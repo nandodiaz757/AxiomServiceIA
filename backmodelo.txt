@@ -1,0 +1,524 @@
+# backend.py
+from fastapi import FastAPI, Query
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any, List
+import sqlite3
+from datetime import datetime
+import json
+import joblib
+import numpy as np
+import os
+import asyncio
+from sklearn.cluster import MiniBatchKMeans
+
+app = FastAPI()
+
+# ----------------------------
+# Configuración
+# ----------------------------
+DB_NAME = "accessibility.db"
+MODELS_DIR = "models"  # raíz de todos los modelos
+
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# NUEVO: flag para decidir si entrenar el modelo general en cada /collect (evita el comentario roto)
+TRAIN_GENERAL_ON_COLLECT = os.getenv("TRAIN_GENERAL_ON_COLLECT", "1") == "1"
+
+# Bloqueos por (tester, build) y para el general
+_model_locks: Dict[str, asyncio.Lock] = {}
+def _get_lock(key: str) -> asyncio.Lock:
+    if key not in _model_locks:
+        _model_locks[key] = asyncio.Lock()
+    return _model_locks[key]
+
+# ----------------------------
+# BD
+# ----------------------------
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS accessibility_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tester_id TEXT,
+            build_id TEXT,
+            timestamp INTEGER,
+            event_type TEXT,
+            event_type_name TEXT,
+            package_name TEXT,
+            class_name TEXT,
+            text TEXT,
+            content_description TEXT,
+            screens_id TEXT,
+            screen_names TEXT,
+            header_text TEXT,
+            actual_device TEXT,
+            collect_node_tree TEXT,
+            additional_info TEXT,
+            tree_data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ----------------------------
+# Modelo de entrada
+# ----------------------------
+class AccessibilityEvent(BaseModel):
+    tester_id: Optional[str] = Field(None, alias="testerId")
+    build_id: Optional[str] = Field(None, alias="buildId")
+
+    timestamp: Optional[int] = Field(None, alias="timestamp")
+    event_type: Optional[int] = Field(None, alias="eventType")
+    event_type_name: Optional[str] = Field(None, alias="eventTypeName")
+    package_name: Optional[str] = Field(None, alias="packageName")
+    class_name: Optional[str] = Field(None, alias="className")
+    text: Optional[str] = Field(None, alias="text")
+    content_description: Optional[str] = Field(None, alias="contentDescription")
+    screens_id: Optional[str] = Field(None, alias="screensId")
+    screen_names: Optional[str] = Field(None, alias="screenNames")
+    header_text: Optional[str] = Field(None, alias="headerText")
+    actual_device: Optional[str] = Field(None, alias="actualDevice")
+    collect_node_tree: Optional[list] = Field(None, alias="collectNodeTree")
+    additional_info: Optional[Dict[str, Any]] = Field(None, alias="additionalInfo")
+    tree_data: Optional[Dict[str, Any]] = Field(None, alias="treeData")
+
+    class Config:
+        allow_population_by_field_name = True
+        allow_population_by_alias = True
+
+# ----------------------------
+# Utilidades de árbol
+# ----------------------------
+def ensure_list(tree):
+    """Convierte un string JSON en lista si es necesario."""
+    if isinstance(tree, str):
+        try:
+            return json.loads(tree)
+        except Exception:
+            return []
+    return tree or []
+
+def compare_trees(old_tree, new_tree):
+    old_tree = ensure_list(old_tree)
+    new_tree = ensure_list(new_tree)
+
+    def make_key(node):
+        if not isinstance(node, dict):
+            return None
+        return node.get("signature") or f"{node.get('xpath', '')}:{node.get('className', '')}"
+
+    old_index = {make_key(n): n for n in old_tree if isinstance(n, dict) and make_key(n)}
+    new_index = {make_key(n): n for n in new_tree if isinstance(n, dict) and make_key(n)}
+
+    removed = [n for k, n in old_index.items() if k not in new_index]
+    added   = [n for k, n in new_index.items() if k not in old_index]
+
+    modified: List[Dict[str, Any]] = []
+    for k, new_node in new_index.items():
+        if k in old_index:
+            old_node = old_index[k]
+            changes = {}
+            for field in ["className", "text", "desc", "viewId", "pkg", "bounds",
+                          "clickable", "enabled", "focusable", "xpath"]:
+                if old_node.get(field) != new_node.get(field):
+                    changes[field] = {"old": old_node.get(field), "new": new_node.get(field)}
+            if changes:
+                modified.append({
+                    "node": {
+                        "signature": k,
+                        "className": new_node.get("className"),
+                        "text": new_node.get("text"),
+                        "xpath": new_node.get("xpath"),
+                    },
+                    "changes": changes
+                })
+    return removed, added, modified
+
+# ----------------------------
+# Utilidades de modelo
+# ----------------------------
+def model_paths(tester_id: Optional[str], build_id: Optional[str]):
+    """
+    Devuelve ruta del modelo incremental individual y la del general.
+    """
+    if tester_id and build_id:
+        base = os.path.join(MODELS_DIR, tester_id, build_id)
+    elif tester_id:
+        base = os.path.join(MODELS_DIR, tester_id, "default")
+    else:
+        base = os.path.join(MODELS_DIR, "anonymous", "default")
+    os.makedirs(base, exist_ok=True)
+    individual_path = os.path.join(base, "model.pkl")
+
+    general_base = os.path.join(MODELS_DIR, "general")
+    os.makedirs(general_base, exist_ok=True)
+    general_path = os.path.join(general_base, "model.pkl")
+
+    return individual_path, general_path
+
+def load_model(path: str) -> Optional[MiniBatchKMeans]:
+    if os.path.exists(path):
+        try:
+            return joblib.load(path)
+        except Exception:
+            return None
+    return None
+
+def init_model_for_data(X: np.ndarray, max_k: int = 3) -> Optional[MiniBatchKMeans]:
+    """
+    Crea un MiniBatchKMeans con k apropiado según datos disponibles.
+    """
+    if X is None or len(X) == 0:
+        return None
+    # número de clusters no puede exceder muestras únicas (y al menos 1)
+    n_clusters = max(1, min(max_k, len(np.unique(X))))
+    return MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=64)
+
+def features_from_rows(rows) -> np.ndarray:
+    # Extrae la "feature" simple desde event_type (numérica)
+    X = np.array([int(r[0]) for r in rows if str(r[0]).isdigit()]).reshape(-1, 1)
+    return X
+
+# ---------------------------------------------------------
+# LÓGICA interna (sin Query) — INDIVIDUAL
+# ---------------------------------------------------------
+async def _train_incremental_logic(tester_id: Optional[str],
+                                   build_id: Optional[str],
+                                   batch_size: int = 200):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT event_type
+        FROM accessibility_data
+        WHERE event_type IS NOT NULL
+          AND IFNULL(tester_id,'') = IFNULL(?, '')
+          AND IFNULL(build_id,'')  = IFNULL(?, '')
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (tester_id, build_id, int(batch_size)))
+    rows = cursor.fetchall()
+    conn.close()
+
+    X = features_from_rows(rows)
+    if len(X) == 0:
+        return {"warning": "No hay datos válidos para entrenar (individual)."}
+
+    individual_path, _ = model_paths(tester_id, build_id)
+    lock = _get_lock(f"ind:{tester_id}:{build_id}")
+
+    async with lock:
+        model = load_model(individual_path)
+        if model is None:
+            model = init_model_for_data(X, max_k=3)
+            if model is None:
+                return {"warning": "Datos insuficientes para inicializar modelo individual."}
+            model.partial_fit(X)
+        else:
+            model.partial_fit(X)
+
+        joblib.dump(model, individual_path)
+
+    return {"status": "incremental_update_individual", "samples": int(len(X)), "path": individual_path}
+
+# ---------------------------------------------------------
+# LÓGICA interna (sin Query) — GENERAL
+# ---------------------------------------------------------
+async def _train_general_logic(batch_size: int = 1000):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT event_type
+        FROM accessibility_data
+        WHERE event_type IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (int(batch_size),))
+    rows = cursor.fetchall()
+    conn.close()
+
+    X = features_from_rows(rows)
+    if len(X) == 0:
+        return {"warning": "No hay datos válidos para entrenar (general)."}
+
+    _, general_path = model_paths(None, None)
+    lock = _get_lock("gen")
+
+    async with lock:
+        model = load_model(general_path)
+        if model is None:
+            model = init_model_for_data(X, max_k=5)  # el general puede tener más clusters
+            if model is None:
+                return {"warning": "Datos insuficientes para inicializar modelo general."}
+            model.partial_fit(X)
+        else:
+            model.partial_fit(X)
+
+        joblib.dump(model, general_path)
+
+    return {"status": "incremental_update_general", "samples": int(len(X)), "path": general_path}
+
+# ----------------------------
+# Endpoints
+# ----------------------------
+@app.post("/collect")
+async def collect_event(event: AccessibilityEvent):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    # Buscar último snapshot de la misma pantalla por tester/build
+    cursor.execute("""
+        SELECT collect_node_tree
+        FROM accessibility_data
+        WHERE screen_names = ? AND IFNULL(tester_id,'') = IFNULL(?, '')
+              AND IFNULL(build_id,'')  = IFNULL(?, '')
+        ORDER BY created_at DESC
+        LIMIT 1
+    """, (event.screen_names, event.tester_id, event.build_id))
+    row = cursor.fetchone()
+
+    last_tree = json.loads(row[0]) if row and row[0] else []
+    new_tree = event.collect_node_tree or []
+
+    removed, added, modified = compare_trees(last_tree, new_tree)
+
+    # Insertar siempre el nuevo snapshot
+    cursor.execute("""
+        INSERT INTO accessibility_data (
+            tester_id, build_id, timestamp, event_type, event_type_name, package_name, class_name, text,
+            content_description, screens_id, screen_names, header_text, actual_device, 
+            collect_node_tree, additional_info, tree_data, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        event.tester_id,
+        event.build_id,
+        event.timestamp,
+        str(event.event_type) if event.event_type is not None else None,
+        event.event_type_name,
+        event.package_name,
+        event.class_name,
+        event.text,
+        event.content_description,
+        event.screens_id,
+        event.screen_names,
+        event.header_text,
+        event.actual_device,
+        json.dumps(event.collect_node_tree) if event.collect_node_tree else None,
+        json.dumps(event.additional_info) if event.additional_info else None,
+        json.dumps(event.tree_data) if event.tree_data else None,
+        datetime.now()
+    ))
+    conn.commit()
+    conn.close()
+
+    result = {"status": "no_change", "message": "Pantalla sin cambios"}
+    if removed or added or modified:
+        # Entrenamiento incremental por tester/build
+        incr_res = await _train_incremental_logic(tester_id=event.tester_id, build_id=event.build_id)
+
+        # NUEVO: control por flag de entorno (antes había un comentario roto aquí)
+        gen_res = None
+        if TRAIN_GENERAL_ON_COLLECT:
+            gen_res = await _train_general_logic()  # desactiva con env TRAIN_GENERAL_ON_COLLECT=0
+
+        result = {
+            "status": "change_detected_and_trained",
+            "removed": removed,
+            "added": added,
+            "modified": modified,
+            "train_individual": incr_res,
+            "train_general": gen_res
+        }
+    return result
+
+@app.get("/data")
+async def get_data(limit: int = 10,
+                   testerId: Optional[str] = Query(None),
+                   buildId: Optional[str] = Query(None)):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    if testerId or buildId:
+        cursor.execute("""
+            SELECT id, tester_id, build_id, timestamp, event_type, event_type_name, package_name, class_name, text,
+                   content_description, screens_id, screen_names, header_text, actual_device,
+                   collect_node_tree, additional_info, tree_data, created_at
+            FROM accessibility_data
+            WHERE IFNULL(tester_id,'') = IFNULL(?, '') AND IFNULL(build_id,'') = IFNULL(?, '')
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (testerId, buildId, int(limit)))
+    else:
+        cursor.execute("""
+            SELECT id, tester_id, build_id, timestamp, event_type, event_type_name, package_name, class_name, text,
+                   content_description, screens_id, screen_names, header_text, actual_device,
+                   collect_node_tree, additional_info, tree_data, created_at
+            FROM accessibility_data
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (int(limit),))
+    rows = cursor.fetchall()
+    conn.close()
+
+    result = []
+    for row in rows:
+        result.append({
+            "id": row[0],
+            "tester_id": row[1],
+            "build_id": row[2],
+            "timestamp": row[3],
+            "event_type": row[4],
+            "event_type_name": row[5],
+            "package_name": row[6],
+            "class_name": row[7],
+            "text": row[8],
+            "content_description": row[9],
+            "screens_id": row[10],
+            "screen_names": row[11],
+            "header_text": row[12],
+            "actual_device": row[13],
+            "collect_node_tree": json.loads(row[14]) if row[14] else None,
+            "additional_info": json.loads(row[15]) if row[15] else None,
+            "tree_data": json.loads(row[16]) if row[16] else None,
+            "created_at": row[17],
+        })
+
+    return {"data": result}
+
+# ---------------------------------------------------------
+# Endpoint HTTP — Entrenamiento incremental INDIVIDUAL
+# ---------------------------------------------------------
+@app.post("/train/incremental")
+async def train_incremental(tester_id: Optional[str] = Query(None),
+                            build_id: Optional[str] = Query(None),
+                            batch_size: int = Query(200)):
+    return await _train_incremental_logic(tester_id, build_id, int(batch_size))
+
+# ---------------------------------------------------------
+# Endpoint HTTP — Entrenamiento incremental GENERAL
+# ---------------------------------------------------------
+@app.post("/train/general")
+async def train_general_incremental(batch_size: int = Query(1000)):
+    return await _train_general_logic(int(batch_size))
+
+# ---------------------------------------------------------
+# Predicción / Dif de pantallas (por tester/build) — difs de árbol
+# ---------------------------------------------------------
+@app.post("/predict")
+async def predict(testerId: Optional[str] = Query(None),
+                  buildId: Optional[str] = Query(None)):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT screen_names, collect_node_tree
+        FROM accessibility_data
+        WHERE screen_names IS NOT NULL
+          AND IFNULL(tester_id,'') = IFNULL(?, '')
+          AND IFNULL(build_id,'')  = IFNULL(?, '')
+        ORDER BY created_at DESC
+        LIMIT 2
+    """, (testerId, buildId))
+    rows = cursor.fetchall()
+    conn.close()
+
+    if len(rows) < 2:
+        return {"error": "No hay suficientes snapshots para comparar"}
+
+    latest_screen, latest_tree = rows[0]
+    prev_screen,   prev_tree   = rows[1]
+
+    removed, added, modified = compare_trees(
+        json.loads(prev_tree) if prev_tree else [],
+        json.loads(latest_tree) if latest_tree else []
+    )
+
+    status = "no_changes" if not removed and not added and not modified else "changed"
+
+    response = {
+        "latest_screen": latest_screen,
+        "previous_screen": prev_screen,
+        "status": status,
+        "differences": {
+            "removed": removed,
+            "added": added,
+            "modified": modified
+        }
+    }
+    if latest_screen != prev_screen:
+        response["warning"] = "Los snapshots son de pantallas distintas"
+    return response
+
+# ---------------------------------------------------------
+# NUEVO: Predicción por clusters (usa individual si existe; si no, cae al general)
+# ---------------------------------------------------------
+@app.get("/predict/cluster")
+async def predict_cluster(testerId: Optional[str] = Query(None),
+                          buildId: Optional[str] = Query(None),
+                          batch_size: int = Query(50)):
+    """
+    Predice el cluster de los últimos 'batch_size' event_type:
+    - Si existe modelo individual (testerId/buildId) lo usa.
+    - Si no, usa el modelo general.
+    """
+    # 1) Cargar features recientes
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT event_type
+        FROM accessibility_data
+        WHERE event_type IS NOT NULL
+          AND IFNULL(tester_id,'') = IFNULL(?, '')
+          AND IFNULL(build_id,'')  = IFNULL(?, '')
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (testerId, buildId, int(batch_size)))
+    rows = cursor.fetchall()
+    conn.close()
+
+    X = features_from_rows(rows)
+    if len(X) == 0:
+        return {"warning": "No hay datos recientes con event_type para predecir."}
+
+    # 2) Seleccionar modelo: individual -> general
+    ind_path, gen_path = model_paths(testerId, buildId)
+    model = load_model(ind_path)
+    using = "individual"
+    if model is None:
+        model = load_model(gen_path)
+        using = "general"
+    if model is None:
+        return {"error": "No hay modelo entrenado (ni individual ni general)."}
+
+    # 3) Predecir
+    try:
+        labels = model.predict(X).tolist()
+    except Exception as e:
+        return {"error": f"No se pudo predecir con el modelo: {e.__class__.__name__}: {str(e)}"}
+
+    # 4) Responder
+    centers = getattr(model, "cluster_centers_", None)
+    return {
+        "using_model": using,
+        "testerId": testerId,
+        "buildId": buildId,
+        "samples": int(len(X)),
+        "predicted_labels": labels,
+        "cluster_centers": centers.tolist() if centers is not None else None
+    }
+
+# ---------------------------------------------------------
+# Info de modelos (paths) útil para debug
+# ---------------------------------------------------------
+@app.get("/model/info")
+async def model_info(testerId: Optional[str] = Query(None),
+                     buildId: Optional[str] = Query(None)):
+    ind_path, gen_path = model_paths(testerId, buildId)
+    return {
+        "individual_model_exists": os.path.exists(ind_path),
+        "individual_model_path": ind_path,
+        "general_model_exists": os.path.exists(gen_path),
+        "general_model_path": gen_path
+    }
