@@ -8,7 +8,25 @@ rustup-init
 curl -X POST "http://localhost:8000/predict"-H "Content-Type: application/json" -d '{"screen": "LoginScreen", "eventType": 1}'
 uvicorn backend:app --reload --host 0.0.0.0 --port 8000
 pip install scipy==1.11.4
+pip install uvicorn
+pip install fastapi uvicorn
+python -m pip install --upgrade pip
+pip install joblib
+pip install -r requirements.txt
 pip install --upgrade pip setuptools wheel
 pip uninstall scipy -y
 python -m venv venv
 .\venv\Scripts\activate
+
+Eliminar Base de Datos
+
+del accessibility.bd
+
+Eliminar Modelos
+
+rmdir /S /Q models
+rmdir /S /Q venv
+
+/S → elimina todo el contenido recursivamente.
+
+/Q → modo silencioso (no pide confirmación).
