@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPException, Depends, WebSocket
 from typing import Optional, Union, List, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 import sqlite3, json, joblib, numpy as np, os, hashlib, logging, asyncio, re, unicodedata
 from sklearn.cluster import MiniBatchKMeans
 from hmmlearn import hmm
@@ -8,20 +8,28 @@ from fastapi.responses import JSONResponse
 from fastapi_utils.tasks import repeat_every
 from diff_model.predict_diff import router as diff_router
 from datetime import datetime
- 
+from email_service import send_email
+from reset_service import generate_code, validate_code
+import random, time
+
     
 # =========================================================
 # CONFIGURACIÓN
 # =========================================================
 app = FastAPI()
 router = APIRouter() 
+
+
 DB_NAME = "accessibility.db"
 MODELS_DIR = "models"
 logger = logging.getLogger("myapp")
 logger.setLevel(logging.INFO)
-app.include_router(diff_router)
 
 
+# Estructura para historial de booleanos (para alertas de cambios)
+
+BOOL_HISTORY = {}  
+codes_db = {}
 
 if not logger.hasHandlers():
     ch = logging.StreamHandler()
@@ -34,6 +42,18 @@ TRAIN_GENERAL_ON_COLLECT = True
 
 # Locks para entrenamientos concurrentes
 _model_locks: Dict[str, asyncio.Lock] = {}
+
+
+class SendCodeRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str = Field(..., alias="newPassword")
+
+class ResetRequest(BaseModel):
+    email: EmailStr
 
 
 # === Reentrenamiento automático del modelo diff ===
@@ -112,6 +132,16 @@ def init_db():
         )
     """)
     c.execute("""
+        CREATE TABLE IF NOT EXISTS boolean_history (
+            screen_id TEXT,
+            node_key TEXT,
+            property TEXT,
+            last_value BOOLEAN,
+            PRIMARY KEY(screen_id, node_key, property)
+        );
+    """)
+
+    c.execute("""
         CREATE TABLE IF NOT EXISTS diff_trace (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tester_id TEXT,
@@ -134,6 +164,16 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             diff_id INTEGER,
             rejected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+        # --- OPCIONAL: para almacenar códigos de verificación ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS password_reset_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            code TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -264,91 +304,142 @@ def normalize_tree(nodes: List[Dict]) -> List[Dict]:
 def stable_signature(nodes: List[Dict]) -> str:
     return hashlib.sha256(json.dumps(normalize_tree(nodes), sort_keys=True).encode()).hexdigest()
 
-# def compare_trees(old_tree, new_tree):
-    # old_tree = ensure_list(old_tree)
-    # new_tree = ensure_list(new_tree)
+def generate_code():
+    """Genera un código de 6 dígitos"""
+    return str(random.randint(100000, 999999))
 
-    # # 🚨 Primera vez: si no hay nada con qué comparar, no hay cambios
-    # if not old_tree:
-        # return [], [], []
 
-    # def make_key(n, idx):
-        # if not isinstance(n, dict): 
-            # return None
+def save_reset_code(email: str, code: str):
+    try:
+        expires_at = int(time.time()) + 900
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO password_reset_codes (email, code, expires_at)
+            VALUES (?, ?, ?)
+        """, (email, code, expires_at))
+        conn.commit()
+        conn.close()
+        print(f"✅ Código guardado para {email}")
+    except Exception as e:
+        print(f"❌ Error guardando código en BD: {e}")
 
-        # view_id = n.get("viewId")
-        # class_name = n.get("className")
-        # header_text = n.get("headerText")
-        # text = str(n.get("text")) if n.get("text") is not None else None
-        # content_desc = str(n.get("contentDescription")) if n.get("contentDescription") is not None else None
-        # signature = n.get("signature")
 
-        # parts = [view_id, class_name, header_text, text, content_desc]
+def validate_code(email: str, code: str, expiration_seconds: int = 300) -> bool:
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""
+        SELECT expires_at FROM password_reset_codes
+        WHERE email = ? AND code = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+    """, (email, code))
+    row = c.fetchone()
+    conn.close()
 
-        # # ⚡ Si no tiene nada distintivo, usamos signature como último recurso
-        # if not any(parts) and signature:
-            # parts.append(signature)
+    if not row:
+        return False
 
-        # return "|".join([str(p) for p in parts if p]) + f"#{idx}"
+    if int(time.time()) > row[0]:
+        return False
 
-    # old_idx = {make_key(n, i): n for i, n in enumerate(old_tree) if make_key(n, i)}
-    # new_idx = {make_key(n, i): n for i, n in enumerate(new_tree) if make_key(n, i)}
+    return True  
 
-    # removed = [n for k, n in old_idx.items() if k not in new_idx]
-    # added   = [n for k, n in new_idx.items() if k not in old_idx]
-    # modified = []
 
-    # for k, nn in new_idx.items():
-        # if k in old_idx:
-            # changes = {}
-            # for f in [
-                # "text", "contentDescription", "checked", "enabled",
-                # "otherField", "className", "headerText", "viewId", "signature"
-            # ]:
-                # if old_idx[k].get(f) != nn.get(f):
-                    # changes[f] = {
-                        # "old": str(old_idx[k].get(f)),
-                        # "new": str(nn.get(f))
-                    # }
-            # if changes:
-                # modified.append({"node": {"key": k}, "changes": changes})
-
-    # return removed, added, modified
-
+def update_bool_history(screen_id, db_conn):
+    """Guarda BOOL_HISTORY en la BD."""
+    cursor = db_conn.cursor()
+    for node_key, props in BOOL_HISTORY.items():
+        for prop, val in props.items():
+            cursor.execute("""
+                INSERT INTO boolean_history(screen_id, node_key, property, last_value)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(screen_id, node_key, property)
+                DO UPDATE SET last_value = excluded.last_value
+            """, (screen_id, node_key, prop, int(val)))
+    db_conn.commit()
 
 def compare_trees(old_tree, new_tree):
+    """Compara dos árboles de nodos accesibles y detecta nodos agregados, eliminados o modificados."""
     old_tree = ensure_list(old_tree)
     new_tree = ensure_list(new_tree)
 
+    SAFE_KEYS = [
+        "viewId", "className", "headerText", "text", "contentDescription",
+        "checked", "enabled", "focusable", "clickable", "otherField"
+    ]
+
+    TEXT_FIELDS = ["text", "contentDescription", "headerText"]
+    BOOL_FIELDS = ["checked", "enabled", "focusable", "clickable"]
+    OTHER_FIELDS = ["className", "viewId", "otherField"]
+
+    def normalize_node(node: dict) -> dict:
+        """Convierte None a cadena vacía y asegura que todos los valores sean tipo str o bool válidos."""
+        normalized = {}
+        for k in SAFE_KEYS:
+            v = node.get(k)
+            if isinstance(v, bool):
+                normalized[k] = v
+            elif v is None:
+                normalized[k] = ""
+            else:
+                normalized[k] = str(v).strip()
+        return normalized
+
     def make_key(n, idx):
-        if not isinstance(n, dict): 
+        """Crea una clave única para identificar nodos similares."""
+        if not isinstance(n, dict):
             return None
+        n = normalize_node(n)
         parts = [
             n.get("viewId"),
             n.get("className"),
             n.get("headerText"),
-            str(n.get("text")) if n.get("text") is not None else None,
-            str(n.get("contentDescription")) if n.get("contentDescription") is not None else None
+            n.get("text"),
+            n.get("contentDescription"),
         ]
         return "|".join([str(p) for p in parts if p]) + f"#{idx}"
 
+    # Índices de nodos previos y actuales
     old_idx = {make_key(n, i): n for i, n in enumerate(old_tree) if make_key(n, i)}
     new_idx = {make_key(n, i): n for i, n in enumerate(new_tree) if make_key(n, i)}
 
+    # Detectar eliminados y agregados
     removed = [n for k, n in old_idx.items() if k not in new_idx]
-    added   = [n for k, n in new_idx.items() if k not in old_idx]
+    added = [n for k, n in new_idx.items() if k not in old_idx]
     modified = []
 
     for k, nn in new_idx.items():
         if k in old_idx:
             changes = {}
-            for f in ["text", "contentDescription", "checked", "enabled", "otherField", "className", "headerText", "viewId"]:
-                if old_idx[k].get(f) != nn.get(f):
-                    changes[f] = {"old": str(old_idx[k].get(f)), "new": str(nn.get(f))}
+            old_node = normalize_node(old_idx[k])
+            new_node = normalize_node(nn)
+
+            for f in TEXT_FIELDS + BOOL_FIELDS + OTHER_FIELDS:
+                old_val = old_node.get(f)
+                new_val = new_node.get(f)
+
+                if f in BOOL_FIELDS:
+                    # Inicializar historial del nodo
+                    if k not in BOOL_HISTORY:
+                        BOOL_HISTORY[k] = {}
+                    # Primera vez que aparece la propiedad → guardar y no alertar
+                    if f not in BOOL_HISTORY[k]:
+                        BOOL_HISTORY[k][f] = new_val
+                        continue
+                    # Si cambia respecto al historial → alertar y actualizar historial
+                    if BOOL_HISTORY[k][f] != new_val:
+                        changes[f] = {"old": BOOL_HISTORY[k][f], "new": new_val}
+                        BOOL_HISTORY[k][f] = new_val
+                else:
+                    if old_val != new_val:
+                        changes[f] = {"old": old_val, "new": new_val}
+
             if changes:
                 modified.append({"node": {"key": k}, "changes": changes})
 
     return removed, added, modified
+
 
 # =========================================================
 # VECTORIZACIÓN Y FEATURES
@@ -472,11 +563,14 @@ async def analyze_and_train(event: AccessibilityEvent):
 
     # Obtener último árbol previo de esa misma pantalla
     with sqlite3.connect(DB_NAME) as conn:
+       
+        print("s_name:", repr(s_name))
+        print("t_id:", repr(t_id))
         prev = conn.execute("""
             SELECT collect_node_tree, signature
             FROM accessibility_data
-            WHERE IFNULL(header_text,'')=IFNULL(?, '')
-              AND IFNULL(tester_id,'')=IFNULL(?, '')
+            WHERE TRIM(LOWER(header_text)) LIKE '%' || TRIM(LOWER(?)) || '%'
+              AND TRIM(tester_id) = TRIM(?)
             ORDER BY created_at DESC
             LIMIT 1
         """, (s_name, t_id)).fetchone()
@@ -542,187 +636,6 @@ async def analyze_and_train(event: AccessibilityEvent):
     await _train_incremental_logic_hybrid(t_id, b_id)
     if TRAIN_GENERAL_ON_COLLECT:
         await _train_general_logic_hybrid()
-
-
-# async def analyze_and_train(event: AccessibilityEvent):
-    # norm = _normalize_event_fields(event)
-    # t_id, b_id = norm.get("tester_id_norm"), norm.get("build_id_norm")
-    # s_name = normalize_header(event.header_text)
-
-    # latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
-    # sig = stable_signature(latest_tree)
-
-    # # Obtener últimos árboles previos junto con su signature
-    # with sqlite3.connect(DB_NAME) as conn:
-        # prev = conn.execute("""
-            # SELECT collect_node_tree, signature
-            # FROM accessibility_data
-            # WHERE IFNULL(header_text,'')=IFNULL(?, '')
-              # AND IFNULL(tester_id,'')=IFNULL(?, '')
-            # ORDER BY created_at DESC
-            # LIMIT 1
-        # """, (s_name, t_id)).fetchone()
-
-    # if not prev:
-        # _insert_diff_trace(t_id, b_id, s_name, "Sin cambios (primera captura)")
-        # await _train_incremental_logic_hybrid(t_id, b_id)
-        # if TRAIN_GENERAL_ON_COLLECT:
-            # await _train_general_logic_hybrid()
-        # return
-
-    # #prev_tree = ensure_list(prev[0])
-    # prev_tree = prev_trees[0] if prev_trees else None
-    
-    # if not prev_tree:
-        # _insert_diff_trace(t_id, b_id, s_name, "Sin cambios (primera captura)")
-        
-        # return
-    # #prev_sig = prev[1]
-
-    # # Comparación siempre con compare_trees
-    # removed, added, modified = compare_trees(prev_tree, latest_tree)
-
-    # # Caso 1: signatures iguales y no hay diffs
-    # if sig == prev_sig and not (removed or added or modified):
-        # _insert_diff_trace(t_id, b_id, s_name, "Sin cambios significativos")
-        # return
-
-    # # Caso 2: signatures diferentes pero compare_trees detecta pocos cambios
-    # # → seguimos con removed/added/modificados REALES, no con "todo cambiado"
-    # # Caso 3: signatures diferentes y compare_trees detecta cambios amplios
-    # # → se registra tal cual
-
-    # removed_j, added_j, mod_j = map(lambda x: json.dumps(x, sort_keys=True),
-                                    # (removed, added, modified))
-
-    # with sqlite3.connect(DB_NAME) as conn:
-        # # Evitar duplicados exactos
-        # if conn.execute("""
-            # SELECT 1 FROM screen_diffs
-            # WHERE IFNULL(header_text,'')=IFNULL(?, '')
-              # AND removed=? AND added=? AND modified=?
-            # LIMIT 1
-        # """, (s_name, removed_j, added_j, mod_j)).fetchone():
-            # return
-
-        # if conn.execute("""
-            # SELECT 1
-            # FROM screen_diffs s
-            # JOIN diff_approvals a ON a.diff_id = s.id
-            # WHERE s.header_text=? AND s.removed=? AND s.added=? AND s.modified=?
-            # LIMIT 1
-        # """, (s_name, removed_j, added_j, mod_j)).fetchone():
-            # return
-
-        # conn.execute("""
-            # INSERT INTO screen_diffs (tester_id, build_id, header_text, removed, added, modified)
-            # VALUES (?,?,?,?,?,?)
-        # """, (t_id, b_id, s_name, removed_j, added_j, mod_j))
-        # conn.commit()
-
-    # _insert_diff_trace(
-        # t_id, b_id, s_name,
-        # f"Removed={len(removed)}, Added={len(added)}, Modified={len(modified)} (sig {'changed' if sig != prev_sig else 'same'})"
-    # )
-
-    # # Entrenamientos
-    # await _train_incremental_logic_hybrid(t_id, b_id)
-    # if TRAIN_GENERAL_ON_COLLECT:
-        # await _train_general_logic_hybrid()
-    
-# async def analyze_and_train(event: AccessibilityEvent):
-    # norm = _normalize_event_fields(event)
-    # t_id, b_id = norm.get("tester_id_norm"), norm.get("build_id_norm")
-    # s_name = normalize_header(event.header_text)
-
-    # latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
-
-    # # ✨ No bloqueamos por firma para no perder cambios en campos extra
-    # sig = stable_signature(latest_tree)
-    # with sqlite3.connect(DB_NAME) as conn:
-        # if conn.execute("""
-            # SELECT 1 FROM accessibility_data
-            # WHERE IFNULL(header_text,'')=IFNULL(?, '')
-              # AND IFNULL(tester_id,'')=IFNULL(?, '')
-              # AND signature=?
-            # LIMIT 1
-        # """, (s_name, t_id, sig)).fetchone():
-            # logger.info("[diff-trace] firma ya existente, continuar para detectar cambios")
-
-    # # Obtener últimos árboles previos
-    # with sqlite3.connect(DB_NAME) as conn:
-        # prev = conn.execute("""
-            # SELECT collect_node_tree
-            # FROM accessibility_data
-            # WHERE IFNULL(header_text,'')=IFNULL(?, '')
-              # AND IFNULL(tester_id,'') = IFNULL(?, '') 
-            # ORDER BY created_at DESC
-            # LIMIT 3
-        # """, (s_name, t_id)).fetchall()
-
-    # prev_trees = [ensure_list(r[0]) for r in prev]
-
-    # if not prev_trees:
-        # _insert_diff_trace(t_id, b_id, s_name, "Sin cambios (primera captura)")
-        # await _train_incremental_logic_hybrid(t_id, b_id)
-        # if TRAIN_GENERAL_ON_COLLECT:
-            # await _train_general_logic_hybrid()
-        # return
-
-    # # Comparar con todos los previos
-    # removed, added, modified = [], [], []
-    # for p in prev_trees:
-        # r, a, m = compare_trees(p, latest_tree)
-        # removed += r
-        # added += a
-        # modified += m
-
-    # # Si no hay cambios, aun así podemos registrar (opcional)
-    # if not (removed or added or modified):
-        # _insert_diff_trace(t_id, b_id, s_name, "Sin cambios significativos")
-        # return
-
-    # # Normalizar JSON para comparación/inserción
-    # removed_j, added_j, mod_j = map(lambda x: json.dumps(x, sort_keys=True),
-                                    # (removed, added, modified))
-
-    # with sqlite3.connect(DB_NAME) as conn:
-        # # Evitar duplicados exactos
-        # if conn.execute("""
-            # SELECT 1 FROM screen_diffs
-            # WHERE IFNULL(header_text,'')=IFNULL(?, '')
-              # AND removed=? AND added=? AND modified=?
-            # LIMIT 1
-        # """, (s_name, removed_j, added_j, mod_j)).fetchone():
-            # return
-
-        # if conn.execute("""
-            # SELECT 1
-            # FROM screen_diffs s
-            # JOIN diff_approvals a ON a.diff_id = s.id
-            # WHERE s.header_text=? AND s.removed=? AND s.added=? AND s.modified=?
-            # LIMIT 1
-        # """, (s_name, removed_j, added_j, mod_j)).fetchone():
-            # return
-
-        # # Insertar cambios detectados
-        # conn.execute("""
-            # INSERT INTO screen_diffs (tester_id, build_id, header_text, removed, added, modified)
-            # VALUES (?,?,?,?,?,?)
-        # """, (t_id, b_id, s_name, removed_j, added_j, mod_j))
-        # conn.commit()
-
-    # _insert_diff_trace(
-        # t_id, b_id, s_name,
-        # f"Removed={len(removed)}, Added={len(added)}, Modified={len(modified)}"
-    # )
-
-    # # Entrenamientos
-    # await _train_incremental_logic_hybrid(t_id, b_id)
-    # if TRAIN_GENERAL_ON_COLLECT:
-        # await _train_general_logic_hybrid()
-    
-
 
 
 # =========================================================
@@ -1141,52 +1054,7 @@ def get_screen_diffs(
 
     return {"screen_diffs": diffs, "has_changes": has_changes}
 
-# @app.get("/screen/diffs")
-# def get_screen_diffs(
-    # tester_id: Optional[str] = Query(None),
-    # build_id: Optional[str] = Query(None),
-    # screen_name: Optional[str] = Query(None)
-# ):
-    # conn = sqlite3.connect(DB_NAME)
-    # cursor = conn.cursor()
 
-    # query = """
-        # SELECT id, tester_id, build_id, screen_name, removed, added, modified, created_at, cluster_info
-        # FROM screen_diffs
-        # WHERE 1=1
-    # """
-    # params = []
-    # if tester_id:
-        # query += " AND (tester_id = ? OR (tester_id IS NULL AND ? = ''))"
-        # params.append(tester_id)
-    # if build_id:
-        # query += " AND IFNULL(build_id, '') = ?"
-        # params.append(build_id)
-    # if screen_name:
-        # query += " AND screen_name = ?"
-        # params.append(screen_name)
-
-    # query += " ORDER BY created_at DESC LIMIT 1"
-    # cursor.execute(query, tuple(params))
-    # row = cursor.fetchone()
-    # conn.close()
-
-    # if not row:
-        # return {"screen_diffs": [], "has_changes": False}
-
-    # diff = {
-        # "id": row[0],
-        # "tester_id": row[1],
-        # "build_id": row[2],
-        # "screen_name": row[3],
-        # "removed": json.loads(row[4]) if row[4] else [],
-        # "added": json.loads(row[5]) if row[5] else [],
-        # "modified": json.loads(row[6]) if row[6] else [],
-        # "created_at": row[7],
-        # "cluster_info": json.loads(row[8]) if row[8] else {}  # <- cluster info
-    # }
-    # has_changes = bool(diff["removed"] or diff["added"] or diff["modified"])
-    # return {"screen_diffs": [diff], "has_changes": has_changes}
 
 @app.get("/screen/exists")
 async def screen_exists(buildId: str = Query(...)):
@@ -1483,14 +1351,6 @@ def capture_coverage(
     }    
     
 app.include_router(router)
-
-# @app.websocket("/ws/status")
-# async def websocket_status(ws: WebSocket):
-    # await ws.accept()
-    # while True:
-        # await asyncio.sleep(1)  # o usar un trigger real de DB
-        # data = get_status_data()  # función que devuelve el mismo JSON de /status
-        # await ws.send_json(data
         
 @app.websocket("/ws/status")
 async def websocket_status(websocket: WebSocket):
@@ -1501,3 +1361,55 @@ async def websocket_status(websocket: WebSocket):
         # Aquí enviar diffs desde tu DB o memoria
         await websocket.send_json({"tester_id": tester_id, "build_id": build_id, "diffs": []})
         await asyncio.sleep(5)        
+
+
+@router.post("/send-reset-code")
+def send_reset_code(req: ResetRequest):
+    print(f"📩 Petición recibida desde Android: {req.email}")
+    try:
+        code = generate_code()
+        codes_db[req.email] = {"code": code, "expires": time.time() + 300}  # 5 minutos
+        
+        
+        save_reset_code(req.email, code)
+
+        send_email(
+            to_email=req.email,
+            subject="Password Reset Code",
+            body_text="Here is your verification code.",
+            code=code
+        )
+        return {"message": "Email sent successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al enviar correo: {e}")
+
+
+@router.post("/reset-password")
+def reset_password(req: ResetPasswordRequest):
+    # Validar código desde SQLite (sin eliminarlo)
+    if not validate_code(req.email, req.code):
+        raise HTTPException(status_code=400, detail="Código inválido o expirado")
+
+    try:
+        # Actualizar la contraseña real en tu DB principal
+        print(f"🔑 Password for {req.email} updated to: {req.new_password}")
+        # aquí iría tu lógica real de actualización en tu tabla de usuarios
+
+        # Solo si la actualización es exitosa, eliminar el código
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("""
+            DELETE FROM password_reset_codes
+            WHERE email = ? AND code = ?
+        """, (req.email, req.code))
+        conn.commit()
+        conn.close()
+
+        return {"success": True, "message": "Contraseña actualizada correctamente"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error actualizando contraseña: {e}")
+
+
+app.include_router(diff_router)
+app.include_router(router, prefix="/api")
