@@ -2,7 +2,7 @@ from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPExc
 from typing import Optional, Union, List, Dict, Any
 from pydantic import BaseModel, Field, EmailStr
 import sqlite3, json, joblib, numpy as np, os, hashlib, logging, asyncio, re, unicodedata
-from sklearn.cluster import MiniBatchKMeans
+from sklearn.cluster import MiniBatchKMeans 
 from hmmlearn import hmm
 from fastapi.responses import JSONResponse
 from fastapi_utils.tasks import repeat_every
@@ -11,7 +11,9 @@ from datetime import datetime
 from email_service import send_email
 from reset_service import generate_code, validate_code
 import random, time
-
+from collections import Counter
+import math
+from sklearn.cluster import KMeans 
     
 # =========================================================
 # CONFIGURACIÓN
@@ -19,12 +21,17 @@ import random, time
 app = FastAPI()
 router = APIRouter() 
 
+if 'kmeans_model' not in globals():
+    kmeans_model = KMeans(n_clusters=5)
+if 'hmm_model' not in globals():
+    hmm_model = hmm.GaussianHMM(n_components=5)
 
 DB_NAME = "accessibility.db"
 MODELS_DIR = "models"
 logger = logging.getLogger("myapp")
 logger.setLevel(logging.INFO)
 
+ENRICHED_VECTOR_THRESHOLD = 0.5  # Ajusta este valor según tu lógica
 
 # Estructura para historial de booleanos (para alertas de cambios)
 
@@ -73,6 +80,15 @@ def _get_lock(key: str) -> asyncio.Lock:
         _model_locks[key] = asyncio.Lock()
     return _model_locks[key]
 
+
+def sequence_entropy(seq: list[str]) -> float:
+    """Calcula la entropía de Shannon de una secuencia de elementos."""
+    if not seq:
+        return 0.0
+    counts = Counter(seq)
+    total = len(seq)
+    ent = -sum((count/total) * math.log2(count/total) for count in counts.values())
+    return ent
 # =========================================================
 # BASE DE DATOS
 # =========================================================
@@ -114,6 +130,9 @@ def init_db():
             collect_node_tree TEXT,
             additional_info TEXT,
             tree_data TEXT,
+            enriched_vector TEXT,
+            cluster_id INTEGER,
+            anomaly_score REAL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -193,6 +212,11 @@ init_db()
 # =========================================================
 # MODELOS DE ENTRADA
 # =========================================================
+class ActionEvent(BaseModel):
+    type: str
+    timestamp: float
+    # otros campos que tenga cada acción
+
 class AccessibilityEvent(BaseModel):
     # Identificación de tester y build (usa alias en camelCase para que coincida con el JSON entrante)
     tester_id: Optional[str] = Field(None, alias="actualDevice")
@@ -215,6 +239,7 @@ class AccessibilityEvent(BaseModel):
     # Datos de dispositivo y versión de la app
     actual_device: Optional[str] = Field(None, alias="actualDevices")    
     version: Optional[str] = Field(None, alias="versions")
+    actions: Optional[List[ActionEvent]] = []
     
     # Árbol de nodos capturado (puede ser dict o lista de nodos)
     # collect_node_tree: Optional[Union[Dict, List]] = Field(None, alias="collectNodeTree")
@@ -535,11 +560,6 @@ async def _train_model_hybrid(
 # ENTRENAMIENTO HÍBRIDO (KMeans + HMM)  – versión mejorada
 # =========================================================
 
-# def normalize_header(text: str) -> str:
-    # if not text:
-        # return ""
-    #Reemplazar saltos de línea y múltiples espacios por uno solo
-    # return re.sub(r"\s+", " ", text.strip())
 
 def normalize_header(text: str) -> str:
     if not text:
@@ -554,20 +574,38 @@ def normalize_header(text: str) -> str:
 
 
 async def analyze_and_train(event: AccessibilityEvent):
+    # Normalizar campos y extraer IDs
     norm = _normalize_event_fields(event)
     t_id, b_id = norm.get("tester_id_norm"), norm.get("build_id_norm")
     s_name = normalize_header(event.header_text)
 
+    # Árbol de nodos y firma
     latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
     sig = stable_signature(latest_tree)
 
-    # Obtener último árbol previo de esa misma pantalla
+    # ---------- Generar features enriquecidas ----------
+    struct_vec = ui_structure_features(latest_tree)
+
+    # Timing y gestos
+    timestamps = [e.timestamp for e in ensure_list(event.actions or [])]
+    time_deltas = np.diff(timestamps) if len(timestamps) > 1 else [0]
+    avg_dwell = float(np.mean(time_deltas)) if len(time_deltas) > 0 else 0
+    num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
+
+    # Input patterns
+    input_vec = input_features(event.actions or [])
+
+    # Vector final
+    enriched_vector = np.array(
+        struct_vec + [avg_dwell, num_gestos] + input_vec,
+        dtype=float
+    )
+    # ---------------------------------------------------
+
+    # Obtener último árbol previo
     with sqlite3.connect(DB_NAME) as conn:
-       
-        print("s_name:", repr(s_name))
-        print("t_id:", repr(t_id))
         prev = conn.execute("""
-            SELECT collect_node_tree, signature
+            SELECT collect_node_tree, signature, enriched_vector
             FROM accessibility_data
             WHERE TRIM(LOWER(header_text)) LIKE '%' || TRIM(LOWER(?)) || '%'
               AND TRIM(tester_id) = TRIM(?)
@@ -577,132 +615,192 @@ async def analyze_and_train(event: AccessibilityEvent):
 
     if not prev:
         _insert_diff_trace(t_id, b_id, s_name, "Sin cambios (primera captura)")
-        await _train_incremental_logic_hybrid(t_id, b_id)
+        await _train_incremental_logic_hybrid(t_id, b_id, enriched_vector=enriched_vector)
+
+        # Recuperar los modelos ya entrenados
+        kmeans_model = KMEANS_MODELS.get(t_id)  # dict global por tester_id
+        hmm_model = HMM_MODELS.get(t_id)
+
         if TRAIN_GENERAL_ON_COLLECT:
-            await _train_general_logic_hybrid()
+            await _train_general_logic_hybrid(enriched_vector=enriched_vector)
         return
 
-    prev_tree, prev_sig = prev[0], prev[1]
+    prev_tree, prev_sig, prev_vec = prev[0], prev[1], prev[2]
     prev_tree = ensure_list(prev_tree)
+    prev_vec = np.array(json.loads(prev_vec)) if prev_vec else None
 
     if not prev_tree:
         _insert_diff_trace(t_id, b_id, s_name, "Sin cambios (primera captura)")
         return
 
-    # Comparación siempre con compare_trees
+    # Comparación con compare_trees
     removed, added, modified = compare_trees(prev_tree, latest_tree)
 
     # Caso 1: firmas iguales y no hay diffs
     if sig == prev_sig and not (removed or added or modified):
-        _insert_diff_trace(t_id, b_id, s_name, "Sin cambios significativos")
-        return
+        anomaly = False
+        if prev_vec is not None:
+            diff_norm = np.linalg.norm(enriched_vector - prev_vec)
+            anomaly = diff_norm > ENRICHED_VECTOR_THRESHOLD
+        _insert_diff_trace(
+            t_id, b_id, s_name,
+            "Sin cambios significativos" + (" pero vector difiere" if anomaly else "")
+        )
+    else:
+        removed_j, added_j, mod_j = map(lambda x: json.dumps(x, sort_keys=True),
+                                        (removed, added, modified))
 
-    # Caso 2 y 3: si hay diffs, se registran
-    removed_j, added_j, mod_j = map(lambda x: json.dumps(x, sort_keys=True),
-                                    (removed, added, modified))
+        with sqlite3.connect(DB_NAME) as conn:
+            if not conn.execute("""
+                SELECT 1 FROM screen_diffs
+                WHERE IFNULL(header_text,'')=IFNULL(?, '')
+                  AND removed=? AND added=? AND modified=?
+                LIMIT 1
+            """, (s_name, removed_j, added_j, mod_j)).fetchone():
+                conn.execute("""
+                    INSERT INTO screen_diffs (tester_id, build_id, header_text, removed, added, modified)
+                    VALUES (?,?,?,?,?,?)
+                """, (t_id, b_id, s_name, removed_j, added_j, mod_j))
+                conn.commit()
 
+        _insert_diff_trace(
+            t_id, b_id, s_name,
+            f"Removed={len(removed)}, Added={len(added)}, Modified={len(modified)} "
+            f"(sig {'changed' if sig != prev_sig else 'same'})"
+        )
+
+    # ---------- Score de anomalía HMM/KMeans ----------
+    
+    cluster_id = None
+    anomaly_score = None
+
+    try:
+        cluster_id = kmeans_model.predict(enriched_vector.reshape(1, -1))[0]
+        logp = hmm_model.score(recent_clusters)
+
+        with sqlite3.connect(DB_NAME) as conn:
+            recent_clusters = [row[0] for row in conn.execute("""
+                SELECT cluster_id
+                FROM accessibility_data
+                WHERE tester_id=?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (t_id, SEQ_LENGTH)).fetchall()]
+
+        recent_clusters.append(cluster_id)
+        recent_clusters = np.array(recent_clusters).reshape(-1, 1)
+
+        logp = hmm_model.score(recent_clusters)
+        anomaly_score = -logp
+
+    except Exception as e:
+        print("Error calculando anomaly_score:", e)
+
+    # Insertar vector enriquecido y cluster/anomaly_score en DB
     with sqlite3.connect(DB_NAME) as conn:
-        # Evitar duplicados exactos
-        if conn.execute("""
-            SELECT 1 FROM screen_diffs
-            WHERE IFNULL(header_text,'')=IFNULL(?, '')
-              AND removed=? AND added=? AND modified=?
-            LIMIT 1
-        """, (s_name, removed_j, added_j, mod_j)).fetchone():
-            return
-
-        if conn.execute("""
-            SELECT 1
-            FROM screen_diffs s
-            JOIN diff_approvals a ON a.diff_id = s.id
-            WHERE s.header_text=? AND s.removed=? AND s.added=? AND s.modified=?
-            LIMIT 1
-        """, (s_name, removed_j, added_j, mod_j)).fetchone():
-            return
-
         conn.execute("""
-            INSERT INTO screen_diffs (tester_id, build_id, header_text, removed, added, modified)
-            VALUES (?,?,?,?,?,?)
-        """, (t_id, b_id, s_name, removed_j, added_j, mod_j))
+            UPDATE accessibility_data
+            SET enriched_vector=?, cluster_id=?, anomaly_score=?
+            WHERE TRIM(LOWER(header_text)) LIKE '%' || TRIM(LOWER(?)) || '%'
+              AND TRIM(tester_id)=TRIM(?)
+        """, (
+            json.dumps(enriched_vector.tolist()),
+            int(cluster_id) if cluster_id is not None else None,
+            float(anomaly_score) if anomaly_score is not None else None,
+            s_name,
+            t_id
+        ))
         conn.commit()
 
-    _insert_diff_trace(
-        t_id, b_id, s_name,
-        f"Removed={len(removed)}, Added={len(added)}, Modified={len(modified)} "
-        f"(sig {'changed' if sig != prev_sig else 'same'})"
-    )
-
-    # Entrenamientos
-    await _train_incremental_logic_hybrid(t_id, b_id)
+    # Entrenamiento híbrido con vector enriquecido
+    await _train_incremental_logic_hybrid(t_id, b_id, enriched_vector=enriched_vector)
     if TRAIN_GENERAL_ON_COLLECT:
-        await _train_general_logic_hybrid()
+        await _train_general_logic_hybrid(enriched_vector=enriched_vector)
 
-
+    
 # =========================================================
 # ENTRENAMIENTO INCREMENTAL (versión original conservada)
 # =========================================================
-async def _train_incremental_logic_hybrid(tester_id: str, build_id: str,
-                                          batch_size=200, min_samples=2):
-    with sqlite3.connect(DB_NAME) as conn:
-        c = conn.cursor()
-        c.execute("""
-            SELECT DISTINCT collect_node_tree
-            FROM accessibility_data
-            WHERE collect_node_tree IS NOT NULL
-              AND IFNULL(tester_id,'')=IFNULL(?, '')
-              AND IFNULL(build_id,'')=IFNULL(?, '')
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, (tester_id, build_id, batch_size))
-        rows = c.fetchall()
-        if len(rows) < min_samples:
-            need = min_samples - len(rows)
+async def _train_incremental_logic_hybrid(
+    tester_id: str,
+    build_id: str,
+    batch_size=200,
+    min_samples=2,
+    enriched_vector: np.ndarray | None = None   # ✅ nuevo parámetro
+):
+    if enriched_vector is not None:
+        X = enriched_vector.reshape(1, -1)
+    else:
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
             c.execute("""
                 SELECT DISTINCT collect_node_tree
                 FROM accessibility_data
                 WHERE collect_node_tree IS NOT NULL
                   AND IFNULL(tester_id,'')=IFNULL(?, '')
                   AND IFNULL(build_id,'')=IFNULL(?, '')
-                ORDER BY created_at ASC
+                ORDER BY created_at DESC
                 LIMIT ?
-            """, (tester_id, build_id, need))
-            rows = c.fetchall() + rows
-    X = features_from_rows(rows)
-    if X.size == 0: return
+            """, (tester_id, build_id, batch_size))
+            rows = c.fetchall()
+            if len(rows) < min_samples:
+                need = min_samples - len(rows)
+                c.execute("""
+                    SELECT DISTINCT collect_node_tree
+                    FROM accessibility_data
+                    WHERE collect_node_tree IS NOT NULL
+                      AND IFNULL(tester_id,'')=IFNULL(?, '')
+                      AND IFNULL(build_id,'')=IFNULL(?, '')
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                """, (tester_id, build_id, need))
+                rows = c.fetchall() + rows
+        X = features_from_rows(rows)
+
+    if X.size == 0:
+        return
     
-    # ✅ Eliminar duplicados de vectores antes de entrenar
+    # Eliminar duplicados antes de entrenar
     X = np.unique(X, axis=0)
 
-    await _train_model_hybrid(X, tester_id, build_id,
-                              _get_lock(f"ind:{tester_id}:{build_id}"),
-                              desc=f"incremental {tester_id}/{build_id}")
+    await _train_model_hybrid(
+        X, tester_id, build_id,
+        _get_lock(f"ind:{tester_id}:{build_id}"),
+        desc=f"incremental {tester_id}/{build_id}"
+    )
 
-async def _train_general_logic_hybrid(batch_size=1000, min_samples=2):
-    with sqlite3.connect(DB_NAME) as conn:
-        c = conn.cursor()
-        c.execute("""
-            SELECT collect_node_tree
-            FROM accessibility_data
-            WHERE collect_node_tree IS NOT NULL
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, (batch_size,))
-        rows = c.fetchall()
-        if len(rows) < min_samples:
-            need = min_samples - len(rows)
+async def _train_general_logic_hybrid(batch_size=1000, min_samples=2, enriched_vector: np.ndarray | None = None):
+    if enriched_vector is not None:
+         X = enriched_vector.reshape(1, -1)
+    else:
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
             c.execute("""
                 SELECT collect_node_tree
                 FROM accessibility_data
                 WHERE collect_node_tree IS NOT NULL
-                ORDER BY created_at ASC
+                ORDER BY created_at DESC
                 LIMIT ?
-            """, (need,))
-            rows = c.fetchall() + rows
-    X = features_from_rows(rows)
-    if X.size == 0: return
-    
-    # ✅ Eliminar duplicados de vectores antes de entrenar
+            """, (batch_size,))
+            rows = c.fetchall()
+            if len(rows) < min_samples:
+                need = min_samples - len(rows)
+                c.execute("""
+                    SELECT collect_node_tree
+                    FROM accessibility_data
+                    WHERE collect_node_tree IS NOT NULL
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                """, (need,))
+                rows = c.fetchall() + rows
+        X = features_from_rows(rows)
+        if X.size == 0: 
+            return
+
+    # Eliminar duplicados de vectores antes de entrenar
     X = np.unique(X, axis=0)
+
+    # Entrenamiento
     await _train_model_hybrid(X, None, None, _get_lock("gen"),
                               max_clusters=5, desc="general")
 
@@ -864,27 +962,39 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
         
         clean_header = (event.header_text or "").replace("\r", "").replace("\n", " ").strip()
 
+        struct_vec = ui_structure_features(normalized_nodes)
+        timestamps = [e.timestamp for e in ensure_list(event.actions or [])]
+        time_deltas = np.diff(timestamps) if len(timestamps) > 1 else [0]
+        avg_dwell = float(np.mean(time_deltas)) if len(time_deltas) > 0 else 0
+        num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
+        input_vec = input_features(event.actions or [])
+
+        enriched_vector = np.array(struct_vec + [avg_dwell, num_gestos] + input_vec, dtype=float)
+        cluster_id: int | None = None
+        anomaly_score: float | None = None
 
         if do_insert:
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
-            logger.info("[collect] Insertando registro en accessibility_data...")
             cursor.execute("""
-            INSERT INTO accessibility_data (
-                tester_id, build_id, timestamp, event_type, event_type_name,
-                package_name, class_name, text, content_description, screens_id,
-                screen_names, header_text,collect_node_tree, signature, 
-                additional_info, tree_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO accessibility_data (
+                    tester_id, build_id, timestamp, event_type, event_type_name,
+                    package_name, class_name, text, content_description, screens_id,
+                    screen_names, header_text, collect_node_tree, signature,
+                    additional_info, tree_data, enriched_vector, cluster_id, anomaly_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tester_norm, build_norm, event.timestamp, event.event_type,
                 event.event_type_name, event.package_name, event.class_name,
                 event.text, event.content_description, screens_id_val,
                 event.screen_names, clean_header,
-                json.dumps(normalized_nodes),   # ✅ árbol filtrado
-                signature,                      # ✅ hash estable
+                json.dumps(normalized_nodes),
+                signature,
                 json.dumps(event.additional_info) if event.additional_info else None,
-                json.dumps(event.tree_data) if event.tree_data else None
+                json.dumps(event.tree_data) if event.tree_data else None,
+                json.dumps(enriched_vector.tolist()) if enriched_vector is not None else None,
+                cluster_id,
+                anomaly_score
             ))
             conn.commit()
             conn.close()
