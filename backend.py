@@ -717,6 +717,8 @@ async def analyze_and_train(event: AccessibilityEvent):
     if TRAIN_GENERAL_ON_COLLECT:
         await _train_general_logic_hybrid(enriched_vector=enriched_vector)
 
+
+
     
 # =========================================================
 # ENTRENAMIENTO INCREMENTAL (versión original conservada)
