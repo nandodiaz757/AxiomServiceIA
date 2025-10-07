@@ -18,3 +18,6 @@ __pycache__/
 
 # Ignorar logs
 *.log
+
+# Ignorar bd
+*.db
