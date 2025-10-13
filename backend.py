@@ -425,88 +425,6 @@ def update_bool_history(screen_id, db_conn):
             """, (screen_id, node_key, prop, int(val)))
     db_conn.commit()
 
-# def compare_trees(old_tree, new_tree):
-#     """Compara dos árboles de nodos accesibles y detecta nodos agregados, eliminados o modificados."""
-#     old_tree = ensure_list(old_tree)
-#     new_tree = ensure_list(new_tree)
-
-#     SAFE_KEYS = [
-#         "viewId", "className", "headerText", "text", "contentDescription",
-#         "checked", "enabled", "focusable", "clickable", "otherField"
-#     ]
-
-#     TEXT_FIELDS = ["text", "contentDescription", "headerText"]
-#     BOOL_FIELDS = ["checked", "enabled", "focusable", "clickable"]
-#     OTHER_FIELDS = ["className", "viewId", "otherField"]
-
-#     def normalize_node(node: dict) -> dict:
-#         """Convierte None a cadena vacía y asegura que todos los valores sean tipo str o bool válidos."""
-#         normalized = {}
-#         for k in SAFE_KEYS:
-#             v = node.get(k)
-#             if isinstance(v, bool):
-#                 normalized[k] = v
-#             elif v is None:
-#                 normalized[k] = ""
-#             else:
-#                 normalized[k] = str(v).strip()
-#         return normalized
-
-#     def make_key(n, idx):
-#         """Crea una clave única para identificar nodos similares."""
-#         if not isinstance(n, dict):
-#             return None
-#         n = normalize_node(n)
-#         parts = [
-#             n.get("viewId"),
-#             n.get("className"),
-#             n.get("headerText"),
-#             n.get("text"),
-#             n.get("contentDescription"),
-#         ]
-#         # return "|".join([str(p) for p in parts if p]) + f"#{idx}"
-#         return "|".join([str(p) for p in parts if p])
-
-
-#     # Índices de nodos previos y actuales
-#     old_idx = {make_key(n, i): n for i, n in enumerate(old_tree) if make_key(n, i)}
-#     new_idx = {make_key(n, i): n for i, n in enumerate(new_tree) if make_key(n, i)}
-
-#     # Detectar eliminados y agregados
-#     removed = [n for k, n in old_idx.items() if k not in new_idx]
-#     added = [n for k, n in new_idx.items() if k not in old_idx]
-#     modified = []
-
-#     for k, nn in new_idx.items():
-#         if k in old_idx:
-#             changes = {}
-#             old_node = normalize_node(old_idx[k])
-#             new_node = normalize_node(nn)
-
-#             for f in TEXT_FIELDS + BOOL_FIELDS + OTHER_FIELDS:
-#                 old_val = old_node.get(f)
-#                 new_val = new_node.get(f)
-
-#                 if f in BOOL_FIELDS:
-#                     # Inicializar historial del nodo
-#                     if k not in BOOL_HISTORY:
-#                         BOOL_HISTORY[k] = {}
-#                     # Primera vez que aparece la propiedad → guardar y no alertar
-#                     if f not in BOOL_HISTORY[k]:
-#                         BOOL_HISTORY[k][f] = new_val
-#                         continue
-#                     # Si cambia respecto al historial → alertar y actualizar historial
-#                     if BOOL_HISTORY[k][f] != new_val:
-#                         changes[f] = {"old": BOOL_HISTORY[k][f], "new": new_val}
-#                         BOOL_HISTORY[k][f] = new_val
-#                 else:
-#                     if old_val != new_val:
-#                         changes[f] = {"old": old_val, "new": new_val}
-
-#             if changes:
-#                 modified.append({"node": {"key": k}, "changes": changes})
-
-#     return removed, added, modified
 
 def compare_trees(old_tree, new_tree, app_name: str = None):
     """
@@ -736,6 +654,7 @@ async def _train_model_hybrid(
         #prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", str(int(build_id) - 1), "model.pkl")
         prev_kmeans, prev_hmm = None, None
         prev_model_path = None
+        prev_build_id = None  
 
         # ✅ Manejo seguro del build_id
         # try:
@@ -858,22 +777,37 @@ def normalize_header(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
-def ensure_model_dimensions(kmeans, X, tester_id, build_id, desc=""):
+def ensure_model_dimensions(kmeans, X, tester_id, build_id, app_name="default_app", desc=""):
     try:
         expected_features = kmeans.cluster_centers_.shape[1]
         current_features = X.shape[1]
+
         if current_features != expected_features:
             logger.warning(
                 f"[{desc}] Dimensión inconsistente: modelo={expected_features}, nuevo={current_features}. Reentrenando..."
             )
-            # Forzar reentrenamiento
+
+            # ⚙️ Forzar reentrenamiento asincrónico
+            lock_key = f"{app_name}:{tester_id}:{build_id}"
+            lock = _get_lock(lock_key)
+
             asyncio.create_task(
-                _train_model_hybrid(X, tester_id, build_id, asyncio.Lock(), desc=f"retrain {desc}")
+                _train_model_hybrid(
+                    X,
+                    tester_id=tester_id,
+                    build_id=build_id,
+                    app_name=app_name,
+                    lock=lock,
+                    desc=f"retrain {desc}"
+                )
             )
+
             return False
+
         return True
+
     except Exception as e:
-        logger.warning(f"[{desc}] No se pudo validar dimensiones del modelo: {e}")
+        logger.warning(f"[{desc}] No se pudo validar dimensiones del modelo ({app_name}/{tester_id}/{build_id}): {e}")
         return False
 
 def structure_signature_features(tree):
@@ -1012,13 +946,28 @@ async def analyze_and_train(event: AccessibilityEvent):
 
     # -------------------- Comparación de árboles ----------------
     removed_all, added_all, modified_all = [], [], []
+
+
+
     for prev in prev_rows:
         collect_json, prev_sig, prev_vec_json, prev_build = prev
         prev_tree = ensure_list(json.loads(collect_json))
+
+        # 🔹 Log: qué se compara con qué
+        print(f"\n--- Comparación con build previa {prev_build} ---")
+        print(f"Prev Build ID: {prev_build}")
+        print(f"Prev Signature: {prev_sig}")
+        print(f"Prev Tree nodes: {len(prev_tree)}")
+        print(f"Latest Build ID: {b_id}")
+        print(f"Latest Signature: {sig}")
+        print(f"Latest Tree nodes: {len(latest_tree)}")
+
+
         removed, added, modified = compare_trees(prev_tree, latest_tree)
         removed_all.extend(removed)
         added_all.extend(added)
         modified_all.extend(modified)
+ 
 
     # Convertir cambios a JSON ordenado para comparar/inserción
     removed_j = json.dumps(removed_all, sort_keys=True)
@@ -1331,10 +1280,11 @@ async def _train_general_logic_hybrid(
 
         # ===================== ENTRENAMIENTO HÍBRIDO =====================
         await _train_model_hybrid(
-            X,
-            None,
-            None,
-            _get_lock("gen"),
+            X=X,
+            tester_id="general",
+            build_id="latest",
+            app_name="default_app",                # o el app real si lo tienes
+            lock=_get_lock("general:global:latest"),
             max_clusters=5,
             desc="general"
         )
@@ -1659,16 +1609,37 @@ async def trigger_incremental_train(
     batch_size: int = Query(200, ge=1),
     min_samples: int = Query(2, ge=1)
 ):
+    # ⚙️ Entrenamiento usando datos previos almacenados (sin enriched_vector directo)
     await _train_incremental_logic_hybrid(
         tester_id=tester_id,
         build_id=build_id,
         batch_size=batch_size,
-        min_samples=min_samples
+        min_samples=min_samples,
+        enriched_vector=None  # 👈 Añadir esto
     )
     return {
         "status": "success",
         "message": f"Entrenamiento incremental híbrido para {tester_id}/{build_id} disparado"
     }
+
+
+# @app.get("/train/incremental")
+# async def trigger_incremental_train(
+#     tester_id: str = Query(...),
+#     build_id: str = Query(...),
+#     batch_size: int = Query(200, ge=1),
+#     min_samples: int = Query(2, ge=1)
+# ):
+#     await _train_incremental_logic_hybrid(
+#         tester_id=tester_id,
+#         build_id=build_id,
+#         batch_size=batch_size,
+#         min_samples=min_samples
+#     )
+#     return {
+#         "status": "success",
+#         "message": f"Entrenamiento incremental híbrido para {tester_id}/{build_id} disparado"
+#     }
 
 @app.get("/screen/diffs")
 def get_screen_diffs(
