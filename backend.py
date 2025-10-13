@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPException, Depends, WebSocket
+from fastapi.responses import HTMLResponse
+from fastapi.testclient import TestClient
 from typing import Optional, Union, List, Dict, Any
 from pydantic import BaseModel, Field, EmailStr
 import sqlite3, json, joblib, numpy as np, os, hashlib, logging, asyncio, re, unicodedata
-from sklearn.cluster import MiniBatchKMeans 
 from hmmlearn import hmm
 from fastapi.responses import JSONResponse
 from fastapi_utils.tasks import repeat_every
@@ -14,7 +15,9 @@ import random, time
 from collections import Counter
 import math
 from sklearn.cluster import KMeans 
-    
+from sklearn.cluster import MiniBatchKMeans
+import httpx
+
 # =========================================================
 # CONFIGURACIÓN
 # =========================================================
@@ -30,6 +33,8 @@ DB_NAME = "accessibility.db"
 MODELS_DIR = "models"
 logger = logging.getLogger("myapp")
 logger.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 ENRICHED_VECTOR_THRESHOLD = 0.5  # Ajusta este valor según tu lógica
 
@@ -37,6 +42,29 @@ ENRICHED_VECTOR_THRESHOLD = 0.5  # Ajusta este valor según tu lógica
 
 BOOL_HISTORY = {}  
 codes_db = {}
+KMEANS_MODELS = {}
+HMM_MODELS = {}
+SEQ_LENGTH = {}  # Longitud de la secuencia para el modelo HMM 
+
+# Limpieza inicial (por si hay residuos en hot reload)
+KMEANS_MODELS.clear()
+HMM_MODELS.clear()
+
+
+# ===================== MODELOS BASE (fallbacks) =====================
+
+# No necesitas inicializarlos aquí si los cargas por tester_id más adelante.
+# Pero puedes tener un “modelo base” para fallback:
+BASE_KMEANS = MiniBatchKMeans(n_clusters=2, random_state=42)
+BASE_HMM = hmm.GaussianHMM(n_components=2, covariance_type="diag", n_iter=50)
+
+# ===================== DIRECTORIOS =====================
+os.makedirs(MODELS_DIR, exist_ok=True)
+MODELS_DIR = os.path.join(os.getcwd(), "models", "trained")
+
+# Locks para evitar entrenamientos simultáneos del mismo tester/build
+_model_locks: Dict[str, asyncio.Lock] = {}
+
 
 if not logger.hasHandlers():
     ch = logging.StreamHandler()
@@ -147,6 +175,8 @@ def init_db():
             added TEXT,
             modified TEXT,
             cluster_info TEXT,
+            anomaly_score REAL DEFAULT 0,
+            cluster_id INTEGER DEFAULT -1,  
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -264,24 +294,29 @@ class AccessibilityEvent(BaseModel):
 SAFE_KEYS = ["className", "text", "desc", "viewId", "pkg"]
 
 
+
 def ui_structure_features(tree: dict) -> list[float]:
     """
-    Cuenta componentes y propiedades de accesibilidad.
+    Cuenta componentes y propiedades de accesibilidad y agrega nuevas features.
     Devuelve:
     [buttons, text_fields, menus, recycler_views, web_views,
-     enabled_count, clickable_count, focusable_count]
+     enabled_count, clickable_count, focusable_count,
+     visible_count, editable_count, image_views]
     """
     counts = {
         "buttons": 0,
         "text_fields": 0,
         "menus": 0,
         "recycler_views": 0,
-        "web_views": 0
+        "web_views": 0,
+        "image_views": 0
     }
     props = {
         "enabled": 0,
         "clickable": 0,
-        "focusable": 0
+        "focusable": 0,
+        "visible": 0,
+        "editable": 0
     }
 
     def traverse(node):
@@ -293,10 +328,13 @@ def ui_structure_features(tree: dict) -> list[float]:
         if "Menu" in cls:          counts["menus"]          += 1
         if "RecyclerView" in cls:  counts["recycler_views"] += 1
         if "WebView" in cls:       counts["web_views"]      += 1
+        if "ImageView" in cls:     counts["image_views"]    += 1
 
         if node.get("enabled"):    props["enabled"]   += 1
         if node.get("clickable"):  props["clickable"] += 1
         if node.get("focusable"):  props["focusable"] += 1
+        if node.get("visible", True):  props["visible"] += 1
+        if "EditText" in cls and node.get("editable", True): props["editable"] += 1
 
         for ch in node.get("children", []):
             traverse(ch)
@@ -305,11 +343,14 @@ def ui_structure_features(tree: dict) -> list[float]:
     return list(counts.values()) + list(props.values())
 
 def input_features(events):
-    total_chars   = sum(len(e.text or "") for e in events if e.type=="input")
-    upper_ratio   = total_chars and sum(ch.isupper() for e in events if e.type=="input" for ch in e.text)/total_chars
-    action_seq    = [e.type for e in events]   # p.ej. ["tap","scroll","tap"]
-    seq_entropy   = sequence_entropy(action_seq)
-    return [total_chars, upper_ratio, seq_entropy]
+    total_chars = sum(len(e.text or "") for e in events if e.type=="input")
+    upper_ratio = total_chars and sum(ch.isupper() for e in events if e.type=="input" for ch in e.text)/total_chars
+    action_seq  = [e.type for e in events]  # ["tap","scroll","input",...]
+    seq_entropy = sequence_entropy(action_seq)
+    # Nueva feature: número de taps y scrolls
+    num_taps = sum(1 for e in events if e.type=="tap")
+    num_scrolls = sum(1 for e in events if e.type=="scroll")
+    return [total_chars, upper_ratio, seq_entropy, num_taps, num_scrolls]
 
 def ensure_list(tree):
     if isinstance(tree, str):
@@ -384,8 +425,94 @@ def update_bool_history(screen_id, db_conn):
             """, (screen_id, node_key, prop, int(val)))
     db_conn.commit()
 
-def compare_trees(old_tree, new_tree):
-    """Compara dos árboles de nodos accesibles y detecta nodos agregados, eliminados o modificados."""
+# def compare_trees(old_tree, new_tree):
+#     """Compara dos árboles de nodos accesibles y detecta nodos agregados, eliminados o modificados."""
+#     old_tree = ensure_list(old_tree)
+#     new_tree = ensure_list(new_tree)
+
+#     SAFE_KEYS = [
+#         "viewId", "className", "headerText", "text", "contentDescription",
+#         "checked", "enabled", "focusable", "clickable", "otherField"
+#     ]
+
+#     TEXT_FIELDS = ["text", "contentDescription", "headerText"]
+#     BOOL_FIELDS = ["checked", "enabled", "focusable", "clickable"]
+#     OTHER_FIELDS = ["className", "viewId", "otherField"]
+
+#     def normalize_node(node: dict) -> dict:
+#         """Convierte None a cadena vacía y asegura que todos los valores sean tipo str o bool válidos."""
+#         normalized = {}
+#         for k in SAFE_KEYS:
+#             v = node.get(k)
+#             if isinstance(v, bool):
+#                 normalized[k] = v
+#             elif v is None:
+#                 normalized[k] = ""
+#             else:
+#                 normalized[k] = str(v).strip()
+#         return normalized
+
+#     def make_key(n, idx):
+#         """Crea una clave única para identificar nodos similares."""
+#         if not isinstance(n, dict):
+#             return None
+#         n = normalize_node(n)
+#         parts = [
+#             n.get("viewId"),
+#             n.get("className"),
+#             n.get("headerText"),
+#             n.get("text"),
+#             n.get("contentDescription"),
+#         ]
+#         # return "|".join([str(p) for p in parts if p]) + f"#{idx}"
+#         return "|".join([str(p) for p in parts if p])
+
+
+#     # Índices de nodos previos y actuales
+#     old_idx = {make_key(n, i): n for i, n in enumerate(old_tree) if make_key(n, i)}
+#     new_idx = {make_key(n, i): n for i, n in enumerate(new_tree) if make_key(n, i)}
+
+#     # Detectar eliminados y agregados
+#     removed = [n for k, n in old_idx.items() if k not in new_idx]
+#     added = [n for k, n in new_idx.items() if k not in old_idx]
+#     modified = []
+
+#     for k, nn in new_idx.items():
+#         if k in old_idx:
+#             changes = {}
+#             old_node = normalize_node(old_idx[k])
+#             new_node = normalize_node(nn)
+
+#             for f in TEXT_FIELDS + BOOL_FIELDS + OTHER_FIELDS:
+#                 old_val = old_node.get(f)
+#                 new_val = new_node.get(f)
+
+#                 if f in BOOL_FIELDS:
+#                     # Inicializar historial del nodo
+#                     if k not in BOOL_HISTORY:
+#                         BOOL_HISTORY[k] = {}
+#                     # Primera vez que aparece la propiedad → guardar y no alertar
+#                     if f not in BOOL_HISTORY[k]:
+#                         BOOL_HISTORY[k][f] = new_val
+#                         continue
+#                     # Si cambia respecto al historial → alertar y actualizar historial
+#                     if BOOL_HISTORY[k][f] != new_val:
+#                         changes[f] = {"old": BOOL_HISTORY[k][f], "new": new_val}
+#                         BOOL_HISTORY[k][f] = new_val
+#                 else:
+#                     if old_val != new_val:
+#                         changes[f] = {"old": old_val, "new": new_val}
+
+#             if changes:
+#                 modified.append({"node": {"key": k}, "changes": changes})
+
+#     return removed, added, modified
+
+def compare_trees(old_tree, new_tree, app_name: str = None):
+    """
+    Compara dos árboles de nodos accesibles y detecta nodos agregados, eliminados o modificados.
+    Si existe un modelo general para la app, se usa como baseline adicional.
+    """
     old_tree = ensure_list(old_tree)
     new_tree = ensure_list(new_tree)
 
@@ -423,17 +550,21 @@ def compare_trees(old_tree, new_tree):
             n.get("text"),
             n.get("contentDescription"),
         ]
-        return "|".join([str(p) for p in parts if p]) + f"#{idx}"
+        return "|".join([str(p) for p in parts if p])
 
-    # Índices de nodos previos y actuales
+    # --------------------------------------------------------
+    # 1️⃣ Índices de nodos previos y actuales
+    # --------------------------------------------------------
     old_idx = {make_key(n, i): n for i, n in enumerate(old_tree) if make_key(n, i)}
     new_idx = {make_key(n, i): n for i, n in enumerate(new_tree) if make_key(n, i)}
 
-    # Detectar eliminados y agregados
     removed = [n for k, n in old_idx.items() if k not in new_idx]
     added = [n for k, n in new_idx.items() if k not in old_idx]
     modified = []
 
+    # --------------------------------------------------------
+    # 2️⃣ Comparar campo por campo entre árboles
+    # --------------------------------------------------------
     for k, nn in new_idx.items():
         if k in old_idx:
             changes = {}
@@ -445,14 +576,12 @@ def compare_trees(old_tree, new_tree):
                 new_val = new_node.get(f)
 
                 if f in BOOL_FIELDS:
-                    # Inicializar historial del nodo
+                    # Historial de booleanos
                     if k not in BOOL_HISTORY:
                         BOOL_HISTORY[k] = {}
-                    # Primera vez que aparece la propiedad → guardar y no alertar
                     if f not in BOOL_HISTORY[k]:
                         BOOL_HISTORY[k][f] = new_val
                         continue
-                    # Si cambia respecto al historial → alertar y actualizar historial
                     if BOOL_HISTORY[k][f] != new_val:
                         changes[f] = {"old": BOOL_HISTORY[k][f], "new": new_val}
                         BOOL_HISTORY[k][f] = new_val
@@ -463,12 +592,53 @@ def compare_trees(old_tree, new_tree):
             if changes:
                 modified.append({"node": {"key": k}, "changes": changes})
 
+    # --------------------------------------------------------
+    # 3️⃣ Verificar diferencias respecto al modelo general (baseline)
+    # --------------------------------------------------------
+    if app_name:
+        baseline_path = os.path.join(MODELS_DIR, app_name, "general", "baseline_tree.json")
+        if os.path.exists(baseline_path):
+            try:
+                with open(baseline_path, "r", encoding="utf-8") as f:
+                    baseline_tree = json.load(f)
+                baseline_idx = {make_key(n, i): normalize_node(n)
+                                for i, n in enumerate(baseline_tree) if make_key(n, i)}
+
+                baseline_modified = []
+                for m in modified:
+                    key = m["node"]["key"]
+                    if key in baseline_idx:
+                        base_node = baseline_idx[key]
+                        changes_vs_baseline = {}
+                        for f, ch in m["changes"].items():
+                            base_val = base_node.get(f)
+                            if base_val != ch["new"]:
+                                changes_vs_baseline[f] = {
+                                    "old": base_val,
+                                    "new": ch["new"],
+                                    "relative_to": "baseline"
+                                }
+                        if changes_vs_baseline:
+                            baseline_modified.append({
+                                "node": m["node"],
+                                "changes": changes_vs_baseline
+                            })
+
+                if baseline_modified:
+                    logger.info(f"[compare_trees] {len(baseline_modified)} cambios respecto a baseline general de {app_name}")
+                    # Fusionamos los cambios baseline en modified
+                    modified.extend(baseline_modified)
+
+            except Exception as e:
+                logger.warning(f"[compare_trees] No se pudo procesar baseline de {app_name}: {e}")
+
     return removed, added, modified
 
 
 # =========================================================
 # VECTORIZACIÓN Y FEATURES
 # =========================================================
+
 
 
 def features_from_rows(rows) -> np.ndarray:
@@ -522,40 +692,155 @@ def features_from_rows(rows) -> np.ndarray:
 # =========================================================
 # ENTRENAMIENTO HÍBRIDO (KMeans + HMM)
 # =========================================================
-        
+
+# ===================== FUNCIÓN PRINCIPAL =====================
 async def _train_model_hybrid(
     X,
-    tester_id,
-    build_id,
-    lock: asyncio.Lock,
-    max_clusters=2,        # ↓ menos clusters en KMeans
-    min_samples=2,
+    tester_id: str = "general",
+    build_id: str = "default",
+    app_name: str = "default_app", 
+    lock: asyncio.Lock = None,
+    max_clusters=3,        # ✅ ahora 3 clusters por defecto
+    min_samples=3,         # ✅ subimos mínimo a 3 para mejor estabilidad
     desc="",
-    n_hmm_states=2         # ↓ menos estados ocultos en el HMM
+    n_hmm_states=3         # ✅ ahora usa 3 estados: estable, leve, estructural
 ):
+    """
+    Entrena modelos HMM + KMeans combinados y los guarda por tester_id/build_id.
+    Si existen modelos previos, continúa el entrenamiento incrementalmente.
+    """
+    logger.info(f"[train_hybrid] Iniciando entrenamiento → tester_id={tester_id}, build_id={build_id}, desc={desc}")
+
+
+    # ✅ Asegura que siempre haya un lock
+    lock = lock or asyncio.Lock()
+
     async with lock:
         if len(X) < min_samples:
-            logger.info(f"[train_hybrid] muestras insuficientes {desc}")
+            logger.warning(f"[train_hybrid] tamaño de X={len(X)} < min_samples={min_samples}, desc={desc}")
             return
 
-        # KMeans con máximo 2 clusters (o tantos como muestras haya)
-        kmeans = MiniBatchKMeans(
-            n_clusters=min(max_clusters, len(X)),
-            random_state=42
-        ).fit(X)
+        # 📁 Ruta base por tester y build
+        # base = os.path.join(MODELS_DIR, tester_id or "general", str(build_id) or "default")
 
-        # HMM con máximo 2 estados ocultos
-        hmm_model = hmm.GaussianHMM(
-            n_components=min(n_hmm_states, len(X)),
-            covariance_type="diag",
-            n_iter=100    # puedes bajar a 50 si quieres aún más rápido
-        ).fit(X, [len(X)])
+        app_dir = os.path.join(MODELS_DIR, app_name)
+        tester_dir = os.path.join(app_dir, tester_id or "general", str(build_id or "default"))
+        os.makedirs(tester_dir, exist_ok=True)
 
-        base = os.path.join(MODELS_DIR, tester_id or "general", build_id or "default")
-        os.makedirs(base, exist_ok=True)
-        joblib.dump({"kmeans": kmeans, "hmm": hmm_model}, os.path.join(base, "model.pkl"))
-        logger.info(f"[train_hybrid] Modelo guardado {desc}")
 
+        # build_folder = "default" if build_id in [None, "", "None"] else str(build_id)
+        # base = os.path.join(MODELS_DIR, tester_id or "general", build_folder)
+        # os.makedirs(base, exist_ok=True)
+
+        # ===================== Cargar modelos previos =====================
+        #prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", str(int(build_id) - 1), "model.pkl")
+        prev_kmeans, prev_hmm = None, None
+        prev_model_path = None
+
+        # ✅ Manejo seguro del build_id
+        # try:
+        #     if build_id is not None and str(build_id).isdigit():
+        #         prev_build_id = str(int(build_id) - 1)
+        #         prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", prev_build_id, "model.pkl")
+        # except Exception:
+        #     prev_model_path = None
+
+        try:
+            if build_id and str(build_id).isdigit():
+                prev_build_id = str(int(build_id) - 1)
+                prev_model_path = os.path.join(app_dir, tester_id, prev_build_id, "model.pkl")
+        except Exception:
+            prev_model_path = None    
+
+        # ✅ Si no existe, usa el modelo general como base
+        # if not prev_model_path or not os.path.exists(prev_model_path):
+        #     general_model_path = os.path.join(app_dir, "general", "model.pkl")
+        #     if os.path.exists(general_model_path):
+        #         prev_model_path = general_model_path
+        #         logger.info(f"[train_hybrid] Usando modelo general como base → {general_model_path}")
+
+                # Cargar modelo previo si existe
+        if prev_model_path and os.path.exists(prev_model_path):
+            try:
+                prev = joblib.load(prev_model_path)
+                prev_kmeans = prev.get("kmeans")
+                prev_hmm = prev.get("hmm")
+                logger.info(f"[train_hybrid] Modelo previo encontrado → {prev_model_path}")
+            except Exception as e:
+                logger.warning(f"[train_hybrid] No se pudo cargar modelo previo: {e}")        
+
+        if prev_build_id:
+            prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", prev_build_id, "model.pkl")
+        else:
+            prev_model_path = None
+
+
+        if prev_model_path and os.path.exists(prev_model_path):
+            try:
+                prev = joblib.load(prev_model_path)
+                prev_kmeans = prev.get("kmeans")
+                prev_hmm = prev.get("hmm")
+                logger.info(f"[train_hybrid] Modelo previo encontrado → {prev_model_path}")
+            except Exception as e:
+                logger.warning(f"[train_hybrid] No se pudo cargar modelo previo: {e}")
+
+        # ===================== Entrenar KMeans =====================
+        try:
+            if prev_kmeans:
+                kmeans = MiniBatchKMeans(
+                    n_clusters=min(max_clusters, len(X)),
+                    random_state=42,
+                    init=prev_kmeans.cluster_centers_,
+                    n_init=1
+                ).fit(X)
+            else:
+                kmeans = MiniBatchKMeans(
+                    n_clusters=min(max_clusters, len(X)),
+                    random_state=42
+                ).fit(X)
+        except Exception as e:
+            logger.error(f"[train_hybrid] Error en KMeans: {e}")
+            kmeans = BASE_KMEANS.fit(X)
+
+        # ===================== Entrenar HMM =====================
+        try:
+            hmm_model = hmm.GaussianHMM(
+                n_components=min(n_hmm_states, len(X)),
+                covariance_type="diag",
+                n_iter=300,
+                tol=1e-3,
+                random_state=42,
+                verbose=False
+            )
+
+            if prev_hmm:
+                hmm_model.startprob_ = prev_hmm.startprob_
+                hmm_model.transmat_ = prev_hmm.transmat_
+                hmm_model.means_ = prev_hmm.means_
+                hmm_model.covars_ = prev_hmm.covars_
+
+            hmm_model.fit(X, [len(X)])
+        except Exception as e:
+            logger.error(f"[train_hybrid] Error en HMM: {e}")
+            hmm_model = BASE_HMM.fit(X)
+
+        # ===================== Guardar modelos =====================
+        try:
+            joblib.dump({"kmeans": kmeans, "hmm": hmm_model}, os.path.join(tester_dir, "model.pkl"))
+            joblib.dump(kmeans, os.path.join(tester_dir, "kmeans.joblib"))
+            joblib.dump(hmm_model, os.path.join(tester_dir, "hmm.joblib"))
+
+            # ✅ Actualizar el modelo general de la app si el tester no es "general"
+            if tester_id != "general":
+                general_dir = os.path.join(app_dir, "general")
+                os.makedirs(general_dir, exist_ok=True)
+                joblib.dump({"kmeans": kmeans, "hmm": hmm_model}, os.path.join(general_dir, "model.pkl"))
+                logger.info(f"[train_hybrid] 🔄 Actualizado modelo general de {app_name}")
+
+            logger.info(f"[train_hybrid] ✅ Modelos guardados correctamente en {tester_dir}")
+        except Exception as e:
+            logger.error(f"[train_hybrid] Error guardando modelos: {e}")
+            
 # =========================================================
 # ENTRENAMIENTO HÍBRIDO (KMeans + HMM)  – versión mejorada
 # =========================================================
@@ -573,130 +858,298 @@ def normalize_header(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
+def ensure_model_dimensions(kmeans, X, tester_id, build_id, desc=""):
+    try:
+        expected_features = kmeans.cluster_centers_.shape[1]
+        current_features = X.shape[1]
+        if current_features != expected_features:
+            logger.warning(
+                f"[{desc}] Dimensión inconsistente: modelo={expected_features}, nuevo={current_features}. Reentrenando..."
+            )
+            # Forzar reentrenamiento
+            asyncio.create_task(
+                _train_model_hybrid(X, tester_id, build_id, asyncio.Lock(), desc=f"retrain {desc}")
+            )
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"[{desc}] No se pudo validar dimensiones del modelo: {e}")
+        return False
+
+def structure_signature_features(tree):
+    """
+    Extrae características estructurales de una jerarquía de nodos de UI.
+    Compatible con vistas Android nativas y frameworks híbridos (Flutter, RN, etc.)
+    """
+    # Inicialización de contadores
+    features = {
+        # --- Android Clásico ---
+        "Button": 0,
+        "MaterialButton": 0,
+        "ImageButton": 0,
+        "EditText": 0,
+        "TextView": 0,
+        "ImageView": 0,
+        "CheckBox": 0,
+        "RadioButton": 0,
+        "Switch": 0,
+        "Spinner": 0,
+        "SeekBar": 0,
+        "ProgressBar": 0,
+        "RecyclerView": 0,
+        "ListView": 0,
+        "ScrollView": 0,
+        "LinearLayout": 0,
+        "RelativeLayout": 0,
+        "ConstraintLayout": 0,
+        "FrameLayout": 0,
+        "CardView": 0,
+
+        # --- Jetpack Compose ---
+        "ComposeView": 0,
+        "Text": 0,           # usado por Compose
+        "ButtonComposable": 0,
+
+        # --- Híbridos (React Native, Flutter, Ionic, WebView) ---
+        "RCTView": 0,        # React Native View
+        "RCTText": 0,        # React Native Text
+        "RCTImageView": 0,
+        "FlutterView": 0,
+        "WebView": 0,
+        "IonContent": 0,
+        "IonButton": 0,
+        "IonInput": 0,
+    }
+
+    max_depth = 0
+    total_nodes = len(tree)
+
+    for node in tree:
+        class_name = node.get("className", "") or ""
+        depth = node.get("depth", 0)
+        max_depth = max(max_depth, depth)
+
+        for key in features.keys():
+            if key.lower() in class_name.lower():
+                features[key] += 1
+
+    # Calcular métricas agregadas útiles
+    interactive_elements = (
+        features["Button"] + features["MaterialButton"] + features["EditText"] +
+        features["CheckBox"] + features["RadioButton"] + features["Switch"] +
+        features["Spinner"] + features["SeekBar"] + features["IonButton"]
+    )
+
+    media_elements = features["ImageView"] + features["RCTImageView"] + features["WebView"]
+
+    layout_complexity = (
+        features["LinearLayout"] + features["RelativeLayout"] +
+        features["ConstraintLayout"] + features["FrameLayout"]
+    )
+
+    # Empaquetar en vector (mantén orden fijo)
+    return [
+        total_nodes,             # total de nodos en pantalla
+        max_depth,               # profundidad máxima
+        interactive_elements,    # elementos interactivos
+        media_elements,          # componentes visuales
+        layout_complexity,       # cantidad de layouts estructurales
+        features["RecyclerView"], 
+        features["ScrollView"],
+        features["ComposeView"],
+        features["FlutterView"],
+        features["IonContent"],
+    ]
+
+
+    
+
 async def analyze_and_train(event: AccessibilityEvent):
-    # Normalizar campos y extraer IDs
+    # -------------------- Normalizar campos --------------------
     norm = _normalize_event_fields(event)
     t_id, b_id = norm.get("tester_id_norm"), norm.get("build_id_norm")
     s_name = normalize_header(event.header_text)
 
-    # Árbol de nodos y firma
+    # 🧩 NUEVO: obtener app_name (por package_name o dominio)
+# 🧩 NUEVO: obtener app_name (por package_name o dominio)
+    app_name = event.package_name or "default_app"
+
+    tester_id = event.tester_id or "general"
+    build_id = event.build_id
+
+    # -------------------- Árbol y firma ------------------------
     latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
     sig = stable_signature(latest_tree)
 
-    # ---------- Generar features enriquecidas ----------
-    struct_vec = ui_structure_features(latest_tree)
 
-    # Timing y gestos
+    # -------------------- Features enriquecidas ----------------
+    struct_vec = np.array(ui_structure_features(latest_tree), dtype=float).flatten()
+    sig_vec = np.array(structure_signature_features(latest_tree), dtype=float).flatten()
+
     timestamps = [e.timestamp for e in ensure_list(event.actions or [])]
     time_deltas = np.diff(timestamps) if len(timestamps) > 1 else [0]
     avg_dwell = float(np.mean(time_deltas)) if len(time_deltas) > 0 else 0
     num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
+    input_vec = np.array(input_features(event.actions or []), dtype=float).flatten()
 
-    # Input patterns
-    input_vec = input_features(event.actions or [])
+    # ✅ Concatenación segura
+    enriched_vector = np.concatenate([
+        struct_vec,
+        sig_vec,
+        np.array([avg_dwell, num_gestos], dtype=float),
+        input_vec
+    ])
 
-    # Vector final
-    enriched_vector = np.array(
-        struct_vec + [avg_dwell, num_gestos] + input_vec,
-        dtype=float
-    )
-    # ---------------------------------------------------
-
-    # Obtener último árbol previo
+    # -------------------- Obtener builds previas ----------------
     with sqlite3.connect(DB_NAME) as conn:
-        prev = conn.execute("""
-            SELECT collect_node_tree, signature, enriched_vector
+        prev_rows = conn.execute("""
+            SELECT collect_node_tree, signature, enriched_vector, build_id
             FROM accessibility_data
-            WHERE TRIM(LOWER(header_text)) LIKE '%' || TRIM(LOWER(?)) || '%'
-              AND TRIM(tester_id) = TRIM(?)
+            WHERE TRIM(tester_id)=TRIM(?)
             ORDER BY created_at DESC
-            LIMIT 1
-        """, (s_name, t_id)).fetchone()
+            LIMIT 5
+        """, (t_id,)).fetchall()
 
-    if not prev:
-        _insert_diff_trace(t_id, b_id, s_name, "Sin cambios (primera captura)")
-        await _train_incremental_logic_hybrid(t_id, b_id, enriched_vector=enriched_vector)
+    # -------------------- Comparación de árboles ----------------
+    removed_all, added_all, modified_all = [], [], []
+    for prev in prev_rows:
+        collect_json, prev_sig, prev_vec_json, prev_build = prev
+        prev_tree = ensure_list(json.loads(collect_json))
+        removed, added, modified = compare_trees(prev_tree, latest_tree)
+        removed_all.extend(removed)
+        added_all.extend(added)
+        modified_all.extend(modified)
 
-        # Recuperar los modelos ya entrenados
-        kmeans_model = KMEANS_MODELS.get(t_id)  # dict global por tester_id
-        hmm_model = HMM_MODELS.get(t_id)
+    # Convertir cambios a JSON ordenado para comparar/inserción
+    removed_j = json.dumps(removed_all, sort_keys=True)
+    added_j = json.dumps(added_all, sort_keys=True)
+    modified_j = json.dumps(modified_all, sort_keys=True)
 
-        if TRAIN_GENERAL_ON_COLLECT:
-            await _train_general_logic_hybrid(enriched_vector=enriched_vector)
-        return
-
-    prev_tree, prev_sig, prev_vec = prev[0], prev[1], prev[2]
-    prev_tree = ensure_list(prev_tree)
-    prev_vec = np.array(json.loads(prev_vec)) if prev_vec else None
-
-    if not prev_tree:
-        _insert_diff_trace(t_id, b_id, s_name, "Sin cambios (primera captura)")
-        return
-
-    # Comparación con compare_trees
-    removed, added, modified = compare_trees(prev_tree, latest_tree)
-
-    # Caso 1: firmas iguales y no hay diffs
-    if sig == prev_sig and not (removed or added or modified):
-        anomaly = False
-        if prev_vec is not None:
-            diff_norm = np.linalg.norm(enriched_vector - prev_vec)
-            anomaly = diff_norm > ENRICHED_VECTOR_THRESHOLD
-        _insert_diff_trace(
-            t_id, b_id, s_name,
-            "Sin cambios significativos" + (" pero vector difiere" if anomaly else "")
-        )
-    else:
-        removed_j, added_j, mod_j = map(lambda x: json.dumps(x, sort_keys=True),
-                                        (removed, added, modified))
-
+    # -------------------- Insertar en screen_diffs (restaurado) ----------------
+    try:
         with sqlite3.connect(DB_NAME) as conn:
             if not conn.execute("""
                 SELECT 1 FROM screen_diffs
                 WHERE IFNULL(header_text,'')=IFNULL(?, '')
                   AND removed=? AND added=? AND modified=?
                 LIMIT 1
-            """, (s_name, removed_j, added_j, mod_j)).fetchone():
+            """, (s_name, removed_j, added_j, modified_j)).fetchone():
                 conn.execute("""
                     INSERT INTO screen_diffs (tester_id, build_id, header_text, removed, added, modified)
                     VALUES (?,?,?,?,?,?)
-                """, (t_id, b_id, s_name, removed_j, added_j, mod_j))
+                """, (t_id, b_id, s_name, removed_j, added_j, modified_j))
                 conn.commit()
+    except Exception as e:
+        print(f"⚠️ Error insertando en screen_diffs: {e}")
 
+    # -------------------- Calcular anomaly_score HMM ----------------
+    cluster_id, anomaly_score = None, None
+    kmeans_model = KMEANS_MODELS.get(t_id)
+    hmm_model = HMM_MODELS.get(t_id)
+
+
+
+    # 🧩 NUEVO: cargar desde disco si no está en memoria
+    #model_dir = os.path.join("models", t_id, str(b_id))
+    model_dir = os.path.join("models", t_id or "general", str(b_id or "latest"))
+
+    if not os.path.exists(model_dir):
+        model_dir = os.path.join("models", "general", "default")
+
+    if not kmeans_model and os.path.exists(os.path.join(model_dir, "kmeans.joblib")):
+        try:
+            kmeans_model = joblib.load(os.path.join(model_dir, "kmeans.joblib"))
+            KMEANS_MODELS[t_id] = kmeans_model
+            print(f"✅ Cargado KMeans para tester {t_id}")
+        except Exception as e:
+            print(f"⚠️ Error cargando kmeans.joblib: {e}")
+
+    if not hmm_model and os.path.exists(os.path.join(model_dir, "hmm.joblib")):
+        try:
+            hmm_model = joblib.load(os.path.join(model_dir, "hmm.joblib"))
+            HMM_MODELS[t_id] = hmm_model
+            print(f"✅ Cargado HMM para tester {t_id}")
+        except Exception as e:
+            print(f"⚠️ Error cargando hmm.joblib: {e}")        
+
+    if not hmm_model and os.path.exists(os.path.join(model_dir, "hmm.joblib")):
+        try:
+            hmm_model = joblib.load(os.path.join(model_dir, "hmm.joblib"))
+            HMM_MODELS[t_id] = hmm_model
+            print(f"✅ Cargado HMM para tester {t_id}")
+        except Exception as e:
+            print(f"⚠️ Error cargando hmm.joblib: {e}")
+    
+    if kmeans_model and hmm_model:
+        try:
+            # Verificar dimensiones
+            if not ensure_model_dimensions(
+                kmeans_model,
+                enriched_vector.reshape(1, -1),
+                t_id,
+                b_id,
+                desc="anomaly_score",
+            ):
+                print("⚠️ Modelo desactualizado — se omite esta predicción (reentrenamiento en curso)")
+                return  # No guardar None en BD
+
+            # ---------- Predicción de cluster ----------
+            try:
+                cluster_id = int(kmeans_model.predict(enriched_vector.reshape(1, -1))[0])
+            except Exception as e:
+                print(f"⚠️ Error prediciendo cluster_id: {e}")
+                cluster_id = -1
+
+            # ---------- Secuencia de acciones ----------
+            seq = [e.type for e in ensure_list(event.actions or []) if e.type in ["tap", "scroll", "input"]]
+            if not seq:
+                seq = ["idle"]
+
+            critical_nodes = sum(1 for n in latest_tree if n.get("className") in ["Button", "EditText"])
+            seq.append(f"critical_{critical_nodes}")
+
+            unique_states = {s: i for i, s in enumerate(set(seq))}
+            encoded_seq = np.array([unique_states[s] for s in seq]).reshape(-1, 1)
+
+            # ---------- Calcular logp ----------
+            try:
+                logp = hmm_model.score(encoded_seq)
+                anomaly_score = max(0.0, float(-logp))
+            except Exception as e:
+                print(f"⚠️ Error en HMM.score(): {e}")
+                anomaly_score = 0.0  # valor seguro
+
+            print(f"[DEBUG] cluster_id={cluster_id}, anomaly_score={anomaly_score}")
+
+        except Exception as e:
+            print("⚠️ Error calculando anomaly_score:", e)
+            anomaly_score = 0.0
+            cluster_id = -1
+    else:
+        print(f"⚠️ No se encontraron modelos cargados para {t_id} (kmeans={kmeans_model}, hmm={hmm_model})")
+
+    if (
+        not removed_all and not added_all and not modified_all and
+        anomaly_score is not None and anomaly_score < 0.5
+    ):
+        _insert_diff_trace(t_id, b_id, s_name, "Pantalla conocida: sin cambios ni anomalías")
+        return  # 🔹 No reentrenar ni insertar más pilas eliminar si no funciona
+
+    # -------------------- Insertar diff_trace ----------------
+    def is_relevant_change(removed, added, modified, anomaly_score, threshold=0.5):
+        num_changes = len(removed) + len(added) + len(modified)
+        return num_changes > 0 or (anomaly_score is not None and anomaly_score > threshold)
+
+    if is_relevant_change(removed_all, added_all, modified_all, anomaly_score):
         _insert_diff_trace(
             t_id, b_id, s_name,
-            f"Removed={len(removed)}, Added={len(added)}, Modified={len(modified)} "
-            f"(sig {'changed' if sig != prev_sig else 'same'})"
+            f"Removed={len(removed_all)}, Added={len(added_all)}, "
+            f"Modified={len(modified_all)}, anomaly_score={anomaly_score if anomaly_score is not None else 'N/A'}"
         )
+    else:
+        _insert_diff_trace(t_id, b_id, s_name, "No hay cambios")
 
-    # ---------- Score de anomalía HMM/KMeans ----------
-    
-    cluster_id = None
-    anomaly_score = None
-
-    try:
-        cluster_id = kmeans_model.predict(enriched_vector.reshape(1, -1))[0]
-        logp = hmm_model.score(recent_clusters)
-
-        with sqlite3.connect(DB_NAME) as conn:
-            recent_clusters = [row[0] for row in conn.execute("""
-                SELECT cluster_id
-                FROM accessibility_data
-                WHERE tester_id=?
-                ORDER BY created_at DESC
-                LIMIT ?
-            """, (t_id, SEQ_LENGTH)).fetchall()]
-
-        recent_clusters.append(cluster_id)
-        recent_clusters = np.array(recent_clusters).reshape(-1, 1)
-
-        logp = hmm_model.score(recent_clusters)
-        anomaly_score = -logp
-
-    except Exception as e:
-        print("Error calculando anomaly_score:", e)
-
-    # Insertar vector enriquecido y cluster/anomaly_score en DB
+    # -------------------- Guardar vector enriquecido y cluster ----------------
     with sqlite3.connect(DB_NAME) as conn:
         conn.execute("""
             UPDATE accessibility_data
@@ -712,102 +1165,187 @@ async def analyze_and_train(event: AccessibilityEvent):
         ))
         conn.commit()
 
-    # Entrenamiento híbrido con vector enriquecido
-    await _train_incremental_logic_hybrid(t_id, b_id, enriched_vector=enriched_vector)
+    # -------------------- Entrenamiento híbrido ----------------
+    # asyncio.create_task(_train_incremental_logic_hybrid(t_id, b_id, enriched_vector=enriched_vector))
+    # #await _train_incremental_logic_hybrid(t_id, b_id, enriched_vector=enriched_vector)
+    # if TRAIN_GENERAL_ON_COLLECT:
+    #     await _train_general_logic_hybrid(enriched_vector=enriched_vector)
+
+    # ✅ Pasamos también app_name
+    asyncio.create_task(
+        _train_model_hybrid(
+            X=np.array([enriched_vector]),
+            tester_id=tester_id,
+            build_id=build_id,
+            app_name=app_name,  # 👈 NUEVO
+            desc=f"{app_name} incremental"
+        )
+    )
+
+    # ✅ Entrenar también el modelo general de la app
     if TRAIN_GENERAL_ON_COLLECT:
-        await _train_general_logic_hybrid(enriched_vector=enriched_vector)
+        await _train_model_hybrid(
+            X=np.array([enriched_vector]),
+            tester_id="general",
+            build_id="latest",
+            app_name=app_name,  # 👈 NUEVO
+            desc=f"{app_name} general"
+        )    
 
-
-
-    
-# =========================================================
-# ENTRENAMIENTO INCREMENTAL (versión original conservada)
-# =========================================================
 async def _train_incremental_logic_hybrid(
     tester_id: str,
     build_id: str,
     batch_size=200,
     min_samples=2,
-    enriched_vector: np.ndarray | None = None   # ✅ nuevo parámetro
+    enriched_vector=None
 ):
-    if enriched_vector is not None:
-        X = enriched_vector.reshape(1, -1)
-    else:
-        with sqlite3.connect(DB_NAME) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT DISTINCT collect_node_tree
-                FROM accessibility_data
-                WHERE collect_node_tree IS NOT NULL
-                  AND IFNULL(tester_id,'')=IFNULL(?, '')
-                  AND IFNULL(build_id,'')=IFNULL(?, '')
-                ORDER BY created_at DESC
-                LIMIT ?
-            """, (tester_id, build_id, batch_size))
-            rows = c.fetchall()
-            if len(rows) < min_samples:
-                need = min_samples - len(rows)
-                c.execute("""
-                    SELECT DISTINCT collect_node_tree
-                    FROM accessibility_data
-                    WHERE collect_node_tree IS NOT NULL
-                      AND IFNULL(tester_id,'')=IFNULL(?, '')
-                      AND IFNULL(build_id,'')=IFNULL(?, '')
-                    ORDER BY created_at ASC
-                    LIMIT ?
-                """, (tester_id, build_id, need))
-                rows = c.fetchall() + rows
-        X = features_from_rows(rows)
+    model_dir = os.path.join("models", tester_id, str(build_id or "latest"))
+    os.makedirs(model_dir, exist_ok=True)
 
-    if X.size == 0:
+    # Cargar vectores históricos
+    with sqlite3.connect(DB_NAME) as conn:
+        rows = conn.execute("""
+            SELECT enriched_vector FROM accessibility_data
+            WHERE tester_id=? AND build_id=?
+            AND enriched_vector IS NOT NULL
+        """, (tester_id, build_id)).fetchall()
+
+    vectors_db = [json.loads(r[0]) for r in rows if r[0]]
+    vectors_db = np.unique(vectors_db, axis=0) if len(vectors_db) > 0 else np.empty((0, 0))
+
+    print(f"[DEBUG] Cantidad de vectores DB (incremental): {len(vectors_db)}")
+    print(f"[DEBUG] Vectores únicos DB (incremental): {len(vectors_db)}")
+
+    if len(vectors_db) < 5:
+        print(f"⚠️ Muy pocos datos ({len(vectors_db)}) — se omite entrenamiento incremental.")
         return
-    
-    # Eliminar duplicados antes de entrenar
-    X = np.unique(X, axis=0)
 
-    await _train_model_hybrid(
-        X, tester_id, build_id,
-        _get_lock(f"ind:{tester_id}:{build_id}"),
-        desc=f"incremental {tester_id}/{build_id}"
+    kmeans_model = MiniBatchKMeans(
+        n_clusters=min(5, len(vectors_db)),
+        random_state=42,
+        n_init="auto",
+        batch_size=batch_size
     )
+    kmeans_model.fit(vectors_db)
 
-async def _train_general_logic_hybrid(batch_size=1000, min_samples=2, enriched_vector: np.ndarray | None = None):
-    if enriched_vector is not None:
-         X = enriched_vector.reshape(1, -1)
-    else:
-        with sqlite3.connect(DB_NAME) as conn:
-            c = conn.cursor()
+    joblib.dump(kmeans_model, os.path.join(model_dir, "kmeans.joblib"))
+
+    n_components = max(2, min(5, len(vectors_db) // 10))
+    try:
+        hmm_model = GaussianHMM(
+            n_components=n_components,
+            covariance_type="diag",
+            n_iter=200,
+            tol=1e-3,
+            verbose=False
+        )
+        hmm_model.fit(vectors_db)
+        joblib.dump(hmm_model, os.path.join(model_dir, "hmm.joblib"))
+    except Exception as e:
+        print(f"⚠️ Error entrenando HMM: {e}")
+        hmm_model = None
+
+    KMEANS_MODELS[tester_id] = kmeans_model
+    HMM_MODELS[tester_id] = hmm_model
+
+    print(f"✅ Modelos guardados correctamente en {model_dir}")
+
+
+
+
+async def _train_general_logic_hybrid(
+    batch_size=1000,
+    min_samples=2,
+    enriched_vector: np.ndarray | None = None
+):
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT collect_node_tree
+            FROM accessibility_data
+            WHERE collect_node_tree IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (batch_size,))
+        rows = c.fetchall()
+
+        if len(rows) < min_samples:
+            need = min_samples - len(rows)
             c.execute("""
                 SELECT collect_node_tree
                 FROM accessibility_data
                 WHERE collect_node_tree IS NOT NULL
-                ORDER BY created_at DESC
+                ORDER BY created_at ASC
                 LIMIT ?
-            """, (batch_size,))
-            rows = c.fetchall()
-            if len(rows) < min_samples:
-                need = min_samples - len(rows)
-                c.execute("""
-                    SELECT collect_node_tree
-                    FROM accessibility_data
-                    WHERE collect_node_tree IS NOT NULL
-                    ORDER BY created_at ASC
-                    LIMIT ?
-                """, (need,))
-                rows = c.fetchall() + rows
-        X = features_from_rows(rows)
-        if X.size == 0: 
+            """, (need,))
+            rows = c.fetchall() + rows
+
+    X_db = features_from_rows(rows)
+
+    if X_db.size > 0:
+        print(f"[DEBUG] Cantidad de vectores DB: {X_db.shape[0]}")
+        print(f"[DEBUG] Vectores únicos DB: {len(np.unique(X_db, axis=0))}")
+
+        # ===================== NORMALIZACIÓN DE VECTORES =====================
+        def normalize_vector_length(vec, expected_len):
+            vec = np.array(vec, dtype=float).flatten()
+            if len(vec) < expected_len:
+                vec = np.pad(vec, (0, expected_len - len(vec)))  # rellena con ceros
+            elif len(vec) > expected_len:
+                vec = vec[:expected_len]  # recorta si es más largo
+            return vec
+
+        # Si no llega enriched_vector, crear uno neutro
+        if enriched_vector is None:
+            print("⚠️ 'enriched_vector' no se pasó correctamente. Se usará vector neutro.")
+            enriched_vector = np.zeros(X_db.shape[1])
+
+        # Calcula longitud esperada según el mayor vector
+        EXPECTED_VECTOR_LEN = max(
+            [len(enriched_vector)] +
+            [len(v) for v in X_db if isinstance(v, (list, np.ndarray))]
+        )
+
+        # Normaliza todos los vectores
+        enriched_vector = normalize_vector_length(enriched_vector, EXPECTED_VECTOR_LEN)
+        X_db = np.array([
+            normalize_vector_length(v, EXPECTED_VECTOR_LEN)
+            for v in X_db
+        ])
+
+        logger.debug(f"[TRAIN] Longitud esperada de vector: {EXPECTED_VECTOR_LEN}")
+        logger.debug(f"[TRAIN] enriched_vector shape: {enriched_vector.shape}, X_db shape: {X_db.shape}")
+
+        # ===================== COMBINAR VECTORES =====================
+        if enriched_vector is not None and not np.all(enriched_vector == 0):
+            X = np.vstack([enriched_vector.reshape(1, -1), X_db])
+        else:
+            X = X_db
+
+        # Elimina duplicados
+        X = np.unique(X, axis=0)
+
+        if len(X) < min_samples:
+            print(f"[DEBUG] No hay suficientes muestras para entrenar: {len(X)} < {min_samples}")
             return
 
-    # Eliminar duplicados de vectores antes de entrenar
-    X = np.unique(X, axis=0)
+        # ===================== ENTRENAMIENTO HÍBRIDO =====================
+        await _train_model_hybrid(
+            X,
+            None,
+            None,
+            _get_lock("gen"),
+            max_clusters=5,
+            desc="general"
+        )
 
-    # Entrenamiento
-    await _train_model_hybrid(X, None, None, _get_lock("gen"),
-                              max_clusters=5, desc="general")
+        # ✅ Limpieza de caché
+        KMEANS_MODELS.pop("general", None)
+        HMM_MODELS.pop("general", None)
+    else:
+        print("[DEBUG] No hay datos suficientes en la base para entrenar.")
 
-                              
-        
+
 # =========================================================
 # A partir de aquí se mantienen tus endpoints y lógica
 # collect, checkForChanges, status, etc.
@@ -971,7 +1509,28 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
         num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
         input_vec = input_features(event.actions or [])
 
-        enriched_vector = np.array(struct_vec + [avg_dwell, num_gestos] + input_vec, dtype=float)
+        # print("[DEBUG] normalized_nodes:", normalized_nodes)
+        # print("[DEBUG] struct_vec:", struct_vec)
+        # print("[DEBUG] timestamps:", timestamps)
+        # print("[DEBUG] avg_dwell:", avg_dwell)
+        # print("[DEBUG] num_gestos:", num_gestos)
+        # print("[DEBUG] input_vec:", input_vec)
+
+        #enriched_vector = np.array(struct_vec + [avg_dwell, num_gestos] + input_vec, dtype=float)
+
+        sig_vec = np.array(structure_signature_features(normalized_nodes), dtype=float)
+        input_vec = np.array(input_features(event.actions or []), dtype=float)
+        combined = np.concatenate([
+            np.array(struct_vec, dtype=float).flatten(),
+            sig_vec.flatten(),
+            np.array([avg_dwell, num_gestos], dtype=float),
+            input_vec.flatten()
+        ])
+        enriched_vector = combined.astype(float)
+
+        
+
+
         cluster_id: int | None = None
         anomaly_score: float | None = None
 
@@ -1115,33 +1674,40 @@ async def trigger_incremental_train(
 def get_screen_diffs(
     tester_id: Optional[str] = Query(None),
     build_id: Optional[str] = Query(None),
-    screen_name: Optional[str] = Query(None)
+    screen_name: Optional[str] = Query(None),
+    only_pending: bool = Query(True)  # Nuevo parámetro opcional
 ):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
     query = """
-        SELECT id, tester_id, build_id, screen_name, removed, added, modified, created_at, cluster_info
-        FROM screen_diffs
+        SELECT s.id, s.tester_id, s.build_id, s.screen_name, 
+               s.removed, s.added, s.modified, s.created_at, s.cluster_info
+        FROM screen_diffs AS s
+        LEFT JOIN diff_approvals AS a
+               ON a.diff_id = s.id
         WHERE 1=1
     """
     params = []
 
+    if only_pending:
+        query += " AND a.id IS NULL"  # Solo diffs sin aprobación
+
     if tester_id is not None:
-        query += " AND (tester_id = ? OR (tester_id IS NULL AND ? = ''))"
+        query += " AND (s.tester_id = ? OR (s.tester_id IS NULL AND ? = ''))"
         params.extend([tester_id, tester_id])
 
     if build_id is not None:
-        query += " AND (build_id = ? OR (build_id IS NULL AND ? = ''))"
+        query += " AND (s.build_id = ? OR (s.build_id IS NULL AND ? = ''))"
         params.extend([build_id, build_id])
 
     if screen_name is not None:
-        query += " AND screen_name = ?"
+        query += " AND s.screen_name = ?"
         params.append(screen_name)
 
     # Solo registros que tengan cambios en removed, added o modified
-    query += " AND (COALESCE(removed, '[]') != '[]' OR COALESCE(added, '[]') != '[]' OR COALESCE(modified, '[]') != '[]')"
-    query += " ORDER BY created_at DESC"
+    query += " AND (COALESCE(s.removed, '[]') != '[]' OR COALESCE(s.added, '[]') != '[]' OR COALESCE(s.modified, '[]') != '[]')"
+    query += " ORDER BY s.created_at DESC"
 
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
@@ -1149,7 +1715,7 @@ def get_screen_diffs(
 
     diffs = []
     for row in rows:
-        diff = {
+        diffs.append({
             "id": row[0],
             "tester_id": row[1],
             "build_id": row[2],
@@ -1159,11 +1725,9 @@ def get_screen_diffs(
             "modified": json.loads(row[6]) if row[6] else [],
             "created_at": row[7],
             "cluster_info": json.loads(row[8]) if row[8] else {}
-        }
-        diffs.append(diff)
+        })
 
-    has_changes = bool(diffs)  # Si hay diffs con cambios, es True
-
+    has_changes = bool(diffs)
     return {"screen_diffs": diffs, "has_changes": has_changes}
 
 
@@ -1521,6 +2085,297 @@ def reset_password(req: ResetPasswordRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error actualizando contraseña: {e}")
+
+@router.get("/qa_summary/{build_id}")
+def qa_summary(build_id: str, db: sqlite3.Connection = Depends(get_db)):
+    rows = db.execute("""
+        SELECT screen_name, message
+        FROM diff_trace
+        WHERE build_id=? 
+        ORDER BY screen_name
+    """, (build_id,)).fetchall()
+
+    summary = {}
+    for r in rows:
+        screen = r["screen_name"]
+        summary.setdefault(screen, []).append(r["message"])
+
+    return JSONResponse(content=summary)
+
+
+@app.get("/qa_summary/{build_id}")
+def qa_summary(build_id: str, tester_id: Optional[str] = None):
+    """
+    Devuelve resumen de cambios por pantalla para QA.
+    - Removed / Added / Modified
+    - anomaly_score
+    - cluster_id
+    - histórico de builds previas (últimas 5)
+    """
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+
+        # Obtener los diffs por pantalla
+        c.execute("""
+            SELECT header_text, removed, added, modified, cluster_info, created_at
+            FROM screen_diffs
+            WHERE build_id = ?
+        """, (build_id,))
+        diffs = c.fetchall()
+
+        summary = []
+        for row in diffs:
+            header_text, removed, added, modified, cluster_info, created_at = row
+            summary.append({
+                "screen": header_text,
+                "removed": json.loads(removed) if removed else [],
+                "added": json.loads(added) if added else [],
+                "modified": json.loads(modified) if modified else [],
+                "cluster_info": cluster_info,
+                "timestamp": created_at
+            })
+
+        # Obtener anomaly_score y cluster_id de accessibility_data
+        c.execute("""
+            SELECT header_text, enriched_vector, cluster_id, anomaly_score
+            FROM accessibility_data
+            WHERE build_id = ?
+            {}
+        """.format("AND tester_id=?" if tester_id else ""), (build_id,) if not tester_id else (build_id, tester_id))
+        vecs = c.fetchall()
+
+        for row in vecs:
+            header_text, enriched_vector, cluster_id, anomaly_score = row
+            for s in summary:
+                if normalize_header(s["screen"]) == normalize_header(header_text):
+                    s.update({
+                        "enriched_vector": json.loads(enriched_vector) if enriched_vector else None,
+                        "cluster_id": cluster_id,
+                        "anomaly_score": anomaly_score
+                    })
+
+    # Ordenar por anomaly_score descendente
+    summary.sort(key=lambda x: x.get("anomaly_score") or 0, reverse=True)
+
+    return JSONResponse(content={"build_id": build_id, "summary": summary})
+
+
+@app.get("/qa_dashboard/{build_id}", response_class=HTMLResponse)
+def qa_dashboard(build_id: str, tester_id: Optional[str] = None):
+    """
+    Dashboard ligero para QA:
+    - Cambios por pantalla
+    - Removed/Added/Modified
+    - Anomaly score y cluster
+    - Colores según criticidad
+    """
+    import json
+    import requests
+
+    # Llamar al endpoint de resumen interno
+    from fastapi.testclient import TestClient
+    client = TestClient(app)
+    response = client.get(f"/qa_summary/{build_id}" + (f"?tester_id={tester_id}" if tester_id else ""))
+    summary = response.json()["summary"]
+
+    # Generar HTML simple con colores
+    html_content = """
+    <html>
+    <head>
+        <title>QA Dashboard - Build {build_id}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 20px; }}
+            table {{ border-collapse: collapse; width: 100%; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; }}
+            th {{ background-color: #f2f2f2; }}
+            .removed {{ background-color: #f8d7da; }} 
+            .added {{ background-color: #d4edda; }}
+            .modified {{ background-color: #fff3cd; }}
+            .anomaly-high {{ font-weight: bold; color: red; }}
+        </style>
+    </head>
+    <body>
+        <h2>QA Dashboard - Build {build_id}</h2>
+        <table>
+            <tr>
+                <th>Screen</th>
+                <th>Removed</th>
+                <th>Added</th>
+                <th>Modified</th>
+                <th>Anomaly Score</th>
+                <th>Cluster ID</th>
+            </tr>
+    """.format(build_id=build_id)
+
+    for s in summary:
+        removed_count = len(s.get("removed", []))
+        added_count = len(s.get("added", []))
+        modified_count = len(s.get("modified", []))
+        anomaly_score = s.get("anomaly_score") or 0
+        cluster_id = s.get("cluster_id") or "-"
+        
+        removed_cls = "removed" if removed_count > 0 else ""
+        added_cls = "added" if added_count > 0 else ""
+        modified_cls = "modified" if modified_count > 0 else ""
+        anomaly_cls = "anomaly-high" if anomaly_score > 1 else ""  # ajustar umbral
+
+        html_content += f"""
+        <tr>
+            <td>{s['screen']}</td>
+            <td class="{removed_cls}">{removed_count}</td>
+            <td class="{added_cls}">{added_count}</td>
+            <td class="{modified_cls}">{modified_count}</td>
+            <td class="{anomaly_cls}">{anomaly_score:.2f}</td>
+            <td>{cluster_id}</td>
+        </tr>
+        """
+
+    html_content += """
+        </table>
+        <p>Colores: <span class='removed'>Removed</span>, <span class='added'>Added</span>, <span class='modified'>Modified</span></p>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html_content)
+
+
+@app.get("/qa_dashboard_advanced/{tester_id}", response_class=HTMLResponse)
+def qa_dashboard_advanced(tester_id: str, builds: Optional[int] = 5):
+    """
+    Dashboard visual avanzado para QA:
+    - Cambios por pantalla
+    - Evolución de builds recientes
+    - Anomaly score y cluster visualizados
+    """
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    # Tomar las últimas N builds para el tester
+    c.execute("""
+        SELECT screen_diffs.build_id, screen_diffs.header_text, screen_diffs.removed, 
+        screen_diffs.added, screen_diffs.modified, screen_diffs.anomaly_score, 
+        screen_diffs.cluster_id
+        FROM screen_diffs
+        LEFT JOIN accessibility_data USING (tester_id, header_text)
+        WHERE tester_id = ?
+        ORDER BY screen_diffs.created_at DESC
+        LIMIT ?
+    """, (tester_id, builds*50))  # asume hasta 50 pantallas por build
+    rows = c.fetchall()
+    conn.close()
+
+    # Preparar datos
+    builds_dict = {}
+    for r in rows:
+        build_id = r[0]
+        screen = r[1]
+        removed = len(json.loads(r[2])) if r[2] else 0
+        added = len(json.loads(r[3])) if r[3] else 0
+        modified = len(json.loads(r[4])) if r[4] else 0
+        anomaly_score = r[5] or 0
+        cluster_id = r[6] or "-"
+        if build_id not in builds_dict:
+            builds_dict[build_id] = []
+        builds_dict[build_id].append({
+            "screen": screen,
+            "removed": removed,
+            "added": added,
+            "modified": modified,
+            "anomaly_score": anomaly_score,
+            "cluster_id": cluster_id
+        })
+
+    builds_sorted = sorted(builds_dict.keys())  # orden cronológico
+
+    # Generar HTML con Chart.js
+    html_content = f"""
+    <html>
+    <head>
+        <title>QA Dashboard Avanzado - Tester {tester_id}</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 20px; }}
+            table {{ border-collapse: collapse; width: 100%; margin-bottom: 40px; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; }}
+            th {{ background-color: #f2f2f2; }}
+            .removed {{ background-color: #f8d7da; }} 
+            .added {{ background-color: #d4edda; }}
+            .modified {{ background-color: #fff3cd; }}
+            .anomaly-high {{ font-weight: bold; color: red; }}
+        </style>
+    </head>
+    <body>
+        <h2>QA Dashboard Avanzado - Tester {tester_id}</h2>
+    """
+
+    # Tabla por build
+    for build_id in builds_sorted:
+        html_content += f"<h3>Build: {build_id}</h3>"
+        html_content += """
+        <table>
+            <tr>
+                <th>Screen</th>
+                <th>Removed</th>
+                <th>Added</th>
+                <th>Modified</th>
+                <th>Anomaly Score</th>
+                <th>Cluster ID</th>
+            </tr>
+        """
+        for s in builds_dict[build_id]:
+            removed_cls = "removed" if s["removed"] > 0 else ""
+            added_cls = "added" if s["added"] > 0 else ""
+            modified_cls = "modified" if s["modified"] > 0 else ""
+            anomaly_cls = "anomaly-high" if s["anomaly_score"] > 1 else ""
+
+            html_content += f"""
+            <tr>
+                <td>{s['screen']}</td>
+                <td class="{removed_cls}">{s['removed']}</td>
+                <td class="{added_cls}">{s['added']}</td>
+                <td class="{modified_cls}">{s['modified']}</td>
+                <td class="{anomaly_cls}">{s['anomaly_score']:.2f}</td>
+                <td>{s['cluster_id']}</td>
+            </tr>
+            """
+        html_content += "</table>"
+
+    # Gráfico agregado: tendencia de Removed / Added / Modified por build
+    removed_series = [sum(s["removed"] for s in builds_dict[b]) for b in builds_sorted]
+    added_series = [sum(s["added"] for s in builds_dict[b]) for b in builds_sorted]
+    modified_series = [sum(s["modified"] for s in builds_dict[b]) for b in builds_sorted]
+
+    html_content += f"""
+    <canvas id="trendChart" width="800" height="400"></canvas>
+    <script>
+        const ctx = document.getElementById('trendChart').getContext('2d');
+        new Chart(ctx, {{
+            type: 'line',
+            data: {{
+                labels: {json.dumps(builds_sorted)},
+                datasets: [
+                    {{ label: 'Removed', data: {removed_series}, borderColor: 'red', fill: false }},
+                    {{ label: 'Added', data: {added_series}, borderColor: 'green', fill: false }},
+                    {{ label: 'Modified', data: {modified_series}, borderColor: 'orange', fill: false }}
+                ]
+            }},
+            options: {{
+                responsive: true,
+                plugins: {{
+                    legend: {{ position: 'top' }},
+                    title: {{ display: true, text: 'Cambios por Build' }}
+                }}
+            }}
+        }});
+    </script>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html_content)
 
 
 app.include_router(diff_router)
