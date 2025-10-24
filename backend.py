@@ -19,6 +19,7 @@ from sklearn.cluster import KMeans
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics.pairwise import cosine_similarity
 import httpx
+import ast
 
 from stable_signature import normalize_node
 
@@ -530,7 +531,7 @@ def preprocess_tree(tree):
 
     # Ordenar los nodos por clase + texto, ignorando jerarquía
     flat.sort(key=lambda n: (n["className"], n["text"]))
-    print("Flattened nodes:", flat)
+    # print("Flattened nodes:", flat)
     return flat
 
 
@@ -638,8 +639,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
         # 🔹 Filtrar campos efímeros automáticamente
         for ef in EPHEMERAL_FIELDS:
             if ef in normalized:
-                # Podrías poner debug opcional aquí
-                # print(f"🔧 IGNORANDO EFÍMERO → {ef}={normalized[ef]} | class={node.get('className')}")
                 normalized.pop(ef)
 
         # 🔧 Debug opcional de nodo final normalizado
@@ -651,17 +650,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
 
     print("🧩 RAW NODE → class={cls}, view_id={view_id}, text={nn.get('text')!r}")
 
-    # def make_base_key(n):
-    #     cls = (n.get("className") or "").strip()
-    #     pkg = (n.get("pkg") or "").strip()
-    #     view_id = (n.get("viewId") or "").strip()
-
-    #     if view_id:
-    #         base_key = f"{pkg}|{cls}|{view_id}"
-    #     else:
-    #         base_key = f"{pkg}|{cls}|subtree:{subtree_hash(n)}"
-    #     return base_key
-    
     def make_base_key(n):
         cls = (n.get("className") or "").strip()
         pkg = (n.get("pkg") or "").strip()
@@ -707,21 +695,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
         # --- Generamos el texto-hash (si existe texto) ---
         text_sig = hashlib.md5(text_like.lower().encode()).hexdigest()[:8] if text_like else ""
 
-        # # --- NUEVA LÓGICA ---
-        # # Si el nodo tiene viewId Y texto → incluimos el hash de texto en la clave
-        # if view_id and text_like:
-        #     key = f"{pkg}|{full_class_sig}|{view_id}|textsig:{text_like}"
-        # elif view_id:
-        #     key = f"{pkg}|{full_class_sig}|{view_id}"
-        # # elif text_like:
-        # #     key = f"{pkg}|{full_class_sig}|textsig:{text_like}"
-        # elif text_like:
-        #     print(f"🔍 TEXT BEFORE HASH → class={cls}, text_like={text_like!r}")
-        #     # text_sig = hashlib.md5(text_like.lower().encode()).hexdigest()[:20]
-        #     safe_text = text_like.replace("\n", " ").strip()[:100]
-        #     key = f"{pkg}|{full_class_sig}|textsig:{safe_text}"
-        #     # key = f"{pkg}|{full_class_sig}|textnode"
-        # --- NUEVA LÓGICA ---
         if view_id:
             # Clave estable basada en viewId y clase → no incluimos texto
             key = f"{pkg}|{full_class_sig}|{view_id}"
@@ -732,32 +705,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
         else:
             # Nodo sin viewId ni texto → hash del subárbol
             key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
-
-        # else:
-        #     key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
-
-        # --- 1. Si tiene viewId ---
-        # if view_id:
-        #     key = f"{pkg}|{full_class_sig}|{view_id}"
-
-        # --- 2. Si tiene texto visible ---
-        # elif text_like:
-        #     # ✅ Generamos hash solo para distinguir nodos de texto únicos
-        #     text_sig = hashlib.md5(text_like.lower().encode()).hexdigest()[:8]
-        #     safe_text = text_like.replace("\n", " ").strip()[:50]  # acortamos texto largo solo para debug
-        #     key = f"{pkg}|{full_class_sig}|textsig:{text_sig}"
-            # print(f"🧩 KEY DE TEXTO: {key} (texto='{safe_text}')")
-
-        #elif text_like:
-            #print(f"🔍 TEXT BEFORE HASH → class={cls}, text_like={text_like!r}")
-            #text_sig = hashlib.md5(text_like.lower().encode()).hexdigest()[:20]
-            # safe_text = text_like.replace("\n", " ").strip()[:100]
-            # key = f"{pkg}|{full_class_sig}|textsig:{safe_text}"
-            #key = f"{pkg}|{full_class_sig}|textnode"
-
-        # --- 3. Sin viewId ni texto ---
-        # else:
-        #     key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
 
         # --- 4. Estado relevante ---
         state_parts = []
@@ -776,13 +723,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
 
         return key
 
-
-    # ---------------- index trees ----------------
-    # old_idx = {make_key(n, idx): normalize_node(n) for idx, n in flatten_tree(old_tree)}
-    # new_idx = {make_key(n, idx): normalize_node(n) for idx, n in flatten_tree(new_tree)}
-
-
-
     # ---------------- index trees ----------------
     old_idx = {}
     for idx, n in flatten_tree(old_tree):
@@ -790,15 +730,11 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
         #old_idx[key] = normalize_node(n)
         key = make_key(n, idx)
         old_idx[key] = normalize_node(n)
-        # if "button" in (n.get("className") or "").lower():
-        #     print("🧩 OLD NODE →", n.get("className"), n.get("viewId"), n.get("text"), "| key:", key)
 
     new_idx = {}
     for idx, n in flatten_tree(new_tree):
         key = make_key(n, idx)
         new_idx[key] = normalize_node(n)
-        # if "button" in (n.get("className") or "").lower():
-        #     print("🧩 NEW NODE →", n.get("className"), n.get("viewId"), n.get("text"), "| key:", key)
 
         try:
             print("🧩 --- DETALLE DE CLAVES Y TEXTOS ---")
@@ -827,68 +763,22 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
     text_overlap = overlap_ratio(old_nodes, new_nodes)
     print(f"📊 Text overlap ratio: {text_overlap:.2f}")
 
-    print("Old nodes:", old_nodes)
-    print("New nodes:", new_nodes)
-
-    # print("🧱 --- OLD CLASSES ---")
-    # for n in old_nodes:
-    #     cls_name = n.get("className") or ""
-    #     if "button" in cls_name.lower():
-    #         print("   OLD:", cls_name)
-
-    # print("🧱 --- NEW CLASSES ---")
-    # for n in new_nodes:
-    #     cls_name = n.get("className") or ""
-    #     if "button" in cls_name.lower():
-    #         print("   NEW:", cls_name)
-
-
-    # print("📋 --- OLD TREE KEYS ---")
-    # for k in old_idx.keys():
-    #     if "button" in k:
-    #         print("   ", k)
-
-    # print("📋 --- NEW TREE KEYS ---")
-    # for k in new_idx.keys():
-    #     if "button" in k:
-    #         print("   ", k)
-
-
-    # Calcular overlap textual
-    # overlap = overlap_ratio(old_nodes, new_nodes)
-    # logger.info(f"📊 Text overlap ratio: {overlap:.2f}")
-
     added = [{"node": {"key": k, "class": v.get("className")}, "changes": {}} for k, v in new_idx.items() if k not in old_idx]
     removed = [{"node": {"key": k, "class": v.get("className")}, "changes": {}} for k, v in old_idx.items() if k not in new_idx]
 
     modified, ignored_changes = [], []
 
-    print("\n🔎 COMPARANDO CLAVES ENTRE OLD_IDX y NEW_IDX...")
-    print(f"   🔹 Total old: {len(old_idx)} | Total new: {len(new_idx)}")
-
         # --- Detectar removidos ---
-    for k, v in old_idx.items():
-        if k not in new_idx:
-            print(f"   ❌ REMOVIDO: {k} ({v.get('className')}, text='{v.get('text', '')[:40]}')")
-            removed.append({"node": {"key": k, "class": v.get("className")}, "changes": {}})
+    # for k, v in old_idx.items():
+    #     if k not in new_idx:
+    #         print(f"   ❌ REMOVIDO: {k} ({v.get('className')}, text='{v.get('text', '')[:40]}')")
+    #         removed.append({"node": {"key": k, "class": v.get("className")}, "changes": {}})
 
-    # --- Detectar agregados ---
-    for k, v in new_idx.items():
-        if k not in old_idx:
-            print(f"   ➕ AGREGADO: {k} ({v.get('className')}, text='{v.get('text', '')[:40]}')")
-            added.append({"node": {"key": k, "class": v.get("className")}, "changes": {}})
-
-
-    print("🧩 --- DETALLE COMPLETO DE TEXTOS (OLD vs NEW) ---")
-    for k in sorted(set(list(old_idx.keys()) + list(new_idx.keys()))):
-        old_text = old_idx.get(k, {}).get("text", "<no existe>")
-        new_text = new_idx.get(k, {}).get("text", "<no existe>")
-        if old_text != new_text:
-            print(f"🔸 DIF TEXT → Key: {k}")
-            print(f"   OLD TEXT: {old_text!r}")
-            print(f"   NEW TEXT: {new_text!r}")
-        else:
-            print(f"✅ IGUAL → {k} → '{new_text}'")
+    # # --- Detectar agregados ---
+    # for k, v in new_idx.items():
+    #     if k not in old_idx:
+    #         print(f"   ➕ AGREGADO: {k} ({v.get('className')}, text='{v.get('text', '')[:40]}')")
+    #         added.append({"node": {"key": k, "class": v.get("className")}, "changes": {}})
 
     # ---------------- detect modifications ----------------
     for k, nn in new_idx.items():
@@ -924,7 +814,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
 
     print(f"🧮 Raw compare_trees → removed={len(removed)}, added={len(added)}, modified={len(modified)}")
 
-
        # ---------------- filtro de recarga visual ----------------
     total_old = len(old_idx)
     total_new = len(new_idx)
@@ -939,9 +828,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
         for v in new_idx.values()
     )
 
-    # if reload_ratio > 0.4 or has_loader:
-    #     print(f"⚠️ Recarga visual detectada (ratio={reload_ratio:.2f}, loader={has_loader}) → limpiando added/removed")
-    #     removed, added = [], []
 
     # ============================================================
     # 🧩 FILTRO 2: Pares estáticos (mismo texto en added/removed)
@@ -954,6 +840,15 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
         if "text:" in key:
             return key.split("text:")[-1].strip()
         return ""
+    
+    # 👉 Agrega aquí:
+    import difflib
+    def similarity_ratio(a: str, b: str) -> float:
+        """Calcula similitud de texto normalizada."""
+        a, b = (a or "").strip().lower(), (b or "").strip().lower()
+        if not a or not b:
+            return 0.0
+        return difflib.SequenceMatcher(None, a, b).ratio()    
 
     # 1️⃣ Extrae los textos antes de filtrar
     old_texts_raw = {normalize_node(n).get("text", "") for _, n in flatten_tree(old_tree) if n.get("text")}
@@ -997,11 +892,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
         print(f"⚠️ Error al detectar cambios globales de texto: {e}")
 
     # ============================================================
-    # ✅ Resultado final
-    # ============================================================
-
-
-    # ============================================================
 # 🧠 DETECCIÓN DE CAMBIO DE TEXTO EN EL MISMO NODO
 # ============================================================
     try:
@@ -1025,6 +915,32 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
                     print(f"    '{old_text}' → '{new_text}'")
     except Exception as e:
         print(f"⚠️ Error en detección de texto en mismo nodo: {e}")
+
+    # 🧠 Detección de cambio de texto entre nodos agregados/removidos
+    detected_text_mods = []
+    for r in removed:
+        r_text = extract_text_from_key(r["node"]["key"])
+        for a in added:
+            a_text = extract_text_from_key(a["node"]["key"])
+            if r_text and a_text and similarity_ratio(r_text, a_text) > 0.6:
+                modified.append({
+                    "node": {"key": a["node"]["key"], "class": a["node"]["class"]},
+                    "changes": {"text": {"old": r_text, "new": a_text}}
+                })
+                detected_text_mods.append((r_text, a_text))
+
+    # Si se detectan modificaciones de texto, remueve esos pares de added/removed
+    if detected_text_mods:
+        removed = [
+            r for r in removed
+            if all(similarity_ratio(extract_text_from_key(r["node"]["key"]), old) <= 0.6
+                   for old, _ in detected_text_mods)
+        ]
+        added = [
+            a for a in added
+            if all(similarity_ratio(extract_text_from_key(a["node"]["key"]), new) <= 0.6
+                   for _, new in detected_text_mods)
+        ]    
 
     #return removed, added, modified
     return {
@@ -1484,6 +1400,7 @@ async def analyze_and_train(event: AccessibilityEvent):
     norm = _normalize_event_fields(event)
     t_id, b_id = norm.get("tester_id_norm"), norm.get("build_id_norm")
     s_name = normalize_header(event.header_text)
+    event_type_ref = normalize_header(event.event_type_name)
     app_name = event.package_name or "default_app"
     tester_id = event.tester_id or "general"
     build_id = event.build_id
@@ -1513,7 +1430,7 @@ async def analyze_and_train(event: AccessibilityEvent):
 
     # -------------------- Obtener snapshot previo ----------------
     prev_tree = None
-    prev_enriched_vec = np.zeros_like(enriched_vector)
+    #last_enriched_vec = np.zeros_like(enriched_vector)
 
     IGNORED_FIELDS = {"text", "headerText", "hint", "contentDescription", "value", "progress"}
 
@@ -1542,10 +1459,51 @@ async def analyze_and_train(event: AccessibilityEvent):
             SELECT collect_node_tree, header_text, signature, enriched_vector, build_id, event_type_name
             FROM accessibility_data
             WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
+              AND build_id != ? 
+              AND signature = ?                                      
             ORDER BY created_at DESC
             LIMIT 5
-        """, (t_id,)).fetchall()
+        """, (t_id, b_id, sig)).fetchall()
+        # 2️⃣ Si no hay coincidencias exactas, buscar por className + header_text
+    if not prev_rows:
+        prev_rows = conn.execute("""
+            SELECT collect_node_tree, header_text, signature, enriched_vector, build_id, event_type_name
+            FROM accessibility_data
+            WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(header_text)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(event_type_name)) = LOWER(TRIM(?))
+            ORDER BY created_at DESC
+            LIMIT 3
+        """, (t_id, s_name, event_type_ref)).fetchall()
 
+     #prev_enriched_vec = np.zeros_like(enriched_vector)
+
+    best_row = None
+    best_sim = 0.0 
+
+    for row in prev_rows:
+        try:
+            prev_enriched_vec = np.array(ast.literal_eval(row[3]), dtype=float)
+
+            min_len = min(len(prev_enriched_vec), len(enriched_vector))
+            prev_vec = prev_enriched_vec[:min_len]
+            curr_vec = enriched_vector[:min_len]
+
+            sim = np.dot(curr_vec, prev_vec) / (
+                np.linalg.norm(curr_vec) * np.linalg.norm(prev_vec) + 1e-8
+            )
+
+            if sim > best_sim:
+                best_sim = sim
+                best_row = row
+        except Exception:
+            continue
+
+    if best_row:
+        logger.info(f"🤝 Coincidencia estructural detectada entre builds (similitud={best_sim:.3f})")
+    else:
+        logger.warning("⚠️ No se encontró coincidencia ni por signature ni por estructura.")
+    
     previous_row = None
     if prev_rows:
         latest_event = getattr(event, "event_type_name", None)
@@ -1635,15 +1593,60 @@ async def analyze_and_train(event: AccessibilityEvent):
         text_diff = diff_result.get("text_diff", {})
 
         # -------------------- Convertir cambios de texto a modified ----------------
+        # for r in removed[:]:
+        #     if r["node"].get("text") in text_diff.get("removed", []):
+        #         removed.remove(r)
+        #         modified.append({
+        #             "node": r["node"],
+        #             "changes": {"text": {"old": r["node"]["text"], "new": text_diff["added"].get(r["node"]["text"], "")}}
+        #         })
+        # for a in added[:]:
+        #     if a["node"].get("text") in text_diff.get("added", []):
+        #         added.remove(a)
+
+        # -------------------- Convertir cambios de texto (de text_diff) a modified ----------------
+        
+        def extract_text_from_key(key: str) -> str:
+            """Extrae el texto visible desde una clave tipo textsig: o text:."""
+            if not key:
+                return ""
+            if "textsig:" in key:
+                return key.split("textsig:")[-1].strip()
+            if "text:" in key:
+                return key.split("text:")[-1].strip()
+            return ""
+
+        def similarity_ratio(a: str, b: str) -> float:
+            """Devuelve la similitud (0.0 a 1.0) entre dos textos."""
+            a, b = (a or "").strip().lower(), (b or "").strip().lower()
+            if not a or not b:
+                return 0.0
+            return difflib.SequenceMatcher(None, a, b).ratio()
+
         for r in removed[:]:
-            if r["node"].get("text") in text_diff.get("removed", []):
-                removed.remove(r)
-                modified.append({
-                    "node": r["node"],
-                    "changes": {"text": {"old": r["node"]["text"], "new": text_diff["added"].get(r["node"]["text"], "")}}
-                })
+            r_text = extract_text_from_key(r["node"]["key"])
+            # Buscar si el texto removido coincide con alguno de los text_diff
+            if r_text in text_diff.get("removed_texts", []):
+                # Buscar la mejor coincidencia con textos agregados
+                best_match = None
+                best_sim = 0.0
+                for new_t in text_diff.get("added_texts", []):
+                    sim = similarity_ratio(r_text, new_t)
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_match = new_t
+                # Si hay coincidencia fuerte, convertir en "modified"
+                if best_match and best_sim > 0.6:
+                    removed.remove(r)
+                    modified.append({
+                        "node": r["node"],
+                        "changes": {"text": {"old": r_text, "new": best_match}}
+                    })
+
+        # Limpiar los added ya usados en modificaciones
         for a in added[:]:
-            if a["node"].get("text") in text_diff.get("added", []):
+            a_text = extract_text_from_key(a["node"]["key"])
+            if a_text in text_diff.get("added_texts", []):
                 added.remove(a)
 
         removed_all.extend(removed)
@@ -2244,18 +2247,30 @@ def get_screen_diffs(
         params.extend([tester_id, tester_id])
 
     if build_id is not None:
-        query += " AND (s.build_id = ? OR (s.build_id IS NULL AND ? = ''))"
-        params.extend([build_id, build_id])
+        query += """
+            AND (
+                TRIM(CAST(s.build_id AS TEXT)) = TRIM(?)
+                OR (s.build_id IS NULL AND ? = '')
+            )
+        """
+        params.extend([str(build_id).strip(), str(build_id).strip()])
 
     if screen_name is not None:
-        query += " AND s.screen_name = ?"
-        params.append(screen_name)
+        query += """
+                AND (
+                    LOWER(TRIM(s.header_text)) = LOWER(TRIM(?))
+                    OR (TRIM(s.header_text) = '' AND ? = '')
+                    OR (s.header_text IS NULL AND ? = '')
+                )
+            """
+        params.extend([screen_name, screen_name, screen_name])
 
     query += """
         AND (
             COALESCE(s.removed, '[]') != '[]'
             OR COALESCE(s.added, '[]') != '[]'
             OR COALESCE(s.modified, '[]') != '[]'
+            OR (s.text_diff IS NOT NULL AND TRIM(s.text_diff) NOT IN ('{}', '', 'null'))
         )
         ORDER BY s.created_at DESC
     """
@@ -2397,28 +2412,27 @@ def get_screen_diffs(
             "screen_status": screen_status,
             "detailed_changes": detailed_changes,
             "created_at": row[8],
-            "cluster_info": json.loads(row[9]) if row[9] else {},
+            "cluster_info": json.loads(row[10]) if row[10] else {},
             "detailed_summary": summary_text  # 🆕 Nuevo campo
         })
 
     # ✅ Cálculo robusto de has_changes
-    # has_changes = any(
-    #     len(d.get("removed", [])) > 0 or
-    #     len(d.get("added", [])) > 0 or
-    #     len(d.get("modified", [])) > 0
-    #     for d in diffs
-    # )
-
-    # ✅ Cálculo robusto de has_changes (incluye cambios de texto)
     has_changes = any(
-        len(d.get("removed", [])) > 0 or
-        len(d.get("added", [])) > 0 or
-        len(d.get("modified", [])) > 0 or
-        (d.get("text_diff", {}).get("overlap_ratio", 1.0) < 0.95)
+        len(d.get("removed", [])) > 0
+        or len(d.get("added", [])) > 0
+        or len(d.get("modified", [])) > 0
+        or (
+            isinstance(d.get("text_diff"), dict)
+            and (
+                d["text_diff"].get("overlap_ratio", 1.0) < 0.95
+                or len(d["text_diff"].get("removed_texts", [])) > 0
+                or len(d["text_diff"].get("added_texts", [])) > 0
+            )
+        )
         for d in diffs
     )
 
-    # print(f"🧩 has_changes={has_changes} | total_diffs={len(diffs)}")
+    print(f"🧩 has_changes={has_changes} | total_diffs={len(diffs)}")
 
     return {
         "screen_diffs": diffs,
