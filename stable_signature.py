@@ -17,4 +17,4 @@ def normalize_tree(nodes: List[Dict]) -> List[Dict]:
 def stable_signature(nodes: List[Dict]) -> str:
     """Genera un hash estable del árbol normalizado."""
     norm = normalize_tree(nodes)
-    return hashlib.sha256(json.dumps(norm, sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(norm, sort_keys=True, ensure_ascii=False).encode()).hexdigest()

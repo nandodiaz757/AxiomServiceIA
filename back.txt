@@ -1,26 +1,45 @@
-from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPException, Depends
+from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPException, Depends, WebSocket
 from typing import Optional, Union, List, Dict, Any
-from pydantic import BaseModel, Field
-import sqlite3, json, joblib, numpy as np, os, hashlib, logging, asyncio
-from sklearn.cluster import MiniBatchKMeans
+from pydantic import BaseModel, Field, EmailStr
+import sqlite3, json, joblib, numpy as np, os, hashlib, logging, asyncio, re, unicodedata
+from sklearn.cluster import MiniBatchKMeans 
 from hmmlearn import hmm
 from fastapi.responses import JSONResponse
 from fastapi_utils.tasks import repeat_every
 from diff_model.predict_diff import router as diff_router
 from datetime import datetime
-
+from email_service import send_email
+from reset_service import generate_code, validate_code
+import random, time
+from collections import Counter
+import math
+from sklearn.cluster import KMeans 
+    
 # =========================================================
 # CONFIGURACIÓN
 # =========================================================
 app = FastAPI()
 router = APIRouter() 
+
+if 'kmeans_model' not in globals():
+    kmeans_model = KMeans(n_clusters=5)
+if 'hmm_model' not in globals():
+    hmm_model = hmm.GaussianHMM(n_components=5)
+
 DB_NAME = "accessibility.db"
 MODELS_DIR = "models"
 logger = logging.getLogger("myapp")
 logger.setLevel(logging.INFO)
-app.include_router(diff_router)
 
+ENRICHED_VECTOR_THRESHOLD = 0.5  # Ajusta este valor según tu lógica
 
+# Estructura para historial de booleanos (para alertas de cambios)
+
+BOOL_HISTORY = {}  
+codes_db = {}
+KMEANS_MODELS = {}
+HMM_MODELS = {}
+SEQ_LENGTH = {}  # Longitud de la secuencia para el modelo HMM 
 
 if not logger.hasHandlers():
     ch = logging.StreamHandler()
@@ -33,6 +52,18 @@ TRAIN_GENERAL_ON_COLLECT = True
 
 # Locks para entrenamientos concurrentes
 _model_locks: Dict[str, asyncio.Lock] = {}
+
+
+class SendCodeRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str = Field(..., alias="newPassword")
+
+class ResetRequest(BaseModel):
+    email: EmailStr
 
 
 # === Reentrenamiento automático del modelo diff ===
@@ -52,6 +83,15 @@ def _get_lock(key: str) -> asyncio.Lock:
         _model_locks[key] = asyncio.Lock()
     return _model_locks[key]
 
+
+def sequence_entropy(seq: list[str]) -> float:
+    """Calcula la entropía de Shannon de una secuencia de elementos."""
+    if not seq:
+        return 0.0
+    counts = Counter(seq)
+    total = len(seq)
+    ent = -sum((count/total) * math.log2(count/total) for count in counts.values())
+    return ent
 # =========================================================
 # BASE DE DATOS
 # =========================================================
@@ -93,6 +133,9 @@ def init_db():
             collect_node_tree TEXT,
             additional_info TEXT,
             tree_data TEXT,
+            enriched_vector TEXT,
+            cluster_id INTEGER,
+            anomaly_score REAL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -102,12 +145,24 @@ def init_db():
             tester_id TEXT,
             build_id TEXT,
             screen_name TEXT,
+            header_text TEXT,
             removed TEXT,
             added TEXT,
             modified TEXT,
+            cluster_info TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS boolean_history (
+            screen_id TEXT,
+            node_key TEXT,
+            property TEXT,
+            last_value BOOLEAN,
+            PRIMARY KEY(screen_id, node_key, property)
+        );
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS diff_trace (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,6 +189,16 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+        # --- OPCIONAL: para almacenar códigos de verificación ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS password_reset_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            code TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_data_tester_build_screen
         ON accessibility_data(tester_id, build_id, screen_names, created_at DESC)
@@ -150,6 +215,11 @@ init_db()
 # =========================================================
 # MODELOS DE ENTRADA
 # =========================================================
+class ActionEvent(BaseModel):
+    type: str
+    timestamp: float
+    # otros campos que tenga cada acción
+
 class AccessibilityEvent(BaseModel):
     # Identificación de tester y build (usa alias en camelCase para que coincida con el JSON entrante)
     tester_id: Optional[str] = Field(None, alias="actualDevice")
@@ -170,8 +240,9 @@ class AccessibilityEvent(BaseModel):
     header_text: Optional[str] = Field(None, alias="headerText")
     
     # Datos de dispositivo y versión de la app
-    actual_device: Optional[str] = Field(None, alias="actualDevice")    
-    version: Optional[str] = Field(None, alias="version")
+    actual_device: Optional[str] = Field(None, alias="actualDevices")    
+    version: Optional[str] = Field(None, alias="versions")
+    actions: Optional[List[ActionEvent]] = []
     
     # Árbol de nodos capturado (puede ser dict o lista de nodos)
     # collect_node_tree: Optional[Union[Dict, List]] = Field(None, alias="collectNodeTree")
@@ -261,60 +332,153 @@ def normalize_tree(nodes: List[Dict]) -> List[Dict]:
 def stable_signature(nodes: List[Dict]) -> str:
     return hashlib.sha256(json.dumps(normalize_tree(nodes), sort_keys=True).encode()).hexdigest()
 
+def generate_code():
+    """Genera un código de 6 dígitos"""
+    return str(random.randint(100000, 999999))
+
+
+def save_reset_code(email: str, code: str):
+    try:
+        expires_at = int(time.time()) + 900
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO password_reset_codes (email, code, expires_at)
+            VALUES (?, ?, ?)
+        """, (email, code, expires_at))
+        conn.commit()
+        conn.close()
+        print(f"✅ Código guardado para {email}")
+    except Exception as e:
+        print(f"❌ Error guardando código en BD: {e}")
+
+
+def validate_code(email: str, code: str, expiration_seconds: int = 300) -> bool:
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""
+        SELECT expires_at FROM password_reset_codes
+        WHERE email = ? AND code = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+    """, (email, code))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        return False
+
+    if int(time.time()) > row[0]:
+        return False
+
+    return True  
+
+
+def update_bool_history(screen_id, db_conn):
+    """Guarda BOOL_HISTORY en la BD."""
+    cursor = db_conn.cursor()
+    for node_key, props in BOOL_HISTORY.items():
+        for prop, val in props.items():
+            cursor.execute("""
+                INSERT INTO boolean_history(screen_id, node_key, property, last_value)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(screen_id, node_key, property)
+                DO UPDATE SET last_value = excluded.last_value
+            """, (screen_id, node_key, prop, int(val)))
+    db_conn.commit()
 
 def compare_trees(old_tree, new_tree):
+    """Compara dos árboles de nodos accesibles y detecta nodos agregados, eliminados o modificados."""
     old_tree = ensure_list(old_tree)
     new_tree = ensure_list(new_tree)
-    def make_key(n):
-        if not isinstance(n, dict): return None
-        parts = [n.get("viewId"), n.get("className"), n.get("headerText")]
-        return "|".join([str(p) for p in parts if p])
-    old_idx = {make_key(n): n for n in old_tree if make_key(n)}
-    new_idx = {make_key(n): n for n in new_tree if make_key(n)}
+
+    SAFE_KEYS = [
+        "viewId", "className", "headerText", "text", "contentDescription",
+        "checked", "enabled", "focusable", "clickable", "otherField"
+    ]
+
+    TEXT_FIELDS = ["text", "contentDescription", "headerText"]
+    BOOL_FIELDS = ["checked", "enabled", "focusable", "clickable"]
+    OTHER_FIELDS = ["className", "viewId", "otherField"]
+
+    def normalize_node(node: dict) -> dict:
+        """Convierte None a cadena vacía y asegura que todos los valores sean tipo str o bool válidos."""
+        normalized = {}
+        for k in SAFE_KEYS:
+            v = node.get(k)
+            if isinstance(v, bool):
+                normalized[k] = v
+            elif v is None:
+                normalized[k] = ""
+            else:
+                normalized[k] = str(v).strip()
+        return normalized
+
+    def make_key(n, idx):
+        """Crea una clave única para identificar nodos similares."""
+        if not isinstance(n, dict):
+            return None
+        n = normalize_node(n)
+        parts = [
+            n.get("viewId"),
+            n.get("className"),
+            n.get("headerText"),
+            n.get("text"),
+            n.get("contentDescription"),
+        ]
+        return "|".join([str(p) for p in parts if p]) + f"#{idx}"
+
+    # Índices de nodos previos y actuales
+    old_idx = {make_key(n, i): n for i, n in enumerate(old_tree) if make_key(n, i)}
+    new_idx = {make_key(n, i): n for i, n in enumerate(new_tree) if make_key(n, i)}
+
+    # Detectar eliminados y agregados
     removed = [n for k, n in old_idx.items() if k not in new_idx]
-    added   = [n for k, n in new_idx.items() if k not in old_idx]
+    added = [n for k, n in new_idx.items() if k not in old_idx]
     modified = []
+
     for k, nn in new_idx.items():
         if k in old_idx:
-            changes = {f: {"old": old_idx[k].get(f), "new": nn.get(f)}
-                       for f in ["text","contentDescription","checked","enabled"]
-                       if old_idx[k].get(f) != nn.get(f)}
+            changes = {}
+            old_node = normalize_node(old_idx[k])
+            new_node = normalize_node(nn)
+
+            for f in TEXT_FIELDS + BOOL_FIELDS + OTHER_FIELDS:
+                old_val = old_node.get(f)
+                new_val = new_node.get(f)
+
+                if f in BOOL_FIELDS:
+                    # Inicializar historial del nodo
+                    if k not in BOOL_HISTORY:
+                        BOOL_HISTORY[k] = {}
+                    # Primera vez que aparece la propiedad → guardar y no alertar
+                    if f not in BOOL_HISTORY[k]:
+                        BOOL_HISTORY[k][f] = new_val
+                        continue
+                    # Si cambia respecto al historial → alertar y actualizar historial
+                    if BOOL_HISTORY[k][f] != new_val:
+                        changes[f] = {"old": BOOL_HISTORY[k][f], "new": new_val}
+                        BOOL_HISTORY[k][f] = new_val
+                else:
+                    if old_val != new_val:
+                        changes[f] = {"old": old_val, "new": new_val}
+
             if changes:
                 modified.append({"node": {"key": k}, "changes": changes})
+
     return removed, added, modified
+
 
 # =========================================================
 # VECTORIZACIÓN Y FEATURES
 # =========================================================
-def compare_trees(old_tree, new_tree):
-    old_tree = ensure_list(old_tree)
-    new_tree = ensure_list(new_tree)
-    def make_key(n):
-        if not isinstance(n, dict): return None
-        parts = [n.get("viewId"), n.get("className"), n.get("headerText")]
-        return "|".join([str(p) for p in parts if p])
-    old_idx = {make_key(n): n for n in old_tree if make_key(n)}
-    new_idx = {make_key(n): n for n in new_tree if make_key(n)}
-    removed = [n for k, n in old_idx.items() if k not in new_idx]
-    added   = [n for k, n in new_idx.items() if k not in old_idx]
-    modified = []
-    for k, nn in new_idx.items():
-        if k in old_idx:
-            changes = {f: {"old": old_idx[k].get(f), "new": nn.get(f)}
-                       for f in ["text","contentDescription","checked","enabled"]
-                       if old_idx[k].get(f) != nn.get(f)}
-            if changes:
-                modified.append({"node": {"key": k}, "changes": changes})
-    return removed, added, modified
+
 
 def features_from_rows(rows) -> np.ndarray:
     vecs = [vector_from_tree(r[0]) for r in rows if r and r[0]]
     return np.vstack(vecs) if vecs else np.empty((0,3))
     
-    
-# =========================================================
-# VECTORIZACIÓN Y FEATURES
-# =========================================================
+
 def vector_from_tree(tree_str: str) -> np.ndarray:
     """
     Genera un vector:
@@ -361,23 +525,6 @@ def features_from_rows(rows) -> np.ndarray:
 # =========================================================
 # ENTRENAMIENTO HÍBRIDO (KMeans + HMM)
 # =========================================================
-# async def _train_model_hybrid(X, tester_id, build_id, lock: asyncio.Lock,
-                              # max_clusters=3, min_samples=2,
-                              # desc="", n_hmm_states=5):
-    # async with lock:
-        # if len(X) < min_samples:
-            # logger.info(f"[train_hybrid] muestras insuficientes {desc}")
-            # return
-        # kmeans = MiniBatchKMeans(n_clusters=min(max_clusters,len(X)), random_state=42).fit(X)
-        # hmm_model = hmm.GaussianHMM(
-            # n_components=min(n_hmm_states,len(X)),
-            # covariance_type="diag", n_iter=100
-        # ).fit(X, [len(X)])
-        # base = os.path.join(MODELS_DIR, tester_id or "general", build_id or "default")
-        # os.makedirs(base, exist_ok=True)
-        # joblib.dump({"kmeans": kmeans, "hmm": hmm_model}, os.path.join(base, "model.pkl"))
-        # logger.info(f"[train_hybrid] Modelo guardado {desc}")
-        
         
 async def _train_model_hybrid(
     X,
@@ -391,6 +538,7 @@ async def _train_model_hybrid(
 ):
     async with lock:
         if len(X) < min_samples:
+            logger.info(f"[train_hybrid] tamaño de X={len(X)}, min_samples={min_samples}, desc={desc}")
             logger.info(f"[train_hybrid] muestras insuficientes {desc}")
             return
 
@@ -417,87 +565,252 @@ async def _train_model_hybrid(
 # =========================================================
 
 
+def normalize_header(text: str) -> str:
+    if not text:
+        return ""
+    # Quitar acentos y normalizar unicode
+    text = "".join(
+        c for c in unicodedata.normalize("NFD", text)
+        if unicodedata.category(c) != "Mn"
+    )
+    # Minúsculas, strip y colapsar espacios
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
 async def analyze_and_train(event: AccessibilityEvent):
+    # Normalizar campos y extraer IDs
     norm = _normalize_event_fields(event)
     t_id, b_id = norm.get("tester_id_norm"), norm.get("build_id_norm")
-    s_name = event.screen_names or ""
+    s_name = normalize_header(event.header_text)
+
+    # Árbol de nodos y firma
     latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
     sig = stable_signature(latest_tree)
 
-    with sqlite3.connect(DB_NAME) as conn:
-        if conn.execute("""
-            SELECT 1 FROM accessibility_data
-            WHERE IFNULL(screen_names,'')=IFNULL(?, '')
-              AND IFNULL(tester_id,'')=IFNULL(?, '')
-              AND signature=?
-            LIMIT 1
-        """, (s_name, t_id, sig)).fetchone():
-            logger.info("[diff-trace] firma ya existente, skip")
-            return
+    # ---------- Generar features enriquecidas ----------
+    struct_vec = ui_structure_features(latest_tree)
 
+    # Timing y gestos
+    timestamps = [e.timestamp for e in ensure_list(event.actions or [])]
+    time_deltas = np.diff(timestamps) if len(timestamps) > 1 else [0]
+    avg_dwell = float(np.mean(time_deltas)) if len(time_deltas) > 0 else 0
+    num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
+
+    # Input patterns
+    input_vec = input_features(event.actions or [])
+
+    # Vector final
+    enriched_vector = np.array(
+        struct_vec + [avg_dwell, num_gestos] + input_vec,
+        dtype=float
+    )
+    # ---------------------------------------------------
+
+    # Obtener último árbol previo
     with sqlite3.connect(DB_NAME) as conn:
         prev = conn.execute("""
-            SELECT collect_node_tree
+            SELECT collect_node_tree, signature, enriched_vector
             FROM accessibility_data
-            WHERE IFNULL(screen_names,'')=IFNULL(?, '')
+            WHERE IFNULL(TRIM(LOWER(header_text)), '') = IFNULL(TRIM(LOWER(?)), '')
+              AND TRIM(tester_id) = TRIM(?)
             ORDER BY created_at DESC
-            LIMIT 3
-        """, (s_name,)).fetchall()
+            LIMIT 1                
+        """, (s_name, t_id)).fetchone()
 
-    prev_trees = [ensure_list(r[0]) for r in prev]
-    if not prev_trees:
-        _insert_diff_trace(t_id, b_id, s_name, "Sin cambios (primera captura)")
-        await _train_incremental_logic_hybrid(t_id, b_id)
+    if not prev:
+        _insert_diff_trace(t_id, b_id, s_name or "<sin header>", "Sin cambios (primera captura)")
+        await _train_incremental_logic_hybrid(t_id, b_id, enriched_vector=enriched_vector)
+
+        
         if TRAIN_GENERAL_ON_COLLECT:
-            await _train_general_logic_hybrid()
+            await _train_general_logic_hybrid(enriched_vector=enriched_vector)
+        return
+    
+    # Validar cantidad de columnas
+    if len(prev) != 3:
+        print(f"⚠️ prev tiene {len(prev)} columnas, esperado 3 → {prev}")
+        _insert_diff_trace(t_id, b_id, s_name, f"Error: resultado inesperado ({len(prev)} columnas)")
         return
 
-    removed, added, modified = [], [], []
-    for p in prev_trees:
-        r,a,m = compare_trees(p, latest_tree)
-        removed += r; added += a; modified += m
+    collect_json, prev_sig, prev_vec = prev
 
-    if not (removed or added or modified):
-        _insert_diff_trace(t_id, b_id, s_name, "Sin cambios significativos")
+
+    try:
+        prev_tree = ensure_list(json.loads(collect_json))
+    except Exception as e:
+        print(f"⚠️ Error decodificando JSON del árbol previo: {e}")
+        prev_tree = []
+            
+    prev_vec = np.array(json.loads(prev_vec)) if prev_vec else None
+
+    if not isinstance(prev_tree, list) or not prev_tree:
+        _insert_diff_trace(t_id, b_id, s_name, "Sin cambios (árbol previo vacío)")
         return
 
-    removed_j, added_j, mod_j = map(lambda x: json.dumps(x, sort_keys=True),
-                                    (removed, added, modified))
+    # Comparación con compare_trees
+    removed, added, modified = compare_trees(prev_tree, latest_tree)
+
+    # Caso 1: firmas iguales y no hay diffs
+    if sig == prev_sig and not (removed or added or modified):
+        anomaly = False
+        if prev_vec is not None:
+            diff_norm = np.linalg.norm(enriched_vector - prev_vec)
+            anomaly = diff_norm > ENRICHED_VECTOR_THRESHOLD
+        _insert_diff_trace(
+            t_id, b_id, s_name,
+            "Sin cambios significativos" + (" pero vector difiere" if anomaly else "")
+        )
+    else:
+        removed_j, added_j, mod_j = map(lambda x: json.dumps(x, sort_keys=True),
+                                        (removed, added, modified))
+
+        with sqlite3.connect(DB_NAME) as conn:
+            if not conn.execute("""
+                SELECT 1 FROM screen_diffs
+                WHERE IFNULL(header_text,'')=IFNULL(?, '')
+                  AND removed=? AND added=? AND modified=?
+                LIMIT 1
+            """, (s_name, removed_j, added_j, mod_j)).fetchone():
+                conn.execute("""
+                    INSERT INTO screen_diffs (tester_id, build_id, header_text, removed, added, modified)
+                    VALUES (?,?,?,?,?,?)
+                """, (t_id, b_id, s_name, removed_j, added_j, mod_j))
+                conn.commit()
+
+        _insert_diff_trace(
+            t_id, b_id, s_name,
+            f"Removed={len(removed)}, Added={len(added)}, Modified={len(modified)} "
+            f"(sig {'changed' if sig != prev_sig else 'same'})"
+        )
+
+    # ---------- Score de anomalía HMM/KMeans ----------
+    cluster_id = None
+    anomaly_score = None
+
+    # Recuperar los modelos entrenados para este tester
+    kmeans_model = KMEANS_MODELS.get(t_id)
+    hmm_model = HMM_MODELS.get(t_id)
+
+    if kmeans_model is not None and hmm_model is not None:
+        try:
+            # 1️⃣ Predecir cluster actual
+            cluster_id = int(kmeans_model.predict(enriched_vector.reshape(1, -1))[0])
+
+            # 2️⃣ Cargar clusters recientes
+            with sqlite3.connect(DB_NAME) as conn:
+                recent_clusters = [
+                    row[0] for row in conn.execute("""
+                        SELECT cluster_id
+                        FROM accessibility_data
+                        WHERE tester_id=?
+                        AND cluster_id IS NOT NULL
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                    """, (t_id, SEQ_LENGTH - 1)).fetchall()
+                ]
+
+            # 3️⃣ Agregar el cluster actual
+            recent_clusters.append(cluster_id)
+            recent_clusters = np.array(recent_clusters).reshape(-1, 1)
+
+            # 4️⃣ Calcular probabilidad logarítmica
+            logp = hmm_model.score(recent_clusters)
+            anomaly_score = float(-logp)
+
+        except Exception as e:
+            print("⚠️ Error calculando anomaly_score:", e)
+    else:
+        print(f"⚠️ Modelos no encontrados para tester_id={t_id}")
+
+    # Insertar vector enriquecido y cluster/anomaly_score en DB
     with sqlite3.connect(DB_NAME) as conn:
-        if conn.execute("""
-            SELECT 1 FROM screen_diffs
-            WHERE IFNULL(screen_name,'')=IFNULL(?, '')
-              AND removed=? AND added=? AND modified=?
-            LIMIT 1
-        """, (s_name, removed_j, added_j, mod_j)).fetchone():
-            return
-        if conn.execute("""
-            SELECT 1
-            FROM screen_diffs s
-            JOIN diff_approvals a ON a.diff_id = s.id
-            WHERE s.screen_name=? AND s.removed=? AND s.added=? AND s.modified=?
-            LIMIT 1
-        """, (s_name, removed_j, added_j, mod_j)).fetchone():
-            return
         conn.execute("""
-            INSERT INTO screen_diffs (tester_id, build_id, screen_name, removed, added, modified)
-            VALUES (?,?,?,?,?,?)
-        """, (t_id, b_id, s_name, removed_j, added_j, mod_j))
+            UPDATE accessibility_data
+            SET enriched_vector=?, cluster_id=?, anomaly_score=?
+            WHERE TRIM(LOWER(header_text)) LIKE '%' || TRIM(LOWER(?)) || '%'
+              AND TRIM(tester_id)=TRIM(?)
+        """, (
+            json.dumps(enriched_vector.tolist()),
+            int(cluster_id) if cluster_id is not None else None,
+            float(anomaly_score) if anomaly_score is not None else None,
+            s_name,
+            t_id
+        ))
         conn.commit()
 
-    _insert_diff_trace(t_id, b_id, s_name,
-                       f"Removed={len(removed)}, Added={len(added)}, Modified={len(modified)}")
-
-    await _train_incremental_logic_hybrid(t_id, b_id)
+    # Entrenamiento híbrido con vector enriquecido
+    await _train_incremental_logic_hybrid(t_id, b_id, enriched_vector=enriched_vector)
     if TRAIN_GENERAL_ON_COLLECT:
-        await _train_general_logic_hybrid()
+        await _train_general_logic_hybrid(enriched_vector=enriched_vector)
 
-
+    
 # =========================================================
 # ENTRENAMIENTO INCREMENTAL (versión original conservada)
 # =========================================================
-async def _train_incremental_logic_hybrid(tester_id: str, build_id: str,
-                                          batch_size=200, min_samples=2):
+# async def _train_incremental_logic_hybrid(
+#     tester_id: str,
+#     build_id: str,
+#     batch_size=200,
+#     min_samples=2,
+#     enriched_vector: np.ndarray | None = None   # ✅ nuevo parámetro
+# ):
+#     if enriched_vector is not None:
+#         X = enriched_vector.reshape(1, -1)
+#     else:
+#         with sqlite3.connect(DB_NAME) as conn:
+#             c = conn.cursor()
+#             c.execute("""
+#                 SELECT DISTINCT collect_node_tree
+#                 FROM accessibility_data
+#                 WHERE collect_node_tree IS NOT NULL
+#                   AND IFNULL(tester_id,'')=IFNULL(?, '')
+#                   AND IFNULL(build_id,'')=IFNULL(?, '')
+#                 ORDER BY created_at DESC
+#                 LIMIT ?
+#             """, (tester_id, build_id, batch_size))
+#             rows = c.fetchall()
+
+#             # ===================== DEPURACIÓN =====================
+#             vecs = [vector_from_tree(r[0]) for r in rows if r and r[0]]
+#             print(f"[DEBUG] Cantidad de vectores: {len(vecs)}")
+#             if vecs:
+#                 print(f"[DEBUG] Vectores únicos: {len(np.unique(np.vstack(vecs), axis=0))}")
+#             # ======================================================
+
+#             if len(rows) < min_samples:
+#                 need = min_samples - len(rows)
+#                 c.execute("""
+#                     SELECT DISTINCT collect_node_tree
+#                     FROM accessibility_data
+#                     WHERE collect_node_tree IS NOT NULL
+#                       AND IFNULL(tester_id,'')=IFNULL(?, '')
+#                       AND IFNULL(build_id,'')=IFNULL(?, '')
+#                     ORDER BY created_at ASC
+#                     LIMIT ?
+#                 """, (tester_id, build_id, need))
+#                 rows = c.fetchall() + rows
+#         X = features_from_rows(rows)
+
+#     if X.size == 0:
+#         return
+    
+#     # Eliminar duplicados antes de entrenar
+#     X = np.unique(X, axis=0)
+
+#     await _train_model_hybrid(
+#         X, tester_id, build_id,
+#         _get_lock(f"ind:{tester_id}:{build_id}"),
+#         desc=f"incremental {tester_id}/{build_id}"
+#     )
+
+async def _train_incremental_logic_hybrid(
+    tester_id: str,
+    build_id: str,
+    batch_size=200,
+    min_samples=2,
+    enriched_vector: np.ndarray | None = None
+):
+    # ===================== Obtener datos de la DB =====================
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
         c.execute("""
@@ -510,6 +823,8 @@ async def _train_incremental_logic_hybrid(tester_id: str, build_id: str,
             LIMIT ?
         """, (tester_id, build_id, batch_size))
         rows = c.fetchall()
+
+        # Si hay menos filas que min_samples, tomar las más antiguas para completar
         if len(rows) < min_samples:
             need = min_samples - len(rows)
             c.execute("""
@@ -522,13 +837,84 @@ async def _train_incremental_logic_hybrid(tester_id: str, build_id: str,
                 LIMIT ?
             """, (tester_id, build_id, need))
             rows = c.fetchall() + rows
-    X = features_from_rows(rows)
-    if X.size == 0: return
-    await _train_model_hybrid(X, tester_id, build_id,
-                              _get_lock(f"ind:{tester_id}:{build_id}"),
-                              desc=f"incremental {tester_id}/{build_id}")
 
-async def _train_general_logic_hybrid(batch_size=1000, min_samples=2):
+    # Convertir los registros a vectores
+    X_db = features_from_rows(rows)
+
+    # ===================== DEPURACIÓN =====================
+    if X_db.size > 0:
+        print(f"[DEBUG] Cantidad de vectores DB (incremental): {X_db.shape[0]}")
+        print(f"[DEBUG] Vectores únicos DB (incremental): {len(np.unique(X_db, axis=0))}")
+    # ======================================================
+
+    # ===================== Combinar con enriched_vector si tiene datos =====================
+    if enriched_vector is not None and not np.all(enriched_vector == 0):
+        X = np.vstack([enriched_vector.reshape(1, -1), X_db])
+    else:
+        X = X_db
+
+    # Eliminar duplicados antes de entrenar
+    X = np.unique(X, axis=0)
+
+    # Validar que tengamos suficientes muestras
+    if len(X) < min_samples:
+        print(f"[DEBUG] No hay suficientes muestras para entrenar incremental: {len(X)} < {min_samples}")
+        return
+
+    # Entrenamiento híbrido
+    await _train_model_hybrid(
+        X, tester_id, build_id,
+        _get_lock(f"ind:{tester_id}:{build_id}"),
+        desc=f"incremental {tester_id}/{build_id}"
+    )
+
+
+# async def _train_general_logic_hybrid(batch_size=1000, min_samples=2, enriched_vector: np.ndarray | None = None):
+#     if enriched_vector is not None:
+#          X = enriched_vector.reshape(1, -1)
+#     else:
+#         with sqlite3.connect(DB_NAME) as conn:
+#             c = conn.cursor()
+#             c.execute("""
+#                 SELECT collect_node_tree
+#                 FROM accessibility_data
+#                 WHERE collect_node_tree IS NOT NULL
+#                 ORDER BY created_at DESC
+#                 LIMIT ?
+#             """, (batch_size,))
+#             rows = c.fetchall()
+
+#         # ===================== DEPURACIÓN =====================
+#             vecs = [vector_from_tree(r[0]) for r in rows if r and r[0]]
+#             print(f"[DEBUG] Cantidad de vectores 2: {len(vecs)}")
+#             if vecs:
+#                 print(f"[DEBUG] Vectores únicos: {len(np.unique(np.vstack(vecs), axis=0))}")
+#             # ======================================================
+
+
+#             if len(rows) < min_samples:
+#                 need = min_samples - len(rows)
+#                 c.execute("""
+#                     SELECT collect_node_tree
+#                     FROM accessibility_data
+#                     WHERE collect_node_tree IS NOT NULL
+#                     ORDER BY created_at ASC
+#                     LIMIT ?
+#                 """, (need,))
+#                 rows = c.fetchall() + rows
+#         X = features_from_rows(rows)
+#         if X.size == 0: 
+#             return
+
+#     # Eliminar duplicados de vectores antes de entrenar
+#     X = np.unique(X, axis=0)
+
+#     # Entrenamiento
+#     await _train_model_hybrid(X, None, None, _get_lock("gen"),
+#                               max_clusters=5, desc="general")
+
+async def _train_general_logic_hybrid(batch_size=1000, min_samples=2, enriched_vector: np.ndarray | None = None):
+    # ===================== Obtener datos de la DB =====================
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
         c.execute("""
@@ -539,6 +925,8 @@ async def _train_general_logic_hybrid(batch_size=1000, min_samples=2):
             LIMIT ?
         """, (batch_size,))
         rows = c.fetchall()
+
+        # Si hay menos filas que min_samples, tomar las más antiguas para completar
         if len(rows) < min_samples:
             need = min_samples - len(rows)
             c.execute("""
@@ -549,11 +937,35 @@ async def _train_general_logic_hybrid(batch_size=1000, min_samples=2):
                 LIMIT ?
             """, (need,))
             rows = c.fetchall() + rows
-    X = features_from_rows(rows)
-    if X.size == 0: return
-    await _train_model_hybrid(X, None, None, _get_lock("gen"),
-                              max_clusters=5, desc="general")
 
+    # Convertir los registros a vectores
+    X_db = features_from_rows(rows)
+
+    # ===================== DEPURACIÓN =====================
+    if X_db.size > 0:
+        print(f"[DEBUG] Cantidad de vectores DB: {X_db.shape[0]}")
+        print(f"[DEBUG] Vectores únicos DB: {len(np.unique(X_db, axis=0))}")
+    # ======================================================
+
+    # ===================== Combinar con enriched_vector si tiene datos =====================
+    if enriched_vector is not None and not np.all(enriched_vector == 0):
+        X = np.vstack([enriched_vector.reshape(1, -1), X_db])
+    else:
+        X = X_db
+
+    # Eliminar duplicados antes de entrenar
+    X = np.unique(X, axis=0)
+
+    # Validar que tengamos suficientes muestras
+    if len(X) < min_samples:
+        print(f"[DEBUG] No hay suficientes muestras para entrenar: {len(X)} < {min_samples}")
+        return
+
+    # Entrenamiento híbrido
+    await _train_model_hybrid(
+        X, None, None, _get_lock("gen"),
+        max_clusters=5, desc="general"
+    )
                               
         
 # =========================================================
@@ -566,39 +978,64 @@ async def _train_general_logic_hybrid(batch_size=1000, min_samples=2):
 
 # =========================================================
 # UTILIDADES PARA NORMALIZAR CAMPOS
-
+        
 def _insert_diff_trace(tester_id, build_id, screen, message):
+    # Normalizar el screen_name
+    screen_normalized = normalize_header(screen)
+
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
-        c.execute("""
-            INSERT INTO diff_trace (tester_id, build_id, screen_name, message)
-            VALUES (?, ?, ?, ?)
-        """, (tester_id, build_id, screen, message))
-        conn.commit()
+        # Verificar si ya existe exactamente el mismo registro
+        exists = c.execute("""
+            SELECT 1 FROM diff_trace
+            WHERE tester_id=? AND build_id=? AND screen_name=? AND message=?
+            LIMIT 1
+        """, (tester_id, build_id, screen_normalized, message)).fetchone()
 
-def update_diff_trace(changes: List[str]) -> None:
+        # Insertar solo si no existe
+        if not exists:
+            c.execute("""
+                INSERT INTO diff_trace (tester_id, build_id, screen_name, message)
+                VALUES (?, ?, ?, ?)
+            """, (tester_id, build_id, screen_normalized, message))
+            conn.commit()        
+
+def update_diff_trace(tester_id: str, build_id: str, screen: str, changes: List[str]) -> None:
     """
     Actualiza la tabla diff_trace:
-      - Si hay cambios, borra mensajes de 'No hay cambios' y agrega cada cambio.
+      - Si hay cambios, borra mensajes 'No hay cambios' y agrega cada cambio.
       - Si no hay cambios, asegura que quede un único registro 'No hay cambios'.
     """
+    screen_normalized = normalize_header(screen)
+
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
         if changes:
-            c.execute("DELETE FROM diff_trace WHERE message='No hay cambios'")
-            for ch in changes:
-                c.execute("INSERT INTO diff_trace (message) VALUES (?)", (ch,))
-        else:
-            c.execute("DELETE FROM diff_trace WHERE message <> 'No hay cambios'")
+            # eliminar registros "No hay cambios" para ese tester/pantalla/build
             c.execute("""
-                INSERT INTO diff_trace (message)
-                SELECT 'No hay cambios'
+                DELETE FROM diff_trace 
+                WHERE tester_id=? AND build_id=? AND screen_name=? 
+                AND message='No hay cambios'
+            """, (tester_id, build_id, screen_normalized))
+            for ch in changes:
+                _insert_diff_trace(tester_id, build_id, screen_normalized, ch)
+        else:
+            # borrar otros mensajes y dejar solo "No hay cambios"
+            c.execute("""
+                DELETE FROM diff_trace 
+                WHERE tester_id=? AND build_id=? AND screen_name=? 
+                AND message <> 'No hay cambios'
+            """, (tester_id, build_id, screen_normalized))
+            c.execute("""
+                INSERT INTO diff_trace (tester_id, build_id, screen_name, message)
+                SELECT ?, ?, ?, 'No hay cambios'
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM diff_trace WHERE message='No hay cambios'
+                    SELECT 1 FROM diff_trace 
+                    WHERE tester_id=? AND build_id=? AND screen_name=? 
+                    AND message='No hay cambios'
                 )
-            """)
-    conn.commit()
-    conn.close()
+            """, (tester_id, build_id, screen_normalized, tester_id, build_id, screen_normalized))
+        conn.commit()
 
 
 def last_hash_for_screen(tester_id: Optional[str],
@@ -682,29 +1119,51 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
         do_insert = True
         if screens_id_val and last and str(last) == str(screens_id_val):
             do_insert = False
+            logger.debug(f"[collect] last={last} ({type(last)}), screens_id_val={screens_id_val} ({type(screens_id_val)})")
             logger.info("[collect] Snapshot idéntico al último almacenado — no se inserta duplicado.")
+        
+        clean_header = (event.header_text or "").replace("\r", "").replace("\n", " ").strip()
+
+        struct_vec = ui_structure_features(normalized_nodes)
+        timestamps = [e.timestamp for e in ensure_list(event.actions or [])]
+        time_deltas = np.diff(timestamps) if len(timestamps) > 1 else [0]
+        avg_dwell = float(np.mean(time_deltas)) if len(time_deltas) > 0 else 0
+        num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
+        input_vec = input_features(event.actions or [])
+
+        # print("[DEBUG] normalized_nodes:", normalized_nodes)
+        # print("[DEBUG] struct_vec:", struct_vec)
+        # print("[DEBUG] timestamps:", timestamps)
+        # print("[DEBUG] avg_dwell:", avg_dwell)
+        # print("[DEBUG] num_gestos:", num_gestos)
+        # print("[DEBUG] input_vec:", input_vec)
+
+        enriched_vector = np.array(struct_vec + [avg_dwell, num_gestos] + input_vec, dtype=float)
+        cluster_id: int | None = None
+        anomaly_score: float | None = None
 
         if do_insert:
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
-            logger.info("[collect] Insertando registro en accessibility_data...")
             cursor.execute("""
-            INSERT INTO accessibility_data (
-                tester_id, build_id, timestamp, event_type, event_type_name,
-                package_name, class_name, text, content_description, screens_id,
-                screen_names, header_text, actual_device, version,
-                collect_node_tree, signature, additional_info, tree_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO accessibility_data (
+                    tester_id, build_id, timestamp, event_type, event_type_name,
+                    package_name, class_name, text, content_description, screens_id,
+                    screen_names, header_text, collect_node_tree, signature,
+                    additional_info, tree_data, enriched_vector, cluster_id, anomaly_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tester_norm, build_norm, event.timestamp, event.event_type,
                 event.event_type_name, event.package_name, event.class_name,
                 event.text, event.content_description, screens_id_val,
-                event.screen_names, event.header_text, event.actual_device,
-                event.version,
-                json.dumps(normalized_nodes),   # ✅ árbol filtrado
-                signature,                      # ✅ hash estable
+                event.screen_names, clean_header,
+                json.dumps(normalized_nodes),
+                signature,
                 json.dumps(event.additional_info) if event.additional_info else None,
-                json.dumps(event.tree_data) if event.tree_data else None
+                json.dumps(event.tree_data) if event.tree_data else None,
+                json.dumps(enriched_vector.tolist()) if enriched_vector is not None else None,
+                cluster_id,
+                anomaly_score
             ))
             conn.commit()
             conn.close()
@@ -736,13 +1195,9 @@ async def get_status(
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    # query = """
-        # SELECT screen_name, removed, added, modified, created_at
-        # FROM screen_diffs
-    #"""
     query = """
         SELECT s.id,
-               s.screen_name,
+               s.header_text,
                s.removed,
                s.added,
                s.modified,
@@ -750,11 +1205,9 @@ async def get_status(
         FROM screen_diffs AS s
         LEFT JOIN diff_approvals AS a
                ON a.diff_id = s.id     
-        WHERE a.id IS NULL 
+        WHERE a.id IS NULL
     """
     clauses, params = [], []
-
-
 
     if testerId:
         clauses.append("s.tester_id = ?")
@@ -763,7 +1216,7 @@ async def get_status(
         clauses.append("s.build_id = ?")
         params.append(buildId)
     if screenName:
-        clauses.append("s.screen_name = ?")
+        clauses.append("s.header_text = ?")
         params.append(screenName)
 
     if clauses:
@@ -773,44 +1226,27 @@ async def get_status(
     params.append(limit)
 
     cursor.execute(query, params)
-
-    # if testerId:
-        # clauses.append("tester_id = ?")
-        # params.append(testerId)
-    # if buildId:
-        # clauses.append("build_id = ?")
-        # params.append(buildId)
-    # if screenName:
-        # clauses.append("screen_name = ?")
-        # params.append(screenName)
-
-    # if clauses:
-        # query += " WHERE " + " AND ".join(clauses)
-
-    # query += " ORDER BY created_at DESC LIMIT ?"
-    # params.append(limit)
-
-    # cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
 
-    # Filtramos solo diffs con cambios reales
+    # Construcción de diffs
     diffs = []
     for r in rows:
-        removed = safe_json(r[1])
-        added = safe_json(r[2])
-        modified = safe_json(r[3])
+        removed = safe_json(r[2])   # ✅ columna correcta
+        added = safe_json(r[3])     # ✅ columna correcta
+        modified = safe_json(r[4])  # ✅ columna correcta
         if removed or added or modified:
             diffs.append({
-                "screen_name": r[0],
+                "id": r[0],
+                "header_text": r[1],
                 "removed": removed,
                 "added": added,
                 "modified": modified,
-                "created_at": r[4],
+                "created_at": r[5],
             })
 
     if not diffs:
-        return {}  # O simplemente `return Response(status_code=204)` para no retornar contenido
+        return {}  # o Response(status_code=204)
 
     return {"status": "changes", "diffs": diffs}
 
@@ -842,74 +1278,86 @@ async def trigger_incremental_train(
         "message": f"Entrenamiento incremental híbrido para {tester_id}/{build_id} disparado"
     }
 
-
 @app.get("/screen/diffs")
 def get_screen_diffs(
     tester_id: Optional[str] = Query(None),
     build_id: Optional[str] = Query(None),
-    screen_name: Optional[str] = Query(None)
+    screen_name: Optional[str] = Query(None),
+    only_pending: bool = Query(True)  # Nuevo parámetro opcional
 ):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
     query = """
-        SELECT id, tester_id, build_id, screen_name, removed, added, modified, created_at
-        FROM screen_diffs
+        SELECT s.id, s.tester_id, s.build_id, s.screen_name, 
+               s.removed, s.added, s.modified, s.created_at, s.cluster_info
+        FROM screen_diffs AS s
+        LEFT JOIN diff_approvals AS a
+               ON a.diff_id = s.id
         WHERE 1=1
     """
     params = []
-    if tester_id:
-        query += " AND IFNULL(tester_id, '') = ?"
-        params.append(tester_id)
-    if build_id:
-        query += " AND IFNULL(build_id, '') = ?"
-        params.append(build_id)
-    if screen_name:
-        query += " AND screen_name = ?"
+
+    if only_pending:
+        query += " AND a.id IS NULL"  # Solo diffs sin aprobación
+
+    if tester_id is not None:
+        query += " AND (s.tester_id = ? OR (s.tester_id IS NULL AND ? = ''))"
+        params.extend([tester_id, tester_id])
+
+    if build_id is not None:
+        query += " AND (s.build_id = ? OR (s.build_id IS NULL AND ? = ''))"
+        params.extend([build_id, build_id])
+
+    if screen_name is not None:
+        query += " AND s.screen_name = ?"
         params.append(screen_name)
 
-    query += " ORDER BY created_at DESC LIMIT 1"
+    # Solo registros que tengan cambios en removed, added o modified
+    query += " AND (COALESCE(s.removed, '[]') != '[]' OR COALESCE(s.added, '[]') != '[]' OR COALESCE(s.modified, '[]') != '[]')"
+    query += " ORDER BY s.created_at DESC"
+
     cursor.execute(query, tuple(params))
-    row = cursor.fetchone()
+    rows = cursor.fetchall()
     conn.close()
 
-    if not row:
-        return {"screen_diffs": [], "has_changes": False}
+    diffs = []
+    for row in rows:
+        diffs.append({
+            "id": row[0],
+            "tester_id": row[1],
+            "build_id": row[2],
+            "screen_name": row[3],
+            "removed": json.loads(row[4]) if row[4] else [],
+            "added": json.loads(row[5]) if row[5] else [],
+            "modified": json.loads(row[6]) if row[6] else [],
+            "created_at": row[7],
+            "cluster_info": json.loads(row[8]) if row[8] else {}
+        })
 
-    diff = {
-        "id": row[0],
-        "tester_id": row[1],
-        "build_id": row[2],
-        "screen_name": row[3],
-        "removed": json.loads(row[4]) if row[4] else [],
-        "added": json.loads(row[5]) if row[5] else [],
-        "modified": json.loads(row[6]) if row[6] else [],
-        "created_at": row[7]
-    }
-    has_changes = bool(diff["removed"] or diff["added"] or diff["modified"])
+    has_changes = bool(diffs)
+    return {"screen_diffs": diffs, "has_changes": has_changes}
 
-    return {"screen_diffs": [diff], "has_changes": has_changes}
+
 
 @app.get("/screen/exists")
 async def screen_exists(buildId: str = Query(...)):
     """
     Devuelve {"exists": true/false} si hay al menos una fila
-    en accessibility_data con el build_id indicado.
+    en accessibility_data con build_id <= buildId.
     """
     conn = sqlite3.connect(DB_NAME)
-    logger.info("🔎 screen_exists llamado con buildId=%s", buildId)
     cursor = conn.cursor()
 
     cursor.execute("""
         SELECT 1 FROM accessibility_data
-        WHERE TRIM(build_id) = ?    
+        WHERE CAST(build_id AS INTEGER) <= CAST(? AS INTEGER)
         LIMIT 1
     """, (buildId,))
 
     row = cursor.fetchone()
     conn.close()
 
-    logger.info("Resultado de la consulta: %s", bool(row))
     return {"exists": bool(row)}
     
     
@@ -1187,3 +1635,65 @@ def capture_coverage(
     }    
     
 app.include_router(router)
+        
+@app.websocket("/ws/status")
+async def websocket_status(websocket: WebSocket):
+    await websocket.accept()
+    tester_id = websocket.query_params.get("tester_id")
+    build_id = websocket.query_params.get("build_id")
+    while True:
+        # Aquí enviar diffs desde tu DB o memoria
+        await websocket.send_json({"tester_id": tester_id, "build_id": build_id, "diffs": []})
+        await asyncio.sleep(5)        
+
+
+@router.post("/send-reset-code")
+def send_reset_code(req: ResetRequest):
+    print(f"📩 Petición recibida desde Android: {req.email}")
+    try:
+        code = generate_code()
+        codes_db[req.email] = {"code": code, "expires": time.time() + 300}  # 5 minutos
+        
+        
+        save_reset_code(req.email, code)
+
+        send_email(
+            to_email=req.email,
+            subject="Password Reset Code",
+            body_text="Here is your verification code.",
+            code=code
+        )
+        return {"message": "Email sent successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al enviar correo: {e}")
+
+
+@router.post("/reset-password")
+def reset_password(req: ResetPasswordRequest):
+    # Validar código desde SQLite (sin eliminarlo)
+    if not validate_code(req.email, req.code):
+        raise HTTPException(status_code=400, detail="Código inválido o expirado")
+
+    try:
+        # Actualizar la contraseña real en tu DB principal
+        print(f"🔑 Password for {req.email} updated to: {req.new_password}")
+        # aquí iría tu lógica real de actualización en tu tabla de usuarios
+
+        # Solo si la actualización es exitosa, eliminar el código
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("""
+            DELETE FROM password_reset_codes
+            WHERE email = ? AND code = ?
+        """, (req.email, req.code))
+        conn.commit()
+        conn.close()
+
+        return {"success": True, "message": "Contraseña actualizada correctamente"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error actualizando contraseña: {e}")
+
+
+app.include_router(diff_router)
+app.include_router(router, prefix="/api")

@@ -12,11 +12,15 @@ from datetime import datetime
 from email_service import send_email
 from reset_service import generate_code, validate_code
 import random, time
+from PIL import Image
 from collections import Counter
 import math
 from sklearn.cluster import KMeans 
 from sklearn.cluster import MiniBatchKMeans
+from sklearn.metrics.pairwise import cosine_similarity
 import httpx
+
+from stable_signature import normalize_node
 
 # =========================================================
 # CONFIGURACIÓN
@@ -50,6 +54,13 @@ SEQ_LENGTH = {}  # Longitud de la secuencia para el modelo HMM
 KMEANS_MODELS.clear()
 HMM_MODELS.clear()
 
+IGNORED_NODE_SUFFIXES = [
+    "|enabled:True",
+    "|focusable:True",
+    "|clickable:True",
+    "|checked:False",
+    "|selected:False",
+]
 
 # ===================== MODELOS BASE (fallbacks) =====================
 
@@ -160,6 +171,7 @@ def init_db():
             tree_data TEXT,
             enriched_vector TEXT,
             cluster_id INTEGER,
+            is_stable INTEGER DEFAULT 0,
             anomaly_score REAL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -176,7 +188,24 @@ def init_db():
             modified TEXT,
             cluster_info TEXT,
             anomaly_score REAL DEFAULT 0,
+            diff_hash TEXT UNIQUE NOT NULL,
+            text_diff TEXT,  
             cluster_id INTEGER DEFAULT -1,  
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+       CREATE TABLE IF NOT EXISTS ignored_changes_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tester_id TEXT,
+            build_id INTEGER,
+            header_text TEXT,
+            signature TEXT,
+            class_name TEXT,
+            field TEXT,
+            old_value TEXT,
+            new_value TEXT,
+            reason TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -204,6 +233,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS diff_approvals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             diff_id INTEGER,
+            approved INTEGER DEFAULT 0, 
             approved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -291,9 +321,14 @@ class AccessibilityEvent(BaseModel):
 # =========================================================
 # UTILIDADES PARA ÁRBOLES Y HASH ESTABLE
 # =========================================================
-SAFE_KEYS = ["className", "text", "desc", "viewId", "pkg"]
-
-
+SAFE_KEYS = [
+    "viewId", "className", "headerText", "text", "contentDescription", "desc", "hint",
+    "checked", "enabled", "focusable", "clickable", "selected", "scrollable",
+    "password", "pressed", "activated", "visible",
+    "progress", "max", "value", "rating", "level",
+    "inputType", "orientation", "index", "layoutParams", "pkg",
+    "textColor", "backgroundColor", "fontSize", "alpha"
+]
 
 def ui_structure_features(tree: dict) -> list[float]:
     """
@@ -360,15 +395,17 @@ def ensure_list(tree):
             return []
     return tree or []
 
-def normalize_node(node: Dict) -> Dict:
-    return {k: (node.get(k) or "") for k in SAFE_KEYS}
+# def normalize_node(node: Dict) -> Dict:
+#     return {k: (node.get(k) or "") for k in SAFE_KEYS}
 
 def normalize_tree(nodes: List[Dict]) -> List[Dict]:
     return sorted([normalize_node(n) for n in nodes if isinstance(n, dict)],
                   key=lambda n: (n["className"], n["text"]))
 
 def stable_signature(nodes: List[Dict]) -> str:
-    return hashlib.sha256(json.dumps(normalize_tree(nodes), sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(normalize_tree(nodes), sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
 
 def generate_code():
     """Genera un código de 6 dígitos"""
@@ -426,131 +463,580 @@ def update_bool_history(screen_id, db_conn):
     db_conn.commit()
 
 
+ # =========================================================
+# UTILIDADES COMPARE TREES
+# =========================================================   
+def estimate_text_color(bitmap):
+    """
+    Recibe un PIL Image (bitmap) del nodo y devuelve un color hexadecimal promedio.
+    """
+    if bitmap is None:
+        return None
+    
+    # Reducir tamaño para acelerar cálculo (opcional)
+    small = bitmap.resize((10, 10))
+    
+    # Convertir a RGB
+    small = small.convert("RGB")
+    
+    # Obtener todos los pixeles
+    pixels = list(small.getdata())
+    
+    # Calcular promedio de R, G, B
+    r_avg = sum(p[0] for p in pixels) // len(pixels)
+    g_avg = sum(p[1] for p in pixels) // len(pixels)
+    b_avg = sum(p[2] for p in pixels) // len(pixels)
+    
+    # Convertir a hex
+    return f"#{r_avg:02X}{g_avg:02X}{b_avg:02X}"
+
+def preprocess_tree(tree):
+    """
+    Limpia, filtra y normaliza un árbol antes de la comparación.
+    Ignora diferencias irrelevantes como cambios de contenedor o de jerarquía.
+    """
+    def _flatten(node_list):
+        result = []
+        for node in ensure_list(node_list):
+            if not isinstance(node, dict):
+                continue
+            cls = node.get("className", "")
+            text = (node.get("text") or node.get("desc") or "").strip()
+            # Ignorar wrappers sin texto ni interactividad
+            if cls in [
+                "android.widget.FrameLayout",
+                "android.view.View",
+                "androidx.compose.ui.platform.ComposeView",
+                "androidx.compose.ui.viewinterop.ViewFactoryHolder",
+            ] and not text:
+                # Desapila sus hijos
+                children = node.get("children") or []
+                result.extend(_flatten(children))
+                continue
+
+            # Normaliza valores vacíos
+            norm_node = {
+                "className": cls,
+                "text": text.lower().strip(),
+                "clickable": bool(node.get("clickable")),
+                "focusable": bool(node.get("focusable")),
+                "enabled": bool(node.get("enabled", True)),
+                "pkg": node.get("pkg", ""),
+            }
+            result.append(norm_node)
+        return result
+
+    flat = _flatten(tree)
+
+    # Ordenar los nodos por clase + texto, ignorando jerarquía
+    flat.sort(key=lambda n: (n["className"], n["text"]))
+    print("Flattened nodes:", flat)
+    return flat
+
+
+
+
 def compare_trees(old_tree, new_tree, app_name: str = None):
     """
     Compara dos árboles de nodos accesibles y detecta nodos agregados, eliminados o modificados.
-    Si existe un modelo general para la app, se usa como baseline adicional.
+    Ajustado para detectar cambios de texto y filtrar ruido de estados efímeros.
     """
+    
     old_tree = ensure_list(old_tree)
     new_tree = ensure_list(new_tree)
 
+    # 🔹 Normalización estructural para ignorar wrappers o contenedores irrelevantes
+    old_tree = preprocess_tree(old_tree)
+    new_tree = preprocess_tree(new_tree)
+
+    if not old_tree:
+        print("⚠️ No hay snapshot previo para comparar, se guarda como base inicial.")
+        return {
+            "removed": [],
+            "added": [],
+            "modified": [],
+            "text_diff": {"removed_texts": [], "added_texts": []}
+        }
+
     SAFE_KEYS = [
-        "viewId", "className", "headerText", "text", "contentDescription",
-        "checked", "enabled", "focusable", "clickable", "otherField"
+        "viewId", "className", "headerText", "text", "contentDescription", "desc", "hint",
+        "checked", "enabled", "focusable", "clickable", "selected", "scrollable",
+        "password", "pressed", "activated", "visible",  
+        "progress", "max", "value", "rating", "level",
+        "inputType", "orientation", "index", "layoutParams", "pkg",
+        "textColor", "backgroundColor", "fontSize", "alpha"
     ]
 
-    TEXT_FIELDS = ["text", "contentDescription", "headerText"]
-    BOOL_FIELDS = ["checked", "enabled", "focusable", "clickable"]
-    OTHER_FIELDS = ["className", "viewId", "otherField"]
+    IGNORED_STATE_FIELDS = {
+        "enabled", "focusable", "clickable", "scrollable", "pressed", "activated", "visible"
+    }
+
+    TEXT_FIELDS = ["text", "contentDescription", "headerText", "hint"]
+    BOOL_FIELDS = [
+        "checked", "enabled", "focusable", "clickable", "selected", "scrollable",
+        "password", "pressed", "activated", "visible"
+    ]
+    NUM_FIELDS = ["progress", "max", "value", "rating", "level"]
+    OTHER_FIELDS = ["className", "viewId", "pkg"]
+    VISUAL_FIELDS = ["textColor", "backgroundColor", "fontSize", "alpha"]
+
+    # ---------------- flatten ----------------
+    def flatten_tree(tree):
+        """Flatten tree generando paths relativos para cada nodo."""
+        result = []
+
+        def _walk(subtree, path=[]):
+            if isinstance(subtree, dict):
+                idx = path[-1] if path else 0
+                result.append((list(path), subtree))  # Guardamos path completo
+                for i, ch in enumerate(subtree.get("children") or []):
+                    _walk(ch, path + [i])
+            elif isinstance(subtree, list):
+                for i, n in enumerate(subtree):
+                    _walk(n, path + [i])
+
+        _walk(tree, [])
+        return result
+    
+
+    def subtree_hash(node):
+        """
+        Calcula un hash estable para un nodo y todo su subárbol.
+        Útil para nodos sin viewId ni texto para detectar movimientos.
+        """
+        node_copy = dict(node)
+        children = node_copy.pop("children", [])
+        node_str = json.dumps(node_copy, sort_keys=True, ensure_ascii=False)
+        hash_value = hashlib.md5(node_str.encode()).hexdigest()
+        
+        # Combina con hashes de los hijos
+        for child in children or []:
+            hash_value = hashlib.md5((hash_value + subtree_hash(child)).encode()).hexdigest()
+        return hash_value[:20]   
+    
+    # Lista de campos efímeros que queremos ignorar
+    EPHEMERAL_FIELDS = {"pressed", "focused", "activated", "selected", "visible"}
+
+    # ---------------- normalize ----------------
 
     def normalize_node(node: dict) -> dict:
-        """Convierte None a cadena vacía y asegura que todos los valores sean tipo str o bool válidos."""
         normalized = {}
         for k in SAFE_KEYS:
             v = node.get(k)
-            if isinstance(v, bool):
-                normalized[k] = v
+            if k in BOOL_FIELDS:
+                normalized[k] = bool(v) if v not in (None, "", "null") else False
+            elif k in NUM_FIELDS:
+                try:
+                    normalized[k] = float(v)
+                except (TypeError, ValueError):
+                    normalized[k] = None
             elif v is None:
                 normalized[k] = ""
             else:
                 normalized[k] = str(v).strip()
+
+        # 🔹 Filtrar campos efímeros automáticamente
+        for ef in EPHEMERAL_FIELDS:
+            if ef in normalized:
+                # Podrías poner debug opcional aquí
+                # print(f"🔧 IGNORANDO EFÍMERO → {ef}={normalized[ef]} | class={node.get('className')}")
+                normalized.pop(ef)
+
+        # 🔧 Debug opcional de nodo final normalizado
+        if 'pressed' in node:
+            print(f"🔧 NODE DEBUG → class={node.get('className')}, view_id={node.get('viewId')}, pressed={node.get('pressed')}")
+
         return normalized
 
-    def make_key(n, idx):
-        """Crea una clave única para identificar nodos similares."""
-        if not isinstance(n, dict):
-            return None
-        n = normalize_node(n)
-        parts = [
-            n.get("viewId"),
-            n.get("className"),
-            n.get("headerText"),
-            n.get("text"),
-            n.get("contentDescription"),
-        ]
-        return "|".join([str(p) for p in parts if p])
 
-    # --------------------------------------------------------
-    # 1️⃣ Índices de nodos previos y actuales
-    # --------------------------------------------------------
-    old_idx = {make_key(n, i): n for i, n in enumerate(old_tree) if make_key(n, i)}
-    new_idx = {make_key(n, i): n for i, n in enumerate(new_tree) if make_key(n, i)}
+    print("🧩 RAW NODE → class={cls}, view_id={view_id}, text={nn.get('text')!r}")
 
-    removed = [n for k, n in old_idx.items() if k not in new_idx]
-    added = [n for k, n in new_idx.items() if k not in old_idx]
-    modified = []
+    # def make_base_key(n):
+    #     cls = (n.get("className") or "").strip()
+    #     pkg = (n.get("pkg") or "").strip()
+    #     view_id = (n.get("viewId") or "").strip()
 
-    # --------------------------------------------------------
-    # 2️⃣ Comparar campo por campo entre árboles
-    # --------------------------------------------------------
+    #     if view_id:
+    #         base_key = f"{pkg}|{cls}|{view_id}"
+    #     else:
+    #         base_key = f"{pkg}|{cls}|subtree:{subtree_hash(n)}"
+    #     return base_key
+    
+    def make_base_key(n):
+        cls = (n.get("className") or "").strip()
+        pkg = (n.get("pkg") or "").strip()
+        view_id = (n.get("viewId") or "").strip()
+        text_like = (n.get("text") or "").strip()
+
+        parts = cls.split(".")
+        norm_class = parts[-1].lower() if parts else ""
+        base_class = parts[-2].lower() if len(parts) > 1 else ""
+        full_class_sig = f"{base_class}.{norm_class}" if base_class else norm_class
+
+        if view_id:
+            base_key = f"{pkg}|{full_class_sig}|{view_id}"
+        elif text_like:
+            base_key = f"{pkg}|{full_class_sig}|text:{text_like}"
+        else:
+            base_key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
+
+        return base_key
+
+    def make_key(n, idx=None, for_qa=False):
+        nn = normalize_node(n)
+        cls = (nn.get("className") or "").strip()
+        pkg = (nn.get("pkg") or "").strip()
+        view_id = (nn.get("viewId") or "").strip()
+        text_like = (
+            nn.get("text")
+            or nn.get("desc")
+            or nn.get("contentDescription")
+            or nn.get("hint")
+            or ""
+        ).strip()
+
+        # --- Normalización de clases ---
+        parts = cls.split(".")
+        norm_class = parts[-1].lower() if parts else ""
+        base_class = parts[-2].lower() if len(parts) > 1 else ""
+        full_class_sig = f"{base_class}.{norm_class}" if base_class else norm_class
+
+        #key = None  # 🔹 asegurar que existe
+        # 🔹 Inicializamos siempre una clave base
+        key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
+        # --- Generamos el texto-hash (si existe texto) ---
+        text_sig = hashlib.md5(text_like.lower().encode()).hexdigest()[:8] if text_like else ""
+
+        # # --- NUEVA LÓGICA ---
+        # # Si el nodo tiene viewId Y texto → incluimos el hash de texto en la clave
+        # if view_id and text_like:
+        #     key = f"{pkg}|{full_class_sig}|{view_id}|textsig:{text_like}"
+        # elif view_id:
+        #     key = f"{pkg}|{full_class_sig}|{view_id}"
+        # # elif text_like:
+        # #     key = f"{pkg}|{full_class_sig}|textsig:{text_like}"
+        # elif text_like:
+        #     print(f"🔍 TEXT BEFORE HASH → class={cls}, text_like={text_like!r}")
+        #     # text_sig = hashlib.md5(text_like.lower().encode()).hexdigest()[:20]
+        #     safe_text = text_like.replace("\n", " ").strip()[:100]
+        #     key = f"{pkg}|{full_class_sig}|textsig:{safe_text}"
+        #     # key = f"{pkg}|{full_class_sig}|textnode"
+        # --- NUEVA LÓGICA ---
+        if view_id:
+            # Clave estable basada en viewId y clase → no incluimos texto
+            key = f"{pkg}|{full_class_sig}|{view_id}"
+        elif text_like:
+            # Solo nodos sin viewId, usamos hash de texto para identificar nodo de texto único
+            safe_text = text_like.replace("\n", " ").strip()[:100]
+            key = f"{pkg}|{full_class_sig}|textsig:{safe_text}"
+        else:
+            # Nodo sin viewId ni texto → hash del subárbol
+            key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
+
+        # else:
+        #     key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
+
+        # --- 1. Si tiene viewId ---
+        # if view_id:
+        #     key = f"{pkg}|{full_class_sig}|{view_id}"
+
+        # --- 2. Si tiene texto visible ---
+        # elif text_like:
+        #     # ✅ Generamos hash solo para distinguir nodos de texto únicos
+        #     text_sig = hashlib.md5(text_like.lower().encode()).hexdigest()[:8]
+        #     safe_text = text_like.replace("\n", " ").strip()[:50]  # acortamos texto largo solo para debug
+        #     key = f"{pkg}|{full_class_sig}|textsig:{text_sig}"
+            # print(f"🧩 KEY DE TEXTO: {key} (texto='{safe_text}')")
+
+        #elif text_like:
+            #print(f"🔍 TEXT BEFORE HASH → class={cls}, text_like={text_like!r}")
+            #text_sig = hashlib.md5(text_like.lower().encode()).hexdigest()[:20]
+            # safe_text = text_like.replace("\n", " ").strip()[:100]
+            # key = f"{pkg}|{full_class_sig}|textsig:{safe_text}"
+            #key = f"{pkg}|{full_class_sig}|textnode"
+
+        # --- 3. Sin viewId ni texto ---
+        # else:
+        #     key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
+
+        # --- 4. Estado relevante ---
+        state_parts = []
+        if norm_class in ["checkbox", "radiobutton", "switch"]:
+            state_parts.append(f"checked:{nn.get('checked')}")
+        if norm_class in ["ratingbar", "seekbar"]:
+            if nn.get("rating") is not None:
+                state_parts.append(f"rating:{nn.get('rating')}")
+            if nn.get("progress") is not None:
+                state_parts.append(f"progress:{nn.get('progress')}")
+        if norm_class == "tablayout":
+            state_parts.append(f"selected:{nn.get('selected')}")
+
+        if state_parts:
+            key += "|" + "|".join(state_parts)
+
+        return key
+
+
+    # ---------------- index trees ----------------
+    # old_idx = {make_key(n, idx): normalize_node(n) for idx, n in flatten_tree(old_tree)}
+    # new_idx = {make_key(n, idx): normalize_node(n) for idx, n in flatten_tree(new_tree)}
+
+
+
+    # ---------------- index trees ----------------
+    old_idx = {}
+    for idx, n in flatten_tree(old_tree):
+        key = make_key(n, idx)
+        #old_idx[key] = normalize_node(n)
+        key = make_key(n, idx)
+        old_idx[key] = normalize_node(n)
+        # if "button" in (n.get("className") or "").lower():
+        #     print("🧩 OLD NODE →", n.get("className"), n.get("viewId"), n.get("text"), "| key:", key)
+
+    new_idx = {}
+    for idx, n in flatten_tree(new_tree):
+        key = make_key(n, idx)
+        new_idx[key] = normalize_node(n)
+        # if "button" in (n.get("className") or "").lower():
+        #     print("🧩 NEW NODE →", n.get("className"), n.get("viewId"), n.get("text"), "| key:", key)
+
+        try:
+            print("🧩 --- DETALLE DE CLAVES Y TEXTOS ---")
+            if not new_idx:
+                print("⚠️ new_idx está vacío, no se generaron claves nuevas.")
+            elif not old_idx:
+                print("⚠️ old_idx está vacío, no se generaron claves viejas.")
+            else:
+                diff_count = 0
+                for k in new_idx:
+                    old_text = old_idx.get(k, {}).get("text", "<no existe>")
+                    new_text = new_idx[k].get("text", "<sin texto>")
+                    if old_text != new_text:
+                        diff_count += 1
+                        print(f"🔸 Key: {k}")
+                        print(f"   OLD TEXT: {old_text!r}")
+                        print(f"   NEW TEXT: {new_text!r}")
+                if diff_count == 0:
+                    print("✅ No se detectaron diferencias de texto (todos los textos coinciden).")
+        except Exception as e:
+            print(f"⚠️ Error al imprimir diferencias de texto: {e}")
+        # ---------------- debug: ver clases reales ----------------
+    old_nodes = [n for _, n in flatten_tree(old_tree)]
+    new_nodes = [n for _, n in flatten_tree(new_tree)]
+
+    text_overlap = overlap_ratio(old_nodes, new_nodes)
+    print(f"📊 Text overlap ratio: {text_overlap:.2f}")
+
+    print("Old nodes:", old_nodes)
+    print("New nodes:", new_nodes)
+
+    # print("🧱 --- OLD CLASSES ---")
+    # for n in old_nodes:
+    #     cls_name = n.get("className") or ""
+    #     if "button" in cls_name.lower():
+    #         print("   OLD:", cls_name)
+
+    # print("🧱 --- NEW CLASSES ---")
+    # for n in new_nodes:
+    #     cls_name = n.get("className") or ""
+    #     if "button" in cls_name.lower():
+    #         print("   NEW:", cls_name)
+
+
+    # print("📋 --- OLD TREE KEYS ---")
+    # for k in old_idx.keys():
+    #     if "button" in k:
+    #         print("   ", k)
+
+    # print("📋 --- NEW TREE KEYS ---")
+    # for k in new_idx.keys():
+    #     if "button" in k:
+    #         print("   ", k)
+
+
+    # Calcular overlap textual
+    # overlap = overlap_ratio(old_nodes, new_nodes)
+    # logger.info(f"📊 Text overlap ratio: {overlap:.2f}")
+
+    added = [{"node": {"key": k, "class": v.get("className")}, "changes": {}} for k, v in new_idx.items() if k not in old_idx]
+    removed = [{"node": {"key": k, "class": v.get("className")}, "changes": {}} for k, v in old_idx.items() if k not in new_idx]
+
+    modified, ignored_changes = [], []
+
+    print("\n🔎 COMPARANDO CLAVES ENTRE OLD_IDX y NEW_IDX...")
+    print(f"   🔹 Total old: {len(old_idx)} | Total new: {len(new_idx)}")
+
+        # --- Detectar removidos ---
+    for k, v in old_idx.items():
+        if k not in new_idx:
+            print(f"   ❌ REMOVIDO: {k} ({v.get('className')}, text='{v.get('text', '')[:40]}')")
+            removed.append({"node": {"key": k, "class": v.get("className")}, "changes": {}})
+
+    # --- Detectar agregados ---
+    for k, v in new_idx.items():
+        if k not in old_idx:
+            print(f"   ➕ AGREGADO: {k} ({v.get('className')}, text='{v.get('text', '')[:40]}')")
+            added.append({"node": {"key": k, "class": v.get("className")}, "changes": {}})
+
+
+    print("🧩 --- DETALLE COMPLETO DE TEXTOS (OLD vs NEW) ---")
+    for k in sorted(set(list(old_idx.keys()) + list(new_idx.keys()))):
+        old_text = old_idx.get(k, {}).get("text", "<no existe>")
+        new_text = new_idx.get(k, {}).get("text", "<no existe>")
+        if old_text != new_text:
+            print(f"🔸 DIF TEXT → Key: {k}")
+            print(f"   OLD TEXT: {old_text!r}")
+            print(f"   NEW TEXT: {new_text!r}")
+        else:
+            print(f"✅ IGUAL → {k} → '{new_text}'")
+
+    # ---------------- detect modifications ----------------
     for k, nn in new_idx.items():
         if k in old_idx:
+            oldn = old_idx[k]
             changes = {}
-            old_node = normalize_node(old_idx[k])
-            new_node = normalize_node(nn)
 
-            for f in TEXT_FIELDS + BOOL_FIELDS + OTHER_FIELDS:
-                old_val = old_node.get(f)
-                new_val = new_node.get(f)
-
-                if f in BOOL_FIELDS:
-                    # Historial de booleanos
-                    if k not in BOOL_HISTORY:
-                        BOOL_HISTORY[k] = {}
-                    if f not in BOOL_HISTORY[k]:
-                        BOOL_HISTORY[k][f] = new_val
-                        continue
-                    if BOOL_HISTORY[k][f] != new_val:
-                        changes[f] = {"old": BOOL_HISTORY[k][f], "new": new_val}
-                        BOOL_HISTORY[k][f] = new_val
-                else:
-                    if old_val != new_val:
+            for f in TEXT_FIELDS + BOOL_FIELDS + NUM_FIELDS + OTHER_FIELDS + VISUAL_FIELDS:
+                old_val, new_val = oldn.get(f), nn.get(f)
+                if old_val != new_val:
+                    if f in IGNORED_STATE_FIELDS and old_val is False and new_val is True:
+                        ignored_changes.append((nn.get("className"), f, (old_val, new_val)))
+                    else:
                         changes[f] = {"old": old_val, "new": new_val}
 
             if changes:
-                modified.append({"node": {"key": k}, "changes": changes})
+                print(f"   ✏️ MODIFICADO: {k} ({nn.get('className')})")
+                print("🔍 Cambio detectado en nodo:", nn.get("className"))
+                for f, vals in changes.items():
+                    print(f"      • {f}: '{vals['old']}' → '{vals['new']}'")
+                    print(f"   • Campo: {f} | old='{vals['old']}' → new='{vals['new']}'")
 
-    # --------------------------------------------------------
-    # 3️⃣ Verificar diferencias respecto al modelo general (baseline)
-    # --------------------------------------------------------
-    if app_name:
-        baseline_path = os.path.join(MODELS_DIR, app_name, "general", "baseline_tree.json")
-        if os.path.exists(baseline_path):
-            try:
-                with open(baseline_path, "r", encoding="utf-8") as f:
-                    baseline_tree = json.load(f)
-                baseline_idx = {make_key(n, i): normalize_node(n)
-                                for i, n in enumerate(baseline_tree) if make_key(n, i)}
+                modified.append({
+                    "node": {"key": k, "class": nn.get("className")},
+                    "changes": changes
+                })
+    print(f"\n📊 RESUMEN → removed={len(removed)}, added={len(added)}, modified={len(modified)}")
+    # ---------------- report ----------------
+    if ignored_changes:
+        print(f"🤖 Ignorados {len(ignored_changes)} cambios esperados:")
+        for c in ignored_changes[:3]:
+            print("   ", c)
 
-                baseline_modified = []
-                for m in modified:
-                    key = m["node"]["key"]
-                    if key in baseline_idx:
-                        base_node = baseline_idx[key]
-                        changes_vs_baseline = {}
-                        for f, ch in m["changes"].items():
-                            base_val = base_node.get(f)
-                            if base_val != ch["new"]:
-                                changes_vs_baseline[f] = {
-                                    "old": base_val,
-                                    "new": ch["new"],
-                                    "relative_to": "baseline"
-                                }
-                        if changes_vs_baseline:
-                            baseline_modified.append({
-                                "node": m["node"],
-                                "changes": changes_vs_baseline
-                            })
+    print(f"🧮 Raw compare_trees → removed={len(removed)}, added={len(added)}, modified={len(modified)}")
 
-                if baseline_modified:
-                    logger.info(f"[compare_trees] {len(baseline_modified)} cambios respecto a baseline general de {app_name}")
-                    # Fusionamos los cambios baseline en modified
-                    modified.extend(baseline_modified)
 
-            except Exception as e:
-                logger.warning(f"[compare_trees] No se pudo procesar baseline de {app_name}: {e}")
+       # ---------------- filtro de recarga visual ----------------
+    total_old = len(old_idx)
+    total_new = len(new_idx)
+    total_changed = len(removed) + len(added)
 
-    return removed, added, modified
+    reload_ratio = total_changed / max(total_old, total_new, 1)
+
+    has_loader = any(
+        "progressbar" in v.get("className", "").lower()
+        or "skeleton" in v.get("className", "").lower()
+        or "shimmer" in v.get("className", "").lower()
+        for v in new_idx.values()
+    )
+
+    # if reload_ratio > 0.4 or has_loader:
+    #     print(f"⚠️ Recarga visual detectada (ratio={reload_ratio:.2f}, loader={has_loader}) → limpiando added/removed")
+    #     removed, added = [], []
+
+    # ============================================================
+    # 🧩 FILTRO 2: Pares estáticos (mismo texto en added/removed)
+    # ============================================================
+    
+    def extract_text_from_key(key: str) -> str:
+        """Extrae texto visible desde la clave, soportando text: o textsig:"""
+        if "textsig:" in key:
+            return key.split("textsig:")[-1].strip()
+        if "text:" in key:
+            return key.split("text:")[-1].strip()
+        return ""
+
+    # 1️⃣ Extrae los textos antes de filtrar
+    old_texts_raw = {normalize_node(n).get("text", "") for _, n in flatten_tree(old_tree) if n.get("text")}
+    new_texts_raw = {normalize_node(n).get("text", "") for _, n in flatten_tree(new_tree) if n.get("text")}
+
+    common_texts = old_texts_raw & new_texts_raw
+    total_texts = old_texts_raw | new_texts_raw
+    text_overlap = len(common_texts) / max(len(total_texts), 1)
+    print(f"📊 Text overlap ratio (raw, pre-filter): {text_overlap:.2f}")
+
+
+    same_text_removed = {extract_text_from_key(r["node"]["key"]) for r in removed if extract_text_from_key(r["node"]["key"])}
+    same_text_added = {extract_text_from_key(a["node"]["key"]) for a in added if extract_text_from_key(a["node"]["key"])}
+
+    overlap_texts = same_text_removed & same_text_added
+    
+    if overlap_texts:
+        print(f"🧩 Filtrando pares estáticos → {len(overlap_texts)} coincidencias de texto persistente")
+        removed = [r for r in removed if not any(t in r["node"]["key"] for t in overlap_texts)]
+        added = [a for a in added if not any(t in a["node"]["key"] for t in overlap_texts)]
+
+        # ============================================================
+    # 🔍 PASADA GLOBAL DE CAMBIOS DE TEXTO (Red de seguridad)
+    # ============================================================
+    try:
+        old_texts = {normalize_node(n).get("text", "") for _, n in flatten_tree(old_tree) if n.get("text")}
+        new_texts = {normalize_node(n).get("text", "") for _, n in flatten_tree(new_tree) if n.get("text")}
+
+        diff_texts = new_texts - old_texts
+        removed_texts = old_texts - new_texts
+
+        if diff_texts or removed_texts:
+            print("📝 CAMBIOS GLOBALES DE TEXTO DETECTADOS:")
+            for t in removed_texts:
+                print(f"   ❌ Texto removido: {t!r}")
+            for t in diff_texts:
+                print(f"   ➕ Texto agregado: {t!r}")
+        else:
+            print("✅ No se detectaron cambios globales de texto.")
+    except Exception as e:
+        print(f"⚠️ Error al detectar cambios globales de texto: {e}")
+
+    # ============================================================
+    # ✅ Resultado final
+    # ============================================================
+
+
+    # ============================================================
+# 🧠 DETECCIÓN DE CAMBIO DE TEXTO EN EL MISMO NODO
+# ============================================================
+    try:
+        for k, old_node in old_idx.items():
+            if k in new_idx:
+                new_node = new_idx[k]
+                old_text = (old_node.get("text") or "").strip()
+                new_text = (new_node.get("text") or "").strip()
+
+                if old_text and new_text and old_text != new_text:
+                    # Si ya existe un modified para esa key, lo actualizamos
+                    existing = next((m for m in modified if m["node"]["key"] == k), None)
+                    if existing:
+                        existing["changes"]["text"] = {"old": old_text, "new": new_text}
+                    else:
+                        modified.append({
+                            "node": {"key": k, "class": new_node.get("className")},
+                            "changes": {"text": {"old": old_text, "new": new_text}}
+                        })
+                    print(f"✏️ Cambio de texto en nodo existente: {k}")
+                    print(f"    '{old_text}' → '{new_text}'")
+    except Exception as e:
+        print(f"⚠️ Error en detección de texto en mismo nodo: {e}")
+
+    #return removed, added, modified
+    return {
+        "removed": removed,
+        "added": added,
+        "modified": modified,
+        "text_diff": {
+            "removed_texts": list(removed_texts),
+            "added_texts": list(diff_texts),
+            "overlap_ratio": text_overlap,  # 👈 agregado
+        }
+    }
 
 
 # =========================================================
@@ -656,27 +1142,12 @@ async def _train_model_hybrid(
         prev_model_path = None
         prev_build_id = None  
 
-        # ✅ Manejo seguro del build_id
-        # try:
-        #     if build_id is not None and str(build_id).isdigit():
-        #         prev_build_id = str(int(build_id) - 1)
-        #         prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", prev_build_id, "model.pkl")
-        # except Exception:
-        #     prev_model_path = None
-
         try:
             if build_id and str(build_id).isdigit():
                 prev_build_id = str(int(build_id) - 1)
                 prev_model_path = os.path.join(app_dir, tester_id, prev_build_id, "model.pkl")
         except Exception:
             prev_model_path = None    
-
-        # ✅ Si no existe, usa el modelo general como base
-        # if not prev_model_path or not os.path.exists(prev_model_path):
-        #     general_model_path = os.path.join(app_dir, "general", "model.pkl")
-        #     if os.path.exists(general_model_path):
-        #         prev_model_path = general_model_path
-        #         logger.info(f"[train_hybrid] Usando modelo general como base → {general_model_path}")
 
                 # Cargar modelo previo si existe
         if prev_model_path and os.path.exists(prev_model_path):
@@ -809,13 +1280,13 @@ def ensure_model_dimensions(kmeans, X, tester_id, build_id, app_name="default_ap
     except Exception as e:
         logger.warning(f"[{desc}] No se pudo validar dimensiones del modelo ({app_name}/{tester_id}/{build_id}): {e}")
         return False
-
+    
+    
 def structure_signature_features(tree):
     """
-    Extrae características estructurales de una jerarquía de nodos de UI.
-    Compatible con vistas Android nativas y frameworks híbridos (Flutter, RN, etc.)
+    Extrae características estructurales de una jerarquía de nodos de UI,
+    incluyendo diversidad textual básica para detectar botones distintos.
     """
-    # Inicialización de contadores
     features = {
         # --- Android Clásico ---
         "Button": 0,
@@ -841,12 +1312,12 @@ def structure_signature_features(tree):
 
         # --- Jetpack Compose ---
         "ComposeView": 0,
-        "Text": 0,           # usado por Compose
+        "Text": 0,
         "ButtonComposable": 0,
 
-        # --- Híbridos (React Native, Flutter, Ionic, WebView) ---
-        "RCTView": 0,        # React Native View
-        "RCTText": 0,        # React Native Text
+        # --- Híbridos ---
+        "RCTView": 0,
+        "RCTText": 0,
         "RCTImageView": 0,
         "FlutterView": 0,
         "WebView": 0,
@@ -858,16 +1329,27 @@ def structure_signature_features(tree):
     max_depth = 0
     total_nodes = len(tree)
 
+    # --- Conjuntos para diversidad textual ---
+    button_texts = set()
+    text_nodes = set()
+
     for node in tree:
-        class_name = node.get("className", "") or ""
+        cls = (node.get("className") or "").lower()
+        text = (node.get("text") or "").strip().lower()
         depth = node.get("depth", 0)
         max_depth = max(max_depth, depth)
 
         for key in features.keys():
-            if key.lower() in class_name.lower():
+            if key.lower() in cls:
                 features[key] += 1
 
-    # Calcular métricas agregadas útiles
+        # recolectar textos visibles
+        if "button" in cls and text:
+            button_texts.add(text)
+        elif "textview" in cls and text:
+            text_nodes.add(text)
+
+    # --- Métricas agregadas ---
     interactive_elements = (
         features["Button"] + features["MaterialButton"] + features["EditText"] +
         features["CheckBox"] + features["RadioButton"] + features["Switch"] +
@@ -881,33 +1363,128 @@ def structure_signature_features(tree):
         features["ConstraintLayout"] + features["FrameLayout"]
     )
 
-    # Empaquetar en vector (mantén orden fijo)
+    # --- Diversidad textual ---
+    unique_button_texts = len(button_texts)
+    unique_text_nodes = len(text_nodes)
+
+    # --- Vector final ---
     return [
-        total_nodes,             # total de nodos en pantalla
-        max_depth,               # profundidad máxima
-        interactive_elements,    # elementos interactivos
-        media_elements,          # componentes visuales
-        layout_complexity,       # cantidad de layouts estructurales
-        features["RecyclerView"], 
+        total_nodes,            # total de nodos
+        max_depth,              # profundidad máxima
+        interactive_elements,   # botones, inputs, switches...
+        media_elements,         # imágenes, webviews...
+        layout_complexity,      # layouts estructurales
+        features["RecyclerView"],
         features["ScrollView"],
         features["ComposeView"],
         features["FlutterView"],
         features["IonContent"],
+        unique_button_texts,    # 🔹 nuevo: número de textos de botón distintos
+        unique_text_nodes,      # 🔹 nuevo: número de textos visibles distintos
     ]
 
 
-    
+def format_screen_diff(diffs):
+    lines = []
+    for diff in diffs:
+        # aceptar ambos formatos: {"node": {...}, "changes": {...}} o nodo plano
+        if "node" in diff:
+            node = diff["node"]
+            changes = diff.get("changes", {})
+        else:
+            # diff es un normalized node o plain dict (viene de removed/added sin envolver)
+            node = {"key": diff.get("viewId") or f"{diff.get('className')}|{diff.get('pkg')}", "class": diff.get("className")}
+            changes = {k: {"old": None, "new": diff.get(k)} for k in diff.keys() if k not in ("className", "pkg")}  # opcional
+        node_name = f"{node.get('class')} ({node.get('key')})"
+        lines.append(f" - {node_name}")
+        for attr, val in changes.items():
+            old = val.get('old')
+            new = val.get('new')
+            lines.append(f"    • {attr}: {old} → {new}")
+    return "\n".join(lines)
+
+def diff_hash(removed, added, modified):
+    """Genera una firma única basada en el contenido del diff."""
+    concat = json.dumps([removed, added, modified], sort_keys=True)
+    return hashlib.sha1(concat.encode("utf-8")).hexdigest()
+
+
+def is_expected_behavior_change(node, field, old, new, expected_initial=None):
+    cls = node.get("class", "")
+
+    # CheckBox, Switch, RadioButton
+    if cls.endswith(("CheckBox", "Switch", "RadioButton")) and field == "checked":
+        if old in (None, "", "null") and new in (True, False):
+            # Ignorar solo si coincide con estado esperado
+            return expected_initial is not None and new == expected_initial
+        return False  # cambios True<->False son relevantes
+
+    # Button / MaterialButton
+    if cls.endswith(("Button", "MaterialButton")) and field == "enabled":
+        if old in (None, "", "null") and new in (True, False):
+            return expected_initial is not None and new == expected_initial
+        return False  # cambios habilitado/deshabilitado son relevantes
+
+    # Scrollables / grids: ignorar enabled
+    if cls.endswith(("ScrollView", "RecyclerView", "ListView", "GridView")):
+        if field == "enabled":
+            return True
+
+    # Todo lo demás es relevante
+    return False
+
+
+# def overlap_ratio(removed, added):
+#     def extract_texts(nodes):
+#         return {
+#             n["node"]["key"].split("textsig:")[-1].strip().lower()
+#             for n in nodes if "textsig:" in n["node"]["key"]
+#         }
+
+#     r_texts, a_texts = extract_texts(removed), extract_texts(added)
+#     if not r_texts or not a_texts:
+#         return 0.0
+#     common = r_texts.intersection(a_texts)
+#     total = r_texts.union(a_texts)
+#     return len(common) / len(total)
+
+def overlap_ratio(old_nodes, new_nodes):
+    """
+    Calcula el overlap de texto entre dos listas de nodos planos.
+    No depende de textsig:, trabaja directamente sobre 'text'.
+    """
+    def extract_texts(nodes, label):
+        texts = set()
+        for n in nodes:
+            text = n.get("text", "")
+            if text:
+                texts.add(text.strip().lower())
+        print(f"[{label}] Textos extraídos ({len(texts)}): {texts}")
+        return texts
+
+    r_texts = extract_texts(old_nodes, "REMOVED")
+    a_texts = extract_texts(new_nodes, "ADDED")
+
+    # ✅ Manejo de casos vacíos para evitar falsos positivos y divisiones por cero
+    if not r_texts and not a_texts:
+        print("⚪ Ambos sets vacíos → overlap = 1.0 (sin cambios detectados)")
+        return 1.0
+    elif not r_texts or not a_texts:
+        print("⚠️ Uno de los sets está vacío → overlap = 0.0 (sin elementos para comparar)")
+        return 0.0
+
+    common = r_texts.intersection(a_texts)
+    total = r_texts.union(a_texts)
+    overlap = len(common) / len(total)
+    print(f"➡️ Overlap: {len(common)}/{len(total)} = {overlap:.2f}")
+    return overlap
 
 async def analyze_and_train(event: AccessibilityEvent):
     # -------------------- Normalizar campos --------------------
     norm = _normalize_event_fields(event)
     t_id, b_id = norm.get("tester_id_norm"), norm.get("build_id_norm")
     s_name = normalize_header(event.header_text)
-
-    # 🧩 NUEVO: obtener app_name (por package_name o dominio)
-# 🧩 NUEVO: obtener app_name (por package_name o dominio)
     app_name = event.package_name or "default_app"
-
     tester_id = event.tester_id or "general"
     build_id = event.build_id
 
@@ -915,6 +1492,7 @@ async def analyze_and_train(event: AccessibilityEvent):
     latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
     sig = stable_signature(latest_tree)
 
+    root_class_name = latest_tree[0].get("className") if latest_tree else ""
 
     # -------------------- Features enriquecidas ----------------
     struct_vec = np.array(ui_structure_features(latest_tree), dtype=float).flatten()
@@ -926,7 +1504,6 @@ async def analyze_and_train(event: AccessibilityEvent):
     num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
     input_vec = np.array(input_features(event.actions or []), dtype=float).flatten()
 
-    # ✅ Concatenación segura
     enriched_vector = np.concatenate([
         struct_vec,
         sig_vec,
@@ -934,212 +1511,206 @@ async def analyze_and_train(event: AccessibilityEvent):
         input_vec
     ])
 
-    # -------------------- Obtener builds previas ----------------
+    # -------------------- Obtener snapshot previo ----------------
+    prev_tree = None
+    prev_enriched_vec = np.zeros_like(enriched_vector)
+
+    IGNORED_FIELDS = {"text", "headerText", "hint", "contentDescription", "value", "progress"}
+
+    def normalize_node(node):
+        return {k: v for k, v in node.items() if k not in IGNORED_FIELDS}
+
+    def trees_are_structurally_similar(tree_a, tree_b, threshold=0.8):
+        set_a = {json.dumps(normalize_node(n), sort_keys=True) for n in tree_a}
+        set_b = {json.dumps(normalize_node(n), sort_keys=True) for n in tree_b}
+        inter = len(set_a & set_b)
+        union = len(set_a | set_b)
+        return (inter / union) >= threshold if union > 0 else False
+    
+    def get_class_name(row):
+        try:
+            views = json.loads(row[0])
+            if isinstance(views, list) and len(views) > 0:
+                return views[0].get("className", "")
+        except Exception:
+            pass
+        return ""
+
+
     with sqlite3.connect(DB_NAME) as conn:
         prev_rows = conn.execute("""
-            SELECT collect_node_tree, signature, enriched_vector, build_id
+            SELECT collect_node_tree, header_text, signature, enriched_vector, build_id, event_type_name
             FROM accessibility_data
-            WHERE TRIM(tester_id)=TRIM(?)
+            WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
             ORDER BY created_at DESC
             LIMIT 5
         """, (t_id,)).fetchall()
 
+    previous_row = None
+    if prev_rows:
+        latest_event = getattr(event, "event_type_name", None)
+
+        # ---------- Filtro mejorado por tipo de evento + className + signature ----------
+        same_event_rows = []
+        if latest_event:
+            # className y signature del evento actual (más reciente)
+            current_class = root_class_name or get_class_name(prev_rows[-1])
+            current_signature = sig
+
+            # 🔍 DEBUG opcional: ver coincidencias campo a campo
+            logger.info("🔍 Evaluando coincidencias previas:")
+            for r in prev_rows:
+                logger.info({
+                    "event": r[5],
+                    "class": get_class_name(r),
+                    "signature": (r[2][:8] if r[2] else None),
+                    "match_event": r[5] == latest_event,
+                    "match_class": get_class_name(r) == current_class,
+                    "match_sig": r[2] == current_signature,
+                })
+
+            same_event_rows = [
+                r for r in prev_rows
+                if (
+                    r[5] == latest_event and
+                    get_class_name(r) == current_class and
+                    (r[2] == current_signature or not current_signature)
+                )
+            ]
+
+        # Si no hay coincidencias, usar al menos la última fila como fallback
+        if not same_event_rows and prev_rows:
+            same_event_rows = [prev_rows[-1]]
+
+        # ---------- Comparación vectorial y estructural ----------
+        latest_vec = enriched_vector.reshape(1, -1)
+        best_sim, best_row = 0, None
+        for r in same_event_rows:
+            try:
+                prev_vec = np.array(json.loads(r[3])).reshape(1, -1)
+                sim = float(cosine_similarity(latest_vec, prev_vec)[0][0])
+                if sim > best_sim:
+                    best_sim, best_row = sim, r
+            except Exception:
+                continue
+
+        if best_row and best_sim > 0.95:
+            previous_row = best_row
+            prev_tree = ensure_list(json.loads(best_row[0]))
+            logger.info(f"🤝 Coincidencia alta por similitud vectorial ({best_sim:.3f})")
+        else:
+            latest_tree_norm = [normalize_node(n) for n in latest_tree]
+            for r in same_event_rows:
+                try:
+                    prev_candidate = ensure_list(json.loads(r[0]))
+                    if trees_are_structurally_similar(latest_tree_norm, prev_candidate):
+                        previous_row = r
+                        prev_tree = prev_candidate
+                        logger.info("🔄 Coincidencia por estructura (layout similar, texto distinto)")
+                        break
+                except Exception:
+                    continue
+            else:
+                logger.warning("⚠️ No hay coincidencia por signature, vector ni estructura.")
+
+        if prev_tree is not None:
+            try:
+                prev_enriched_vec = np.array(json.loads(previous_row[3]), dtype=float)
+            except Exception:
+                prev_enriched_vec = np.zeros_like(enriched_vector)
+
     # -------------------- Comparación de árboles ----------------
     removed_all, added_all, modified_all = [], [], []
 
+    if prev_tree:
+        try:
+            diff_result = compare_trees(prev_tree, latest_tree)
+        except Exception as e:
+            logger.error(f"❌ Error ejecutando compare_trees: {e}")
+            diff_result = {"removed": [], "added": [], "modified": [], "text_diff": {}}
 
+        removed = diff_result["removed"]
+        added = diff_result["added"]
+        modified = diff_result["modified"]
+        text_diff = diff_result.get("text_diff", {})
 
-    for prev in prev_rows:
-        collect_json, prev_sig, prev_vec_json, prev_build = prev
-        prev_tree = ensure_list(json.loads(collect_json))
+        # -------------------- Convertir cambios de texto a modified ----------------
+        for r in removed[:]:
+            if r["node"].get("text") in text_diff.get("removed", []):
+                removed.remove(r)
+                modified.append({
+                    "node": r["node"],
+                    "changes": {"text": {"old": r["node"]["text"], "new": text_diff["added"].get(r["node"]["text"], "")}}
+                })
+        for a in added[:]:
+            if a["node"].get("text") in text_diff.get("added", []):
+                added.remove(a)
 
-        # 🔹 Log: qué se compara con qué
-        print(f"\n--- Comparación con build previa {prev_build} ---")
-        print(f"Prev Build ID: {prev_build}")
-        print(f"Prev Signature: {prev_sig}")
-        print(f"Prev Tree nodes: {len(prev_tree)}")
-        print(f"Latest Build ID: {b_id}")
-        print(f"Latest Signature: {sig}")
-        print(f"Latest Tree nodes: {len(latest_tree)}")
-
-
-        removed, added, modified = compare_trees(prev_tree, latest_tree)
         removed_all.extend(removed)
         added_all.extend(added)
         modified_all.extend(modified)
- 
 
-    # Convertir cambios a JSON ordenado para comparar/inserción
-    removed_j = json.dumps(removed_all, sort_keys=True)
-    added_j = json.dumps(added_all, sort_keys=True)
-    modified_j = json.dumps(modified_all, sort_keys=True)
+        logger.info(f"📊 compare_trees → removed={len(removed_all)}, added={len(added_all)}, modified={len(modified_all)}")
+        logger.info(f"📊 Text overlap ratio: {overlap_ratio(removed_all, added_all):.2f}")
 
-    # -------------------- Insertar en screen_diffs (restaurado) ----------------
-    try:
+    # -------------------- Guardar en screen_diffs ----------------
+    if removed_all or added_all or modified_all:
+        removed_j = json.dumps(removed_all, sort_keys=True, ensure_ascii=False)
+        added_j = json.dumps(added_all, sort_keys=True, ensure_ascii=False)
+        modified_j = json.dumps(modified_all, sort_keys=True, ensure_ascii=False)
+        diff_signature = diff_hash(removed_all, added_all, modified_all)
+
         with sqlite3.connect(DB_NAME) as conn:
-            if not conn.execute("""
-                SELECT 1 FROM screen_diffs
-                WHERE IFNULL(header_text,'')=IFNULL(?, '')
-                  AND removed=? AND added=? AND modified=?
-                LIMIT 1
-            """, (s_name, removed_j, added_j, modified_j)).fetchone():
-                conn.execute("""
-                    INSERT INTO screen_diffs (tester_id, build_id, header_text, removed, added, modified)
-                    VALUES (?,?,?,?,?,?)
-                """, (t_id, b_id, s_name, removed_j, added_j, modified_j))
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT s.id, a.approved
+                FROM screen_diffs AS s
+                LEFT JOIN diff_approvals AS a ON a.diff_id = s.id
+                WHERE s.diff_hash = ?
+            """, (diff_signature,))
+            existing = cur.fetchone()
+
+            if existing and existing[1]:
+                logger.info(f"✅ Diff {diff_signature[:8]} ya aprobado — no se inserta.")
+            elif existing:
+                logger.info(f"⚠️ Diff {diff_signature[:8]} ya existente sin aprobación.")
+            else:
+                text_diff_j = json.dumps(text_diff, ensure_ascii=False)
+                cur.execute("""
+                    INSERT INTO screen_diffs (tester_id, build_id, header_text, removed, added, modified, text_diff, diff_hash)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (t_id, b_id, s_name, removed_j, added_j, modified_j, text_diff_j, diff_signature))
                 conn.commit()
-    except Exception as e:
-        print(f"⚠️ Error insertando en screen_diffs: {e}")
+                logger.info(f"🧩 Guardado cambio ({diff_signature[:8]}) en screen_diffs")
 
-    # -------------------- Calcular anomaly_score HMM ----------------
-    cluster_id, anomaly_score = None, None
-    kmeans_model = KMEANS_MODELS.get(t_id)
-    hmm_model = HMM_MODELS.get(t_id)
-
-
-
-    # 🧩 NUEVO: cargar desde disco si no está en memoria
-    #model_dir = os.path.join("models", t_id, str(b_id))
-    model_dir = os.path.join("models", t_id or "general", str(b_id or "latest"))
-
-    if not os.path.exists(model_dir):
-        model_dir = os.path.join("models", "general", "default")
-
-    if not kmeans_model and os.path.exists(os.path.join(model_dir, "kmeans.joblib")):
-        try:
-            kmeans_model = joblib.load(os.path.join(model_dir, "kmeans.joblib"))
-            KMEANS_MODELS[t_id] = kmeans_model
-            print(f"✅ Cargado KMeans para tester {t_id}")
-        except Exception as e:
-            print(f"⚠️ Error cargando kmeans.joblib: {e}")
-
-    if not hmm_model and os.path.exists(os.path.join(model_dir, "hmm.joblib")):
-        try:
-            hmm_model = joblib.load(os.path.join(model_dir, "hmm.joblib"))
-            HMM_MODELS[t_id] = hmm_model
-            print(f"✅ Cargado HMM para tester {t_id}")
-        except Exception as e:
-            print(f"⚠️ Error cargando hmm.joblib: {e}")        
-
-    if not hmm_model and os.path.exists(os.path.join(model_dir, "hmm.joblib")):
-        try:
-            hmm_model = joblib.load(os.path.join(model_dir, "hmm.joblib"))
-            HMM_MODELS[t_id] = hmm_model
-            print(f"✅ Cargado HMM para tester {t_id}")
-        except Exception as e:
-            print(f"⚠️ Error cargando hmm.joblib: {e}")
-    
-    if kmeans_model and hmm_model:
-        try:
-            # Verificar dimensiones
-            if not ensure_model_dimensions(
-                kmeans_model,
-                enriched_vector.reshape(1, -1),
-                t_id,
-                b_id,
-                desc="anomaly_score",
-            ):
-                print("⚠️ Modelo desactualizado — se omite esta predicción (reentrenamiento en curso)")
-                return  # No guardar None en BD
-
-            # ---------- Predicción de cluster ----------
-            try:
-                cluster_id = int(kmeans_model.predict(enriched_vector.reshape(1, -1))[0])
-            except Exception as e:
-                print(f"⚠️ Error prediciendo cluster_id: {e}")
-                cluster_id = -1
-
-            # ---------- Secuencia de acciones ----------
-            seq = [e.type for e in ensure_list(event.actions or []) if e.type in ["tap", "scroll", "input"]]
-            if not seq:
-                seq = ["idle"]
-
-            critical_nodes = sum(1 for n in latest_tree if n.get("className") in ["Button", "EditText"])
-            seq.append(f"critical_{critical_nodes}")
-
-            unique_states = {s: i for i, s in enumerate(set(seq))}
-            encoded_seq = np.array([unique_states[s] for s in seq]).reshape(-1, 1)
-
-            # ---------- Calcular logp ----------
-            try:
-                logp = hmm_model.score(encoded_seq)
-                anomaly_score = max(0.0, float(-logp))
-            except Exception as e:
-                print(f"⚠️ Error en HMM.score(): {e}")
-                anomaly_score = 0.0  # valor seguro
-
-            print(f"[DEBUG] cluster_id={cluster_id}, anomaly_score={anomaly_score}")
-
-        except Exception as e:
-            print("⚠️ Error calculando anomaly_score:", e)
-            anomaly_score = 0.0
-            cluster_id = -1
-    else:
-        print(f"⚠️ No se encontraron modelos cargados para {t_id} (kmeans={kmeans_model}, hmm={hmm_model})")
-
-    if (
-        not removed_all and not added_all and not modified_all and
-        anomaly_score is not None and anomaly_score < 0.5
-    ):
-        _insert_diff_trace(t_id, b_id, s_name, "Pantalla conocida: sin cambios ni anomalías")
-        return  # 🔹 No reentrenar ni insertar más pilas eliminar si no funciona
-
-    # -------------------- Insertar diff_trace ----------------
-    def is_relevant_change(removed, added, modified, anomaly_score, threshold=0.5):
-        num_changes = len(removed) + len(added) + len(modified)
-        return num_changes > 0 or (anomaly_score is not None and anomaly_score > threshold)
-
-    if is_relevant_change(removed_all, added_all, modified_all, anomaly_score):
-        _insert_diff_trace(
-            t_id, b_id, s_name,
-            f"Removed={len(removed_all)}, Added={len(added_all)}, "
-            f"Modified={len(modified_all)}, anomaly_score={anomaly_score if anomaly_score is not None else 'N/A'}"
-        )
-    else:
-        _insert_diff_trace(t_id, b_id, s_name, "No hay cambios")
-
-    # -------------------- Guardar vector enriquecido y cluster ----------------
+    # -------------------- Actualizar enriched_vector ----------------
     with sqlite3.connect(DB_NAME) as conn:
         conn.execute("""
             UPDATE accessibility_data
-            SET enriched_vector=?, cluster_id=?, anomaly_score=?
+            SET enriched_vector=?
             WHERE TRIM(LOWER(header_text)) LIKE '%' || TRIM(LOWER(?)) || '%'
               AND TRIM(tester_id)=TRIM(?)
-        """, (
-            json.dumps(enriched_vector.tolist()),
-            int(cluster_id) if cluster_id is not None else None,
-            float(anomaly_score) if anomaly_score is not None else None,
-            s_name,
-            t_id
-        ))
+        """, (json.dumps(enriched_vector.tolist(), ensure_ascii=False), s_name, t_id))
         conn.commit()
 
-    # -------------------- Entrenamiento híbrido ----------------
-    # asyncio.create_task(_train_incremental_logic_hybrid(t_id, b_id, enriched_vector=enriched_vector))
-    # #await _train_incremental_logic_hybrid(t_id, b_id, enriched_vector=enriched_vector)
-    # if TRAIN_GENERAL_ON_COLLECT:
-    #     await _train_general_logic_hybrid(enriched_vector=enriched_vector)
+    # -------------------- Entrenamiento incremental ----------------
+    asyncio.create_task(_train_model_hybrid(
+        X=np.array([enriched_vector]),
+        tester_id=tester_id,
+        build_id=build_id,
+        app_name=app_name,
+        desc=f"{app_name} incremental"
+    ))
 
-    # ✅ Pasamos también app_name
-    asyncio.create_task(
-        _train_model_hybrid(
-            X=np.array([enriched_vector]),
-            tester_id=tester_id,
-            build_id=build_id,
-            app_name=app_name,  # 👈 NUEVO
-            desc=f"{app_name} incremental"
-        )
-    )
-
-    # ✅ Entrenar también el modelo general de la app
     if TRAIN_GENERAL_ON_COLLECT:
         await _train_model_hybrid(
             X=np.array([enriched_vector]),
             tester_id="general",
             build_id="latest",
-            app_name=app_name,  # 👈 NUEVO
+            app_name=app_name,
             desc=f"{app_name} general"
-        )    
+        )
+
 
 async def _train_incremental_logic_hybrid(
     tester_id: str,
@@ -1198,8 +1769,6 @@ async def _train_incremental_logic_hybrid(
     HMM_MODELS[tester_id] = hmm_model
 
     print(f"✅ Modelos guardados correctamente en {model_dir}")
-
-
 
 
 async def _train_general_logic_hybrid(
@@ -1297,14 +1866,6 @@ async def _train_general_logic_hybrid(
 
 
 # =========================================================
-# A partir de aquí se mantienen tus endpoints y lógica
-# collect, checkForChanges, status, etc.
-# Solo hay que reemplazar llamadas a
-# _train_incremental_logic y _train_general_logic
-# por sus versiones híbridas
-# =========================================================
-
-# =========================================================
 # UTILIDADES PARA NORMALIZAR CAMPOS
         
 def _insert_diff_trace(tester_id, build_id, screen, message):
@@ -1327,7 +1888,9 @@ def _insert_diff_trace(tester_id, build_id, screen, message):
                 VALUES (?, ?, ?, ?)
             """, (tester_id, build_id, screen_normalized, message))
             conn.commit()        
+            logger.info(f"📝 Trace guardado: {message}")
 
+            
 def update_diff_trace(tester_id: str, build_id: str, screen: str, changes: List[str]) -> None:
     """
     Actualiza la tabla diff_trace:
@@ -1417,8 +1980,10 @@ def normalize_tree(nodes: List[Dict]) -> List[Dict]:
 def stable_signature(nodes: List[Dict]) -> str:
     """Genera un hash estable del árbol normalizado."""
     norm = normalize_tree(nodes)
-    return hashlib.sha256(json.dumps(norm, sort_keys=True).encode()).hexdigest()   
-    
+    return hashlib.sha256(
+        json.dumps(norm, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
 # =========================================================
 # ENDPOINTS API
 # =========================================================
@@ -1435,6 +2000,19 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
         build_norm = norm.get("build_id_norm")
         screen_name = event.screen_names or ""
         screens_id_val = event.screens_id or norm.get("screensId") or None
+
+        # Determinar className principal o asignar por defecto si es splash
+        if normalized_nodes and isinstance(normalized_nodes, list):
+            root_class_name = normalized_nodes[0].get("className", "") if isinstance(normalized_nodes[0], dict) else ""
+        else:
+            root_class_name = ""
+
+        # Asignar nombre por defecto si está vacío o el árbol es muy pequeño
+        if not root_class_name or len(normalized_nodes) <= 2:
+            root_class_name = "SplashActivity"
+
+
+        logger.info(f"[collect] Root className detectado: {root_class_name}")
 
         logger.info(f"[collect] normalized tester={tester_norm} build={build_norm} screen={screen_name} screens_id={screens_id_val}")
 
@@ -1469,20 +2047,34 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
         #enriched_vector = np.array(struct_vec + [avg_dwell, num_gestos] + input_vec, dtype=float)
 
         sig_vec = np.array(structure_signature_features(normalized_nodes), dtype=float)
-        input_vec = np.array(input_features(event.actions or []), dtype=float)
+        #input_vec = np.array(input_features(event.actions or []), dtype=float)
+
+        timestamps = [e.timestamp for e in ensure_list(event.actions or [])]
+        time_deltas = np.diff(timestamps) if len(timestamps) > 1 else [0]
+        avg_dwell = float(np.mean(time_deltas)) if len(time_deltas) > 0 else 0
+        num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
+        input_vec = np.array(input_features(event.actions or []), dtype=float).flatten()
+
         combined = np.concatenate([
             np.array(struct_vec, dtype=float).flatten(),
             sig_vec.flatten(),
             np.array([avg_dwell, num_gestos], dtype=float),
             input_vec.flatten()
         ])
-        enriched_vector = combined.astype(float)
-
-        
+        #enriched_vector = combined.astype(float)
+        enriched_vector = np.concatenate([
+            struct_vec,
+            sig_vec,
+            np.array([avg_dwell, num_gestos], dtype=float),
+            input_vec
+        ])
 
 
         cluster_id: int | None = None
         anomaly_score: float | None = None
+
+        # justo antes del INSERT, define:
+        db_class_name = root_class_name or (event.class_name or "")
 
         if do_insert:
             conn = sqlite3.connect(DB_NAME)
@@ -1496,14 +2088,14 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tester_norm, build_norm, event.timestamp, event.event_type,
-                event.event_type_name, event.package_name, event.class_name,
+                event.event_type_name, event.package_name, db_class_name,
                 event.text, event.content_description, screens_id_val,
                 event.screen_names, clean_header,
-                json.dumps(normalized_nodes),
+                json.dumps(normalized_nodes, ensure_ascii=False),
                 signature,
-                json.dumps(event.additional_info) if event.additional_info else None,
-                json.dumps(event.tree_data) if event.tree_data else None,
-                json.dumps(enriched_vector.tolist()) if enriched_vector is not None else None,
+                json.dumps(event.additional_info, ensure_ascii=False) if event.additional_info else None,
+                json.dumps(event.tree_data, ensure_ascii=False) if event.tree_data else None,
+                json.dumps(enriched_vector.tolist(), ensure_ascii=False) if enriched_vector is not None else None,
                 cluster_id,
                 anomaly_score
             ))
@@ -1512,6 +2104,7 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
             logger.info("[collect] Insert completado.")
         else:
             logger.info("[collect] Se omitió insert porque snapshot coincide con último.")
+            logger.info(f"[collect] Insert completado con class_name={root_class_name}")
 
         # Añadir tarea en background para análisis/entrenamiento (siempre la lanzamos,
         # aunque no se haya insertado para mantener chequeos)
@@ -1623,37 +2216,19 @@ async def trigger_incremental_train(
     }
 
 
-# @app.get("/train/incremental")
-# async def trigger_incremental_train(
-#     tester_id: str = Query(...),
-#     build_id: str = Query(...),
-#     batch_size: int = Query(200, ge=1),
-#     min_samples: int = Query(2, ge=1)
-# ):
-#     await _train_incremental_logic_hybrid(
-#         tester_id=tester_id,
-#         build_id=build_id,
-#         batch_size=batch_size,
-#         min_samples=min_samples
-#     )
-#     return {
-#         "status": "success",
-#         "message": f"Entrenamiento incremental híbrido para {tester_id}/{build_id} disparado"
-#     }
-
 @app.get("/screen/diffs")
 def get_screen_diffs(
     tester_id: Optional[str] = Query(None),
     build_id: Optional[str] = Query(None),
     screen_name: Optional[str] = Query(None),
-    only_pending: bool = Query(True)  # Nuevo parámetro opcional
+    only_pending: bool = Query(True)
 ):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
     query = """
-        SELECT s.id, s.tester_id, s.build_id, s.screen_name, 
-               s.removed, s.added, s.modified, s.created_at, s.cluster_info
+        SELECT s.id, s.tester_id, s.build_id, s.screen_name, s.header_text,
+               s.removed, s.added, s.modified, s.text_diff, s.created_at, s.cluster_info
         FROM screen_diffs AS s
         LEFT JOIN diff_approvals AS a
                ON a.diff_id = s.id
@@ -1662,7 +2237,7 @@ def get_screen_diffs(
     params = []
 
     if only_pending:
-        query += " AND a.id IS NULL"  # Solo diffs sin aprobación
+        query += " AND a.id IS NULL"
 
     if tester_id is not None:
         query += " AND (s.tester_id = ? OR (s.tester_id IS NULL AND ? = ''))"
@@ -1676,31 +2251,179 @@ def get_screen_diffs(
         query += " AND s.screen_name = ?"
         params.append(screen_name)
 
-    # Solo registros que tengan cambios en removed, added o modified
-    query += " AND (COALESCE(s.removed, '[]') != '[]' OR COALESCE(s.added, '[]') != '[]' OR COALESCE(s.modified, '[]') != '[]')"
-    query += " ORDER BY s.created_at DESC"
+    query += """
+        AND (
+            COALESCE(s.removed, '[]') != '[]'
+            OR COALESCE(s.added, '[]') != '[]'
+            OR COALESCE(s.modified, '[]') != '[]'
+        )
+        ORDER BY s.created_at DESC
+    """
 
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
     conn.close()
 
+    def safe_json_load(v):
+        try:
+            return json.loads(v) if v else []
+        except Exception:
+            return []
+
+    # --- Función auxiliar para generar el resumen elegante ---
+    from io import StringIO
+
+
+    def capture_pretty_summary(removed_all, added_all, modified_all):
+        """Convierte los cambios en mensajes legibles tipo IA / QA."""
+        lines = []
+
+        def format_node_text(node):
+            """Usar texto real si existe, sino la key."""
+            return node.get("text") or node.get("desc") or node.get("contentDescription") or node.get("hint") or node.get("key", "")
+
+        # --- Procesar eliminados ---
+        for node in removed_all:
+            text = format_node_text(node)
+            lines.append(f"🗑️ {node.get('class','unknown')} eliminado: “{text}”")
+
+        # --- Procesar agregados ---
+        for node in added_all:
+            text = format_node_text(node)
+            lines.append(f"🆕 {node.get('class','unknown')} agregado: “{text}”")
+
+        # --- Procesar modificados ---
+        for change in modified_all:
+            node = change.get("node", {})
+            changes = change.get("changes", {})
+            if not changes:
+                # Sin cambios visibles, pero mismo nodo
+                text = format_node_text(node)
+                lines.append(f"✏️ {node.get('class','unknown')} sin cambios visibles: “{text}”")
+            else:
+                for attr, vals in changes.items():
+                    old = vals.get("old")
+                    new = vals.get("new")
+                    # Si tiene JSON largo, simplificar
+                    if isinstance(old, str) and old.startswith("{"): old = "(estructura)"
+                    if isinstance(new, str) and new.startswith("{"): new = "(estructura)"
+                    lines.append(f"✏️ {node.get('class','unknown')} modificado ({attr}): “{old}” → “{new}”")
+
+        if not lines:
+            return "✅ Sin cambios relevantes detectados."
+
+        return "\n".join(lines)
+
+    # --- Construir lista de diffs ---
     diffs = []
+
     for row in rows:
+        removed = safe_json_load(row[5])
+        added = safe_json_load(row[6])
+        modified = safe_json_load(row[7])
+        text_diff = safe_json_load(row[8])
+
+                # 🧠 Analizar el overlap de texto
+        overlap_ratio = 0.0
+        screen_status = "unknown"
+        try:
+            overlap_ratio = text_diff.get("overlap_ratio", 0.0)
+            if overlap_ratio >= 0.98:
+                screen_status = "identical"  # sin cambios visibles
+            elif overlap_ratio >= 0.8:
+                screen_status = "minor_changes"  # cambios pequeños
+            else:
+                screen_status = "different"  # pantalla distinta
+        except Exception:
+            pass
+
+        # 🔍 Expande los detalles de todos los cambios
+        detailed_changes = []
+
+        def add_node_change(action: str, node: dict):
+            detailed_changes.append({
+                "attribute": "(entire node)",
+                "old_value": None if action == "added" else json.dumps(node, ensure_ascii=False),
+                "new_value": json.dumps(node, ensure_ascii=False) if action == "added" else None,
+                "node_class": node.get("class"),
+                "node_key": node.get("key"),
+                "node_text": node.get("text", ""),
+                "pkg": node.get("pkg", ""),
+                "action": action
+            })
+
+        # Procesar modificados
+        for change in modified:
+            node = change.get("node", {})
+            changes = change.get("changes", {})
+            if not changes:
+                add_node_change("modified_empty", node)
+            for attr, vals in changes.items():
+                detailed_changes.append({
+                    "attribute": attr,
+                    "old_value": vals.get("old"),
+                    "new_value": vals.get("new"),
+                    "node_class": node.get("class"),
+                    "node_key": node.get("key"),
+                    "node_text": node.get("text", ""),
+                    "pkg": node.get("pkg", ""),
+                    "action": "modified"
+                })
+
+        # Procesar agregados y eliminados
+        for node in added:
+            add_node_change("added", node)
+
+        for node in removed:
+            add_node_change("removed", node)
+
+        # 🆕 Generar resumen elegante para cada diff
+        summary_text = capture_pretty_summary(removed, added, modified)
+
         diffs.append({
             "id": row[0],
             "tester_id": row[1],
             "build_id": row[2],
             "screen_name": row[3],
-            "removed": json.loads(row[4]) if row[4] else [],
-            "added": json.loads(row[5]) if row[5] else [],
-            "modified": json.loads(row[6]) if row[6] else [],
-            "created_at": row[7],
-            "cluster_info": json.loads(row[8]) if row[8] else {}
+            "header_text": row[4],
+            "removed_count": len(removed),
+            "added_count": len(added),
+            "modified_count": len(modified),
+            "removed": removed,
+            "added": added,
+            "modified": modified,
+            "text_diff": text_diff,
+            "text_overlap": overlap_ratio,
+            "screen_status": screen_status,
+            "detailed_changes": detailed_changes,
+            "created_at": row[8],
+            "cluster_info": json.loads(row[9]) if row[9] else {},
+            "detailed_summary": summary_text  # 🆕 Nuevo campo
         })
 
-    has_changes = bool(diffs)
-    return {"screen_diffs": diffs, "has_changes": has_changes}
+    # ✅ Cálculo robusto de has_changes
+    # has_changes = any(
+    #     len(d.get("removed", [])) > 0 or
+    #     len(d.get("added", [])) > 0 or
+    #     len(d.get("modified", [])) > 0
+    #     for d in diffs
+    # )
 
+    # ✅ Cálculo robusto de has_changes (incluye cambios de texto)
+    has_changes = any(
+        len(d.get("removed", [])) > 0 or
+        len(d.get("added", [])) > 0 or
+        len(d.get("modified", [])) > 0 or
+        (d.get("text_diff", {}).get("overlap_ratio", 1.0) < 0.95)
+        for d in diffs
+    )
+
+    # print(f"🧩 has_changes={has_changes} | total_diffs={len(diffs)}")
+
+    return {
+        "screen_diffs": diffs,
+        "has_changes": has_changes
+    }
 
 
 @app.get("/screen/exists")
@@ -1723,56 +2446,60 @@ async def screen_exists(buildId: str = Query(...)):
 
     return {"exists": bool(row)}
     
-    
 @app.post("/approve_diff")
 async def approve_diff(request: Request):
     """
     Espera JSON: {"diff_id": <id>} o {"diff_id": "11"}.
     Registra la aprobación en DB y devuelve resultado.
     """
-    # --- 1. Leer JSON de forma segura ---
+    # --- 1. Leer JSON ---
     try:
         payload = await request.json()
     except ValueError:
-        # El body estaba vacío o no era JSON válido
         raise HTTPException(status_code=400, detail="Cuerpo JSON inválido o vacío")
 
     # --- 2. Validar diff_id ---
     diff_id = payload.get("diff_id") or payload.get("id")
     if diff_id is None:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "diff_id missing"},
-        )
+        return JSONResponse(status_code=400, content={"status": "error", "message": "diff_id missing"})
 
     try:
         diff_id_int = int(diff_id)
     except (TypeError, ValueError):
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "diff_id must be integer"},
-        )
+        return JSONResponse(status_code=400, content={"status": "error", "message": "diff_id must be integer"})
 
-    # --- 3. Guardar en la base de datos ---
+    # --- 3. Guardar en DB ---
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
+
+        # Crear tabla si no existe
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS diff_approvals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 diff_id INTEGER,
-                approved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                approved INTEGER DEFAULT 1,
+                approved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        cursor.execute("INSERT INTO diff_approvals(diff_id) VALUES (?)", (diff_id_int,))
+
+        # Verificar si ya está aprobado
+        cursor.execute("SELECT 1 FROM diff_approvals WHERE diff_id = ?", (diff_id_int,))
+        if cursor.fetchone():
+            return {"status": "already_approved", "diff_id": diff_id_int}
+
+        # Insertar aprobación
+        cursor.execute("INSERT INTO diff_approvals(diff_id, approved) VALUES (?, 1)", (diff_id_int,))
         conn.commit()
+
     except Exception as db_err:
         logger.exception("Error de base de datos en /approve_diff")
         raise HTTPException(status_code=500, detail=f"DB error: {db_err}")
     finally:
         conn.close()
 
-    logger.info("Diff %s aprobado vía API", diff_id_int)
+    logger.info("✅ Diff %s aprobado vía API", diff_id_int)
     return {"status": "success", "diff_id": diff_id_int}
 
 
@@ -2326,7 +3053,7 @@ def qa_dashboard_advanced(tester_id: str, builds: Optional[int] = 5):
         new Chart(ctx, {{
             type: 'line',
             data: {{
-                labels: {json.dumps(builds_sorted)},
+                labels: {json.dumps(builds_sorted, ensure_ascii=False)},
                 datasets: [
                     {{ label: 'Removed', data: {removed_series}, borderColor: 'red', fill: false }},
                     {{ label: 'Added', data: {added_series}, borderColor: 'green', fill: false }},
