@@ -20,6 +20,8 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics.pairwise import cosine_similarity
 import httpx
 import ast
+from packaging import version
+import difflib
 
 from stable_signature import normalize_node
 
@@ -120,6 +122,33 @@ def _get_lock(key: str) -> asyncio.Lock:
         _model_locks[key] = asyncio.Lock()
     return _model_locks[key]
 
+def ui_structure_similarity(tree_a, tree_b):
+    """Compara estructuras jerárquicas de dos árboles de UI, ignorando texto exacto."""
+    def flatten_structure(node, depth=0):
+        """Aplana jerarquía en etiquetas con nivel + clase + hints."""
+        nodes = []
+        if isinstance(node, dict):
+            cls = node.get("className", "")
+            hint = node.get("hint", "")
+            desc = node.get("contentDescription", "")
+            text = node.get("text", "")
+            tag = f"{depth}|{cls}|{hint or desc or text}"
+            nodes.append(tag)
+            for child in node.get("children") or []:
+                nodes.extend(flatten_structure(child, depth + 1))
+        elif isinstance(node, list):
+            for child in node:
+                nodes.extend(flatten_structure(child, depth))
+        return nodes
+
+    a_nodes = flatten_structure(tree_a)
+    b_nodes = flatten_structure(tree_b)
+
+    a_str = "\n".join(sorted(a_nodes))
+    b_str = "\n".join(sorted(b_nodes))
+
+    return difflib.SequenceMatcher(None, a_str, b_str).ratio()
+
 
 def sequence_entropy(seq: list[str]) -> float:
     """Calcula la entropía de Shannon de una secuencia de elementos."""
@@ -129,6 +158,56 @@ def sequence_entropy(seq: list[str]) -> float:
     total = len(seq)
     ent = -sum((count/total) * math.log2(count/total) for count in counts.values())
     return ent
+
+
+def init_metrics_table():
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metrics_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tester_id TEXT,
+                build_id TEXT,
+                total_events INTEGER DEFAULT 0,
+                total_changes INTEGER DEFAULT 0,
+                total_added INTEGER DEFAULT 0,
+                total_removed INTEGER DEFAULT 0,
+                total_modified INTEGER DEFAULT 0,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tester_id, build_id)
+            )
+        """)
+        conn.commit()
+
+
+# Actualizar métricas
+def update_metrics(tester_id: str, build_id: str, has_changes: bool,
+                   added_count: int = 0, removed_count: int = 0, modified_count: int = 0):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO metrics_changes (
+                tester_id, build_id, total_events, total_changes,
+                total_added, total_removed, total_modified
+            )
+            VALUES (?, ?, 1, ?, ?, ?, ?)
+            ON CONFLICT(tester_id, build_id)
+            DO UPDATE SET
+                total_events = total_events + 1,
+                total_changes = total_changes + EXCLUDED.total_changes,
+                total_added = total_added + EXCLUDED.total_added,
+                total_removed = total_removed + EXCLUDED.total_removed,
+                total_modified = total_modified + EXCLUDED.total_modified,
+                last_updated = CURRENT_TIMESTAMP
+        """, (
+            tester_id,
+            build_id,
+            1 if has_changes else 0,
+            added_count,
+            removed_count,
+            modified_count
+        ))
+        conn.commit()
+
 # =========================================================
 # BASE DE DATOS
 # =========================================================
@@ -255,6 +334,21 @@ def init_db():
             code TEXT NOT NULL,
             expires_at INTEGER NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # ✅ NUEVA TABLA: métricas de cambios
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS metrics_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tester_id TEXT,
+            build_id TEXT,
+            total_events INTEGER DEFAULT 0,
+            total_changes INTEGER DEFAULT 0,
+            total_added INTEGER DEFAULT 0,      
+            total_removed INTEGER DEFAULT 0,    
+            total_modified INTEGER DEFAULT 0,   
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(tester_id, build_id)
         )
     """)
     c.execute("""
@@ -581,6 +675,11 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
     OTHER_FIELDS = ["className", "viewId", "pkg"]
     VISUAL_FIELDS = ["textColor", "backgroundColor", "fontSize", "alpha"]
 
+    removed_texts = locals().get("removed_texts", set())
+    diff_texts = locals().get("diff_texts", set())
+    structure_sim = locals().get("structure_sim", 0.0)
+    text_overlap = locals().get("text_overlap", 1.0)
+
     # ---------------- flatten ----------------
     def flatten_tree(tree):
         """Flatten tree generando paths relativos para cada nodo."""
@@ -768,18 +867,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
 
     modified, ignored_changes = [], []
 
-        # --- Detectar removidos ---
-    # for k, v in old_idx.items():
-    #     if k not in new_idx:
-    #         print(f"   ❌ REMOVIDO: {k} ({v.get('className')}, text='{v.get('text', '')[:40]}')")
-    #         removed.append({"node": {"key": k, "class": v.get("className")}, "changes": {}})
-
-    # # --- Detectar agregados ---
-    # for k, v in new_idx.items():
-    #     if k not in old_idx:
-    #         print(f"   ➕ AGREGADO: {k} ({v.get('className')}, text='{v.get('text', '')[:40]}')")
-    #         added.append({"node": {"key": k, "class": v.get("className")}, "changes": {}})
-
     # ---------------- detect modifications ----------------
     for k, nn in new_idx.items():
         if k in old_idx:
@@ -841,7 +928,9 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
             return key.split("text:")[-1].strip()
         return ""
     
-    # 👉 Agrega aquí:
+
+
+
     import difflib
     def similarity_ratio(a: str, b: str) -> float:
         """Calcula similitud de texto normalizada."""
@@ -942,6 +1031,28 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
                    for _, new in detected_text_mods)
         ]    
 
+     # ============================================================
+    # 🧠 SIMILITUD ESTRUCTURAL DE UI
+    # ============================================================
+    try:
+        structure_sim = ui_structure_similarity(old_tree, new_tree)
+        print(f"🏗️ Similitud estructural de UI: {structure_sim:.3f}")
+
+        # Si la similitud estructural es muy alta (>0.9) y no hay diffs,
+        # probablemente son la misma pantalla sin cambios funcionales.
+        if structure_sim > 0.9 and not (removed or added or modified):
+            print("✅ Pantalla estructuralmente igual — sin cambios relevantes.")
+    except Exception as e:
+        print(f"⚠️ Error calculando similitud estructural: {e}")
+        structure_sim = None    
+
+    has_changes = bool(
+        removed or added or modified
+        or text_overlap < 0.9
+        or removed_texts
+        or diff_texts
+    )   
+
     #return removed, added, modified
     return {
         "removed": removed,
@@ -951,7 +1062,9 @@ def compare_trees(old_tree, new_tree, app_name: str = None):
             "removed_texts": list(removed_texts),
             "added_texts": list(diff_texts),
             "overlap_ratio": text_overlap,  # 👈 agregado
-        }
+        },
+        "structure_similarity": structure_sim,  # 👈 agregado
+         "has_changes": has_changes
     }
 
 
@@ -1040,17 +1153,9 @@ async def _train_model_hybrid(
             logger.warning(f"[train_hybrid] tamaño de X={len(X)} < min_samples={min_samples}, desc={desc}")
             return
 
-        # 📁 Ruta base por tester y build
-        # base = os.path.join(MODELS_DIR, tester_id or "general", str(build_id) or "default")
-
         app_dir = os.path.join(MODELS_DIR, app_name)
         tester_dir = os.path.join(app_dir, tester_id or "general", str(build_id or "default"))
         os.makedirs(tester_dir, exist_ok=True)
-
-
-        # build_folder = "default" if build_id in [None, "", "None"] else str(build_id)
-        # base = os.path.join(MODELS_DIR, tester_id or "general", build_folder)
-        # os.makedirs(base, exist_ok=True)
 
         # ===================== Cargar modelos previos =====================
         #prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", str(int(build_id) - 1), "model.pkl")
@@ -1349,21 +1454,6 @@ def is_expected_behavior_change(node, field, old, new, expected_initial=None):
     # Todo lo demás es relevante
     return False
 
-
-# def overlap_ratio(removed, added):
-#     def extract_texts(nodes):
-#         return {
-#             n["node"]["key"].split("textsig:")[-1].strip().lower()
-#             for n in nodes if "textsig:" in n["node"]["key"]
-#         }
-
-#     r_texts, a_texts = extract_texts(removed), extract_texts(added)
-#     if not r_texts or not a_texts:
-#         return 0.0
-#     common = r_texts.intersection(a_texts)
-#     total = r_texts.union(a_texts)
-#     return len(common) / len(total)
-
 def overlap_ratio(old_nodes, new_nodes):
     """
     Calcula el overlap de texto entre dos listas de nodos planos.
@@ -1398,7 +1488,8 @@ def overlap_ratio(old_nodes, new_nodes):
 async def analyze_and_train(event: AccessibilityEvent):
     # -------------------- Normalizar campos --------------------
     norm = _normalize_event_fields(event)
-    t_id, b_id = norm.get("tester_id_norm"), norm.get("build_id_norm")
+    t_id = str(norm.get("tester_id_norm") or "").strip()
+    b_id = str(norm.get("build_id_norm") or "").strip()
     s_name = normalize_header(event.header_text)
     event_type_ref = normalize_header(event.event_type_name)
     app_name = event.package_name or "default_app"
@@ -1408,7 +1499,6 @@ async def analyze_and_train(event: AccessibilityEvent):
     # -------------------- Árbol y firma ------------------------
     latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
     sig = stable_signature(latest_tree)
-
     root_class_name = latest_tree[0].get("className") if latest_tree else ""
 
     # -------------------- Features enriquecidas ----------------
@@ -1428,11 +1518,43 @@ async def analyze_and_train(event: AccessibilityEvent):
         input_vec
     ])
 
+    # Valor por defecto, para evitar errores si hay excepciones antes de asignarlo
+    has_changes = False  
+
+    # -------------------- Verificación rápida de cambio de header --------------------
+    try:
+        curr_header = (s_name or "").strip().lower()
+        prev_header = None
+
+        with sqlite3.connect(DB_NAME) as conn:
+            # Buscar el último header distinto para el mismo tester
+            row = conn.execute("""
+                SELECT header_text
+                FROM accessibility_data
+                WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
+                AND LOWER(TRIM(header_text)) != LOWER(TRIM(?))
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (t_id, curr_header)).fetchone()
+
+            if row:
+                prev_header = (row[0] or "").strip().lower()
+
+        if prev_header and prev_header != curr_header:
+            print(f"⚠️ Header cambió (detección temprana): '{prev_header}' → '{curr_header}'")
+            logger.info(f"🔤 Cambio detectado temprano en header_text: '{prev_header}' → '{curr_header}'")
+            header_changed = {"before": prev_header, "after": curr_header}
+        else:
+            header_changed = None
+            print("✅ Header sin cambios (verificación temprana).")
+
+    except Exception as e:
+        header_changed = None
+        logger.warning(f"⚠️ Error en verificación temprana de header_text: {e}")
+
     # -------------------- Obtener snapshot previo ----------------
     prev_tree = None
-    #last_enriched_vec = np.zeros_like(enriched_vector)
-
-    IGNORED_FIELDS = {"text", "headerText", "hint", "contentDescription", "value", "progress"}
+    IGNORED_FIELDS = {"hint", "contentDescription", "value", "progress"}
 
     def normalize_node(node):
         return {k: v for k, v in node.items() if k not in IGNORED_FIELDS}
@@ -1443,7 +1565,7 @@ async def analyze_and_train(event: AccessibilityEvent):
         inter = len(set_a & set_b)
         union = len(set_a | set_b)
         return (inter / union) >= threshold if union > 0 else False
-    
+
     def get_class_name(row):
         try:
             views = json.loads(row[0])
@@ -1453,46 +1575,40 @@ async def analyze_and_train(event: AccessibilityEvent):
             pass
         return ""
 
-
     with sqlite3.connect(DB_NAME) as conn:
         prev_rows = conn.execute("""
             SELECT collect_node_tree, header_text, signature, enriched_vector, build_id, event_type_name
             FROM accessibility_data
             WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
-              AND build_id != ? 
-              AND signature = ?                                      
+              AND LOWER(TRIM(build_id)) != LOWER(TRIM(?))
             ORDER BY created_at DESC
             LIMIT 5
-        """, (t_id, b_id, sig)).fetchall()
-        # 2️⃣ Si no hay coincidencias exactas, buscar por className + header_text
-    if not prev_rows:
-        prev_rows = conn.execute("""
-            SELECT collect_node_tree, header_text, signature, enriched_vector, build_id, event_type_name
-            FROM accessibility_data
-            WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
-              AND LOWER(TRIM(header_text)) = LOWER(TRIM(?))
-              AND LOWER(TRIM(event_type_name)) = LOWER(TRIM(?))
-            ORDER BY created_at DESC
-            LIMIT 3
-        """, (t_id, s_name, event_type_ref)).fetchall()
+        """, (t_id, b_id)).fetchall()
 
-     #prev_enriched_vec = np.zeros_like(enriched_vector)
+    if not prev_rows:
+        with sqlite3.connect(DB_NAME) as conn:
+            prev_rows = conn.execute("""
+                SELECT collect_node_tree, header_text, signature, enriched_vector, build_id, event_type_name
+                FROM accessibility_data
+                WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
+                  AND LOWER(TRIM(header_text)) = LOWER(TRIM(?))
+                  AND LOWER(TRIM(event_type_name)) = LOWER(TRIM(?))
+                ORDER BY created_at DESC
+                LIMIT 3
+            """, (t_id, s_name, event_type_ref)).fetchall()
 
     best_row = None
-    best_sim = 0.0 
+    best_sim = 0.0
 
     for row in prev_rows:
         try:
             prev_enriched_vec = np.array(ast.literal_eval(row[3]), dtype=float)
-
             min_len = min(len(prev_enriched_vec), len(enriched_vector))
             prev_vec = prev_enriched_vec[:min_len]
             curr_vec = enriched_vector[:min_len]
-
             sim = np.dot(curr_vec, prev_vec) / (
                 np.linalg.norm(curr_vec) * np.linalg.norm(prev_vec) + 1e-8
             )
-
             if sim > best_sim:
                 best_sim = sim
                 best_row = row
@@ -1503,30 +1619,15 @@ async def analyze_and_train(event: AccessibilityEvent):
         logger.info(f"🤝 Coincidencia estructural detectada entre builds (similitud={best_sim:.3f})")
     else:
         logger.warning("⚠️ No se encontró coincidencia ni por signature ni por estructura.")
-    
+
     previous_row = None
     if prev_rows:
         latest_event = getattr(event, "event_type_name", None)
-
-        # ---------- Filtro mejorado por tipo de evento + className + signature ----------
         same_event_rows = []
+
         if latest_event:
-            # className y signature del evento actual (más reciente)
             current_class = root_class_name or get_class_name(prev_rows[-1])
             current_signature = sig
-
-            # 🔍 DEBUG opcional: ver coincidencias campo a campo
-            logger.info("🔍 Evaluando coincidencias previas:")
-            for r in prev_rows:
-                logger.info({
-                    "event": r[5],
-                    "class": get_class_name(r),
-                    "signature": (r[2][:8] if r[2] else None),
-                    "match_event": r[5] == latest_event,
-                    "match_class": get_class_name(r) == current_class,
-                    "match_sig": r[2] == current_signature,
-                })
-
             same_event_rows = [
                 r for r in prev_rows
                 if (
@@ -1536,13 +1637,12 @@ async def analyze_and_train(event: AccessibilityEvent):
                 )
             ]
 
-        # Si no hay coincidencias, usar al menos la última fila como fallback
         if not same_event_rows and prev_rows:
             same_event_rows = [prev_rows[-1]]
 
-        # ---------- Comparación vectorial y estructural ----------
         latest_vec = enriched_vector.reshape(1, -1)
         best_sim, best_row = 0, None
+
         for r in same_event_rows:
             try:
                 prev_vec = np.array(json.loads(r[3])).reshape(1, -1)
@@ -1552,7 +1652,7 @@ async def analyze_and_train(event: AccessibilityEvent):
             except Exception:
                 continue
 
-        if best_row and best_sim > 0.95:
+        if best_row and best_sim > 0.90:
             previous_row = best_row
             prev_tree = ensure_list(json.loads(best_row[0]))
             logger.info(f"🤝 Coincidencia alta por similitud vectorial ({best_sim:.3f})")
@@ -1571,93 +1671,53 @@ async def analyze_and_train(event: AccessibilityEvent):
             else:
                 logger.warning("⚠️ No hay coincidencia por signature, vector ni estructura.")
 
-        if prev_tree is not None:
-            try:
-                prev_enriched_vec = np.array(json.loads(previous_row[3]), dtype=float)
-            except Exception:
-                prev_enriched_vec = np.zeros_like(enriched_vector)
-
     # -------------------- Comparación de árboles ----------------
     removed_all, added_all, modified_all = [], [], []
+    text_diff = {}
 
     if prev_tree:
+        logger.debug(f"Comparando árboles: prev={len(prev_tree)} nodos, latest={len(latest_tree)} nodos")
+        if len(prev_tree) == len(latest_tree):
+            logger.debug("⚠️ Árboles del mismo tamaño, posible snapshot idéntico.")
+
         try:
             diff_result = compare_trees(prev_tree, latest_tree)
+            has_changes = bool(
+                diff_result.get("removed") or
+                diff_result.get("added") or
+                diff_result.get("modified") or
+                diff_result.get("text_diff", {}).get("removed_texts") or
+                diff_result.get("text_diff", {}).get("added_texts") or
+                diff_result.get("text_diff", {}).get("diff_texts") or
+                diff_result.get("text_diff", {}).get("text_overlap", 1.0) < 0.9
+            )
         except Exception as e:
             logger.error(f"❌ Error ejecutando compare_trees: {e}")
-            diff_result = {"removed": [], "added": [], "modified": [], "text_diff": {}}
+            diff_result = {"removed": [], "added": [], "modified": [], "text_diff": {}, "has_changes": False}
+            has_changes = False
 
-        removed = diff_result["removed"]
-        added = diff_result["added"]
-        modified = diff_result["modified"]
+        removed_all = diff_result.get("removed", [])
+        added_all = diff_result.get("added", [])
+        modified_all = diff_result.get("modified", [])
         text_diff = diff_result.get("text_diff", {})
 
-        # -------------------- Convertir cambios de texto a modified ----------------
-        # for r in removed[:]:
-        #     if r["node"].get("text") in text_diff.get("removed", []):
-        #         removed.remove(r)
-        #         modified.append({
-        #             "node": r["node"],
-        #             "changes": {"text": {"old": r["node"]["text"], "new": text_diff["added"].get(r["node"]["text"], "")}}
-        #         })
-        # for a in added[:]:
-        #     if a["node"].get("text") in text_diff.get("added", []):
-        #         added.remove(a)
 
-        # -------------------- Convertir cambios de texto (de text_diff) a modified ----------------
-        
-        def extract_text_from_key(key: str) -> str:
-            """Extrae el texto visible desde una clave tipo textsig: o text:."""
-            if not key:
-                return ""
-            if "textsig:" in key:
-                return key.split("textsig:")[-1].strip()
-            if "text:" in key:
-                return key.split("text:")[-1].strip()
-            return ""
+        print(f"📊 [DEBUG DIFF RESULT] removed={len(removed_all)}, added={len(added_all)}, modified={len(modified_all)}, has_changes={has_changes}")
+        logger.info(f"📊 compare_trees → removed={len(removed_all)}, added={len(added_all)}, modified={len(modified_all)}, has_changes={has_changes}")
 
-        def similarity_ratio(a: str, b: str) -> float:
-            """Devuelve la similitud (0.0 a 1.0) entre dos textos."""
-            a, b = (a or "").strip().lower(), (b or "").strip().lower()
-            if not a or not b:
-                return 0.0
-            return difflib.SequenceMatcher(None, a, b).ratio()
-
-        for r in removed[:]:
-            r_text = extract_text_from_key(r["node"]["key"])
-            # Buscar si el texto removido coincide con alguno de los text_diff
-            if r_text in text_diff.get("removed_texts", []):
-                # Buscar la mejor coincidencia con textos agregados
-                best_match = None
-                best_sim = 0.0
-                for new_t in text_diff.get("added_texts", []):
-                    sim = similarity_ratio(r_text, new_t)
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_match = new_t
-                # Si hay coincidencia fuerte, convertir en "modified"
-                if best_match and best_sim > 0.6:
-                    removed.remove(r)
-                    modified.append({
-                        "node": r["node"],
-                        "changes": {"text": {"old": r_text, "new": best_match}}
-                    })
-
-        # Limpiar los added ya usados en modificaciones
-        for a in added[:]:
-            a_text = extract_text_from_key(a["node"]["key"])
-            if a_text in text_diff.get("added_texts", []):
-                added.remove(a)
-
-        removed_all.extend(removed)
-        added_all.extend(added)
-        modified_all.extend(modified)
-
-        logger.info(f"📊 compare_trees → removed={len(removed_all)}, added={len(added_all)}, modified={len(modified_all)}")
-        logger.info(f"📊 Text overlap ratio: {overlap_ratio(removed_all, added_all):.2f}")
+        try:
+            structure_sim = ui_structure_similarity(prev_tree, latest_tree)
+            text_diff["ui_structure_similarity"] = structure_sim
+            logger.info(f"🏗️ Similitud estructural UI: {structure_sim:.3f}")
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo calcular similitud estructural: {e}")
+            text_diff["ui_structure_similarity"] = None
+    else:
+        logger.info("ℹ️ No hay árbol previo — se omite comparación estructural.")
+        has_changes = True
 
     # -------------------- Guardar en screen_diffs ----------------
-    if removed_all or added_all or modified_all:
+    if has_changes:
         removed_j = json.dumps(removed_all, sort_keys=True, ensure_ascii=False)
         added_j = json.dumps(added_all, sort_keys=True, ensure_ascii=False)
         modified_j = json.dumps(modified_all, sort_keys=True, ensure_ascii=False)
@@ -1673,18 +1733,33 @@ async def analyze_and_train(event: AccessibilityEvent):
             """, (diff_signature,))
             existing = cur.fetchone()
 
+            # --- Header changed ya detectado, aseguramos que se incluya en text_diff ---
+            if header_changed:
+                print(f"⚠️ Header cambió: '{header_changed['before']}' → '{header_changed['after']}'")
+                text_diff["header_changed"] = header_changed
+                has_changes = has_changes or True
+            else:
+                print("✅ Header sin cambios.")
+
+            # --- Decidir si insertar ---
             if existing and existing[1]:
                 logger.info(f"✅ Diff {diff_signature[:8]} ya aprobado — no se inserta.")
             elif existing:
                 logger.info(f"⚠️ Diff {diff_signature[:8]} ya existente sin aprobación.")
-            else:
+            elif has_changes:
+                removed_j = json.dumps(removed_all, sort_keys=True, ensure_ascii=False)
+                added_j = json.dumps(added_all, sort_keys=True, ensure_ascii=False)
+                modified_j = json.dumps(modified_all, sort_keys=True, ensure_ascii=False)
                 text_diff_j = json.dumps(text_diff, ensure_ascii=False)
+
                 cur.execute("""
                     INSERT INTO screen_diffs (tester_id, build_id, header_text, removed, added, modified, text_diff, diff_hash)
                     VALUES (?,?,?,?,?,?,?,?)
                 """, (t_id, b_id, s_name, removed_j, added_j, modified_j, text_diff_j, diff_signature))
                 conn.commit()
                 logger.info(f"🧩 Guardado cambio ({diff_signature[:8]}) en screen_diffs")
+    else:
+        logger.info(f"🧩 has_changes={has_changes} | total_diffs={len(removed_all)+len(added_all)+len(modified_all)}")
 
     # -------------------- Actualizar enriched_vector ----------------
     with sqlite3.connect(DB_NAME) as conn:
@@ -1713,7 +1788,15 @@ async def analyze_and_train(event: AccessibilityEvent):
             app_name=app_name,
             desc=f"{app_name} general"
         )
+    
+    try:
+        added_count = len(added_all or [])
+        removed_count = len(removed_all or [])
+        modified_count = len(modified_all or [])
+    except Exception:
+        added_count = removed_count = modified_count = 0
 
+    return has_changes, added_count, removed_count, modified_count
 
 async def _train_incremental_logic_hybrid(
     tester_id: str,
@@ -1987,135 +2070,106 @@ def stable_signature(nodes: List[Dict]) -> str:
         json.dumps(norm, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
 
-# =========================================================
-# ENDPOINTS API
-# =========================================================
 @app.post("/collect")
 async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundTasks):
     logger.debug("Raw request: %s", event.model_dump())
     try:
-        # Normalizamos variantes de campos que pueden venir con distintos nombres
+        # -------------------- Normalización --------------------
         raw_nodes = event.collect_node_tree or event.tree_data or []
         normalized_nodes = normalize_tree(raw_nodes)
         signature = stable_signature(raw_nodes)
         norm = _normalize_event_fields(event)
+
         tester_norm = norm.get("tester_id_norm")
         build_norm = norm.get("build_id_norm")
         screen_name = event.screen_names or ""
+        header_text = event.header_text or ""
         screens_id_val = event.screens_id or norm.get("screensId") or None
 
-        # Determinar className principal o asignar por defecto si es splash
+        # Class raíz
         if normalized_nodes and isinstance(normalized_nodes, list):
             root_class_name = normalized_nodes[0].get("className", "") if isinstance(normalized_nodes[0], dict) else ""
         else:
             root_class_name = ""
-
-        # Asignar nombre por defecto si está vacío o el árbol es muy pequeño
         if not root_class_name or len(normalized_nodes) <= 2:
             root_class_name = "SplashActivity"
 
+        print(f"[collect] Root className detectado: {root_class_name}")
+        print(f"[collect] tester={tester_norm} build={build_norm} screen={screen_name}")
 
-        logger.info(f"[collect] Root className detectado: {root_class_name}")
+        # -------------------- Estado inicial --------------------
+        has_changes = False
+        prev_build_name = None
+        is_new_record = True
 
-        logger.info(f"[collect] normalized tester={tester_norm} build={build_norm} screen={screen_name} screens_id={screens_id_val}")
-
-        # Evitar duplicados inmediatos: comparar último hash
+        # -------------------- Buscar último snapshot --------------------
         last = last_hash_for_screen(tester_norm, screen_name)
         logger.debug(f"[collect] last_hash={last} current_hash={screens_id_val}")
 
-        # Si el hash actual es None (no enviado), igual insertamos el snapshot bruto,
-        # pero si viene con screens_id y coincide con el último, podemos evitar insertar duplicado.
-        do_insert = True
-        if screens_id_val and last and str(last) == str(screens_id_val):
-            do_insert = False
-            logger.debug(f"[collect] last={last} ({type(last)}), screens_id_val={screens_id_val} ({type(screens_id_val)})")
-            logger.info("[collect] Snapshot idéntico al último almacenado — no se inserta duplicado.")
-        
-        clean_header = (event.header_text or "").replace("\r", "").replace("\n", " ").strip()
+        prev_snapshot = None
+        if last:
+            with sqlite3.connect(DB_NAME) as conn:
+                conn.row_factory = sqlite3.Row
+                prev_snapshot = conn.execute("""
+                    SELECT class_name, build_id, collect_node_tree
+                    FROM accessibility_data
+                    WHERE header_text = ? AND class_name = ?
+                    ORDER BY id DESC LIMIT 1
+                """, (header_text, root_class_name)).fetchone()
 
-        struct_vec = ui_structure_features(normalized_nodes)
-        timestamps = [e.timestamp for e in ensure_list(event.actions or [])]
-        time_deltas = np.diff(timestamps) if len(timestamps) > 1 else [0]
-        avg_dwell = float(np.mean(time_deltas)) if len(time_deltas) > 0 else 0
-        num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
-        input_vec = input_features(event.actions or [])
+        if prev_snapshot:
+            prev_build_name = prev_snapshot["build_id"]
+            prev_nodes = json.loads(prev_snapshot["collect_node_tree"] or "[]")
+            is_new_record = build_norm != prev_build_name
 
-        # print("[DEBUG] normalized_nodes:", normalized_nodes)
-        # print("[DEBUG] struct_vec:", struct_vec)
-        # print("[DEBUG] timestamps:", timestamps)
-        # print("[DEBUG] avg_dwell:", avg_dwell)
-        # print("[DEBUG] num_gestos:", num_gestos)
-        # print("[DEBUG] input_vec:", input_vec)
+            # Ejecutar análisis y obtener cambios
+            # has_changes = await analyze_and_train(event)
+            has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
 
-        #enriched_vector = np.array(struct_vec + [avg_dwell, num_gestos] + input_vec, dtype=float)
+            update_metrics(
+                tester_norm,
+                build_norm,
+                has_changes,
+                added_count=added_count,
+                removed_count=removed_count,
+                modified_count=modified_count
+            )
+            return {"has_changes": has_changes}
 
-        sig_vec = np.array(structure_signature_features(normalized_nodes), dtype=float)
-        #input_vec = np.array(input_features(event.actions or []), dtype=float)
-
-        timestamps = [e.timestamp for e in ensure_list(event.actions or [])]
-        time_deltas = np.diff(timestamps) if len(timestamps) > 1 else [0]
-        avg_dwell = float(np.mean(time_deltas)) if len(time_deltas) > 0 else 0
-        num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
-        input_vec = np.array(input_features(event.actions or []), dtype=float).flatten()
-
-        combined = np.concatenate([
-            np.array(struct_vec, dtype=float).flatten(),
-            sig_vec.flatten(),
-            np.array([avg_dwell, num_gestos], dtype=float),
-            input_vec.flatten()
-        ])
-        #enriched_vector = combined.astype(float)
-        enriched_vector = np.concatenate([
-            struct_vec,
-            sig_vec,
-            np.array([avg_dwell, num_gestos], dtype=float),
-            input_vec
-        ])
-
-
-        cluster_id: int | None = None
-        anomaly_score: float | None = None
-
-        # justo antes del INSERT, define:
-        db_class_name = root_class_name or (event.class_name or "")
+        # -------------------- Insertar si corresponde --------------------
+        do_insert = is_new_record or has_changes
 
         if do_insert:
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO accessibility_data (
-                    tester_id, build_id, timestamp, event_type, event_type_name,
-                    package_name, class_name, text, content_description, screens_id,
-                    screen_names, header_text, collect_node_tree, signature,
-                    additional_info, tree_data, enriched_vector, cluster_id, anomaly_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                tester_norm, build_norm, event.timestamp, event.event_type,
-                event.event_type_name, event.package_name, db_class_name,
-                event.text, event.content_description, screens_id_val,
-                event.screen_names, clean_header,
-                json.dumps(normalized_nodes, ensure_ascii=False),
-                signature,
-                json.dumps(event.additional_info, ensure_ascii=False) if event.additional_info else None,
-                json.dumps(event.tree_data, ensure_ascii=False) if event.tree_data else None,
-                json.dumps(enriched_vector.tolist(), ensure_ascii=False) if enriched_vector is not None else None,
-                cluster_id,
-                anomaly_score
-            ))
-            conn.commit()
-            conn.close()
-            logger.info("[collect] Insert completado.")
-        else:
-            logger.info("[collect] Se omitió insert porque snapshot coincide con último.")
-            logger.info(f"[collect] Insert completado con class_name={root_class_name}")
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO accessibility_data (
+                        tester_id, build_id, timestamp, event_type, event_type_name,
+                        package_name, class_name, text, content_description, screens_id,
+                        screen_names, header_text, collect_node_tree, signature,
+                        additional_info, tree_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    tester_norm, build_norm, event.timestamp, event.event_type,
+                    event.event_type_name, event.package_name, root_class_name,
+                    event.text, event.content_description, screens_id_val,
+                    event.screen_names, header_text,
+                    json.dumps(normalized_nodes, ensure_ascii=False),
+                    signature,
+                    json.dumps(event.additional_info, ensure_ascii=False) if event.additional_info else None,
+                    json.dumps(event.tree_data, ensure_ascii=False) if event.tree_data else None
+                ))
+                conn.commit()
+            logger.info("[collect] Insert completado (nuevo build o cambios detectados).")
+            return {"status": "success", "inserted": True, "has_changes": has_changes}
 
-        # Añadir tarea en background para análisis/entrenamiento (siempre la lanzamos,
-        # aunque no se haya insertado para mantener chequeos)
-        background_tasks.add_task(analyze_and_train, event)
-        return {"status": "success", "inserted": do_insert}
+        # Si no hay cambios ni nuevo build
+        return {"status": "skipped", "inserted": False, "has_changes": has_changes}
+
     except Exception as e:
         logger.error(f"Error en /collect: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
 
 @app.get("/status")
 async def get_status(
@@ -2219,6 +2273,14 @@ async def trigger_incremental_train(
     }
 
 
+def extract_numeric_version(v: str) -> str:
+    """Extrae el número de versión (por ejemplo, 'v1.2.3-beta' → '1.2.3')."""
+    if not v:
+        return None
+    match = re.search(r"(\d+(?:\.\d+){0,2})", v)
+    return match.group(1) if match else None
+
+
 @app.get("/screen/diffs")
 def get_screen_diffs(
     tester_id: Optional[str] = Query(None),
@@ -2246,38 +2308,39 @@ def get_screen_diffs(
         query += " AND (s.tester_id = ? OR (s.tester_id IS NULL AND ? = ''))"
         params.extend([tester_id, tester_id])
 
-    if build_id is not None:
-        query += """
-            AND (
-                TRIM(CAST(s.build_id AS TEXT)) = TRIM(?)
-                OR (s.build_id IS NULL AND ? = '')
-            )
-        """
-        params.extend([str(build_id).strip(), str(build_id).strip()])
-
     if screen_name is not None:
         query += """
-                AND (
-                    LOWER(TRIM(s.header_text)) = LOWER(TRIM(?))
-                    OR (TRIM(s.header_text) = '' AND ? = '')
-                    OR (s.header_text IS NULL AND ? = '')
-                )
-            """
-        params.extend([screen_name, screen_name, screen_name])
+            AND (
+                LOWER(TRIM(s.header_text)) LIKE LOWER(TRIM(?))
+                OR (TRIM(s.header_text) = '' AND ? = '')
+                OR (s.header_text IS NULL AND ? = '')
+            )
+        """
+        like_pattern = f"%{screen_name.strip()}%"
+        params.extend([like_pattern, screen_name, screen_name])
 
-    query += """
-        AND (
-            COALESCE(s.removed, '[]') != '[]'
-            OR COALESCE(s.added, '[]') != '[]'
-            OR COALESCE(s.modified, '[]') != '[]'
-            OR (s.text_diff IS NOT NULL AND TRIM(s.text_diff) NOT IN ('{}', '', 'null'))
-        )
-        ORDER BY s.created_at DESC
-    """
+    query += " ORDER BY s.created_at DESC"
 
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
     conn.close()
+
+    # 🧮 Filtro de build_id semántico (menor o igual)
+    if build_id is not None:
+        build_ver_str = extract_numeric_version(str(build_id))
+        if build_ver_str:
+            build_ver = version.parse(build_ver_str)
+            filtered_rows = []
+            for r in rows:
+                r_build_str = extract_numeric_version(str(r[2]))
+                if not r_build_str:
+                    continue  # ignora los registros sin versión válida
+                try:
+                    if version.parse(r_build_str) <= build_ver:
+                        filtered_rows.append(r)
+                except Exception:
+                    continue
+            rows = filtered_rows
 
     def safe_json_load(v):
         try:
@@ -2417,20 +2480,15 @@ def get_screen_diffs(
         })
 
     # ✅ Cálculo robusto de has_changes
-    has_changes = any(
-        len(d.get("removed", [])) > 0
-        or len(d.get("added", [])) > 0
-        or len(d.get("modified", [])) > 0
-        or (
-            isinstance(d.get("text_diff"), dict)
-            and (
-                d["text_diff"].get("overlap_ratio", 1.0) < 0.95
-                or len(d["text_diff"].get("removed_texts", [])) > 0
-                or len(d["text_diff"].get("added_texts", [])) > 0
-            )
-        )
-        for d in diffs
-    )
+    print("DEBUG diffs:", diffs)
+    # Tomamos has_changes directo de compare_trees
+    for d in diffs:
+        # ejemplo si cada diff viene de compare_trees
+        d["has_changes"] = d.get("has_changes", True)  # fallback True si no viene
+
+    # Si quieres un indicador global
+    # has_changes = any(d["has_changes"] for d in diffs)
+    has_changes = any(diff.get("has_changes", False) for diff in diffs)
 
     print(f"🧩 has_changes={has_changes} | total_diffs={len(diffs)}")
 
@@ -3092,3 +3150,24 @@ def qa_dashboard_advanced(tester_id: str, builds: Optional[int] = 5):
 
 app.include_router(diff_router)
 app.include_router(router, prefix="/api")
+
+
+@app.get("/metrics/changes")
+async def get_change_metrics(tester_id: str = None):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        q = """
+            SELECT tester_id, build_id, total_events, total_changes,
+                   total_added, total_removed, total_modified,
+                   ROUND(100.0 * total_changes / total_events, 2) AS change_rate,
+                   last_updated
+            FROM metrics_changes
+        """
+        if tester_id:
+            q += " WHERE tester_id = ? ORDER BY last_updated DESC"
+            rows = cur.execute(q, (tester_id,)).fetchall()
+        else:
+            q += " ORDER BY last_updated DESC"
+            rows = cur.execute(q).fetchall()
+        return {"metrics": [dict(r) for r in rows]}
