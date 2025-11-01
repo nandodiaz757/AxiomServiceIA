@@ -753,180 +753,6 @@ def features_from_rows(rows) -> np.ndarray:
 # =========================================================
 # ENTRENAMIENTO HÍBRIDO (KMeans + HMM)
 # =========================================================
-
-# ===================== FUNCIÓN PRINCIPAL =====================
-# async def _train_model_hybrid(
-#     X,
-#     tester_id: str = "general",
-#     build_id: str = "default",
-#     app_name: str = "default_app", 
-#     lock: asyncio.Lock = None,
-#     max_clusters=3,        # ✅ ahora 3 clusters por defecto
-#     min_samples=1,         # ✅ subimos mínimo a 3 para mejor estabilidad
-#     desc="",
-#     n_hmm_states=3         # ✅ ahora usa 3 estados: estable, leve, estructural
-# ):
-#     """
-#     Entrena modelos HMM + KMeans combinados y los guarda por tester_id/build_id.
-#     Si existen modelos previos, continúa el entrenamiento incrementalmente.
-#     """
-#     logger.info(f"[train_hybrid] Iniciando entrenamiento → tester_id={tester_id}, build_id={build_id}, desc={desc}")
-
-
-#     # ✅ Asegura que siempre haya un lock
-#     lock = lock or asyncio.Lock()
-
-#     async with lock:
-#         if len(X) < min_samples:
-#             logger.warning(f"[train_hybrid] tamaño de X={len(X)} < min_samples={min_samples}, desc={desc}")
-#             return
-
-#         app_dir = os.path.join(MODELS_DIR, app_name)
-#         tester_dir = os.path.join(app_dir, tester_id or "general", str(build_id or "default"))
-#         os.makedirs(tester_dir, exist_ok=True)
-
-#         # ===================== Cargar modelos previos =====================
-#         #prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", str(int(build_id) - 1), "model.pkl")
-#         prev_kmeans, prev_hmm = None, None
-#         prev_model_path = None
-#         prev_build_id = None  
-
-#         try:
-#             if build_id and str(build_id).isdigit():
-#                 prev_build_id = str(int(build_id) - 1)
-#                 prev_model_path = os.path.join(app_dir, tester_id, prev_build_id, "model.pkl")
-#         except Exception:
-#             prev_model_path = None    
-
-#                 # Cargar modelo previo si existe
-#         if prev_model_path and os.path.exists(prev_model_path):
-#             try:
-#                 prev = joblib.load(prev_model_path)
-#                 prev_kmeans = prev.get("kmeans")
-#                 prev_hmm = prev.get("hmm")
-#                 logger.info(f"[train_hybrid] Modelo previo encontrado → {prev_model_path}")
-#             except Exception as e:
-#                 logger.warning(f"[train_hybrid] No se pudo cargar modelo previo: {e}")        
-
-#         if prev_build_id:
-#             prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", prev_build_id, "model.pkl")
-#         else:
-#             prev_model_path = None
-
-
-#         if prev_model_path and os.path.exists(prev_model_path):
-#             try:
-#                 prev = joblib.load(prev_model_path)
-#                 prev_kmeans = prev.get("kmeans")
-#                 prev_hmm = prev.get("hmm")
-#                 logger.info(f"[train_hybrid] Modelo previo encontrado → {prev_model_path}")
-#             except Exception as e:
-#                 logger.warning(f"[train_hybrid] No se pudo cargar modelo previo: {e}")
-
-        # ===================== Entrenar KMeans =====================
-        # try:
-        #     if prev_kmeans:
-        #         kmeans = MiniBatchKMeans(
-        #             n_clusters=min(max_clusters, len(X)),
-        #             random_state=42,
-        #             init=prev_kmeans.cluster_centers_,
-        #             n_init=1
-        #         ).fit(X)
-        #     else:
-        #         kmeans = MiniBatchKMeans(
-        #             n_clusters=min(max_clusters, len(X)),
-        #             random_state=42
-        #         ).fit(X)
-        # except Exception as e:
-        #     logger.error(f"[train_hybrid] Error en KMeans: {e}")
-        #     kmeans = BASE_KMEANS.fit(X)
-        # ===================== Entrenar KMeans (INCREMENTAL) =====================
-        # try:
-        #     n_clusters = min(max_clusters, len(X))
-
-        #     if prev_kmeans:
-        #         # Incremental update — ajusta los centroides existentes con nuevos datos
-        #         prev_kmeans.partial_fit(X)
-        #         kmeans = prev_kmeans
-        #         logger.info("[train_hybrid] 🔁 KMeans actualizado incrementalmente con partial_fit()")
-        #     else:
-        #         # Entrenamiento inicial
-        #         kmeans = MiniBatchKMeans(
-        #             n_clusters=n_clusters,
-        #             random_state=42,
-        #             batch_size=max(10, len(X))
-        #         ).fit(X)
-        #         logger.info("[train_hybrid] 🆕 KMeans inicial entrenado desde cero")
-        # except Exception as e:
-        #     logger.error(f"[train_hybrid] Error en KMeans incremental: {e}")
-        #     kmeans = BASE_KMEANS.fit(X)
-
-        # ===================== Entrenar HMM =====================
-        # try:
-        #     hmm_model = hmm.GaussianHMM(
-        #         n_components=min(n_hmm_states, len(X)),
-        #         covariance_type="diag",
-        #         n_iter=300,
-        #         tol=1e-3,
-        #         random_state=42,
-        #         verbose=False
-        #     )
-
-        #     if prev_hmm:
-        #         hmm_model.startprob_ = prev_hmm.startprob_
-        #         hmm_model.transmat_ = prev_hmm.transmat_
-        #         hmm_model.means_ = prev_hmm.means_
-        #         hmm_model.covars_ = prev_hmm.covars_
-
-        #     hmm_model.fit(X, [len(X)])
-        # except Exception as e:
-        #     logger.error(f"[train_hybrid] Error en HMM: {e}")
-        #     hmm_model = BASE_HMM.fit(X)
-
-        # ===================== Entrenar HMM (PSEUDO-INCREMENTAL) =====================
-        # try:
-        #     hmm_model = hmm.GaussianHMM(
-        #         n_components=min(n_hmm_states, len(X)),
-        #         covariance_type="diag",
-        #         n_iter=300,
-        #         tol=1e-3,
-        #         random_state=42,
-        #         verbose=False
-        #     )
-
-        #     if prev_hmm:
-        #         hmm_model.startprob_ = prev_hmm.startprob_
-        #         hmm_model.transmat_ = prev_hmm.transmat_
-        #         hmm_model.means_ = prev_hmm.means_
-        #         hmm_model.covars_ = prev_hmm.covars_
-
-        #         # Reentrenamiento leve con nuevos datos
-        #         hmm_model.fit(X, [len(X)])
-        #         logger.info("[train_hybrid] 🔁 HMM ajustado con nuevos datos (pseudo-incremental)")
-        #     else:
-        #         hmm_model.fit(X, [len(X)])
-        #         logger.info("[train_hybrid] 🆕 HMM inicial entrenado desde cero")
-        # except Exception as e:
-        #     logger.error(f"[train_hybrid] Error en HMM incremental: {e}")
-        #     hmm_model = BASE_HMM.fit(X)
-
-
-        # # ===================== Guardar modelos =====================
-        # try:
-        #     joblib.dump({"kmeans": kmeans, "hmm": hmm_model}, os.path.join(tester_dir, "model.pkl"))
-        #     joblib.dump(kmeans, os.path.join(tester_dir, "kmeans.joblib"))
-        #     joblib.dump(hmm_model, os.path.join(tester_dir, "hmm.joblib"))
-
-        #     # ✅ Actualizar el modelo general de la app si el tester no es "general"
-        #     if tester_id != "general":
-        #         general_dir = os.path.join(app_dir, "general")
-        #         os.makedirs(general_dir, exist_ok=True)
-        #         joblib.dump({"kmeans": kmeans, "hmm": hmm_model}, os.path.join(general_dir, "model.pkl"))
-        #         logger.info(f"[train_hybrid] 🔄 Actualizado modelo general de {app_name}")
-
-        #     logger.info(f"[train_hybrid] ✅ Modelos guardados correctamente en {tester_dir}")
-        # except Exception as e:
-        #     logger.error(f"[train_hybrid] Error guardando modelos: {e}")
             
 # =========================================================
 # ENTRENAMIENTO HÍBRIDO (KMeans + HMM)  – versión mejorada
@@ -1380,17 +1206,6 @@ async def analyze_and_train(event: AccessibilityEvent):
         if len(prev_tree) == len(latest_tree):
             logger.debug("⚠️ Árboles del mismo tamaño, posible snapshot idéntico.")
 
-        # try:
-        #     diff_result = compare_trees(prev_tree, latest_tree)
-        #     has_changes = bool(
-        #         diff_result.get("removed") or
-        #         diff_result.get("added") or
-        #         diff_result.get("modified") or
-        #         diff_result.get("text_diff", {}).get("removed_texts") or
-        #         diff_result.get("text_diff", {}).get("added_texts") or
-        #         diff_result.get("text_diff", {}).get("diff_texts") or
-        #         diff_result.get("text_diff", {}).get("text_overlap", 1.0) < 0.9
-        #     )
         try:
             diff_result = compare_trees(
                 prev_tree,
@@ -1518,10 +1333,7 @@ async def analyze_and_train(event: AccessibilityEvent):
                     diff_signature, text_overlap, overlap_ratio,
                     ui_structure_sim_value, screen_status
                 ))
-                # cur.execute("""
-                #     INSERT OR IGNORE INTO screen_diffs (tester_id, build_id, screen_name, header_text, removed, added, modified, text_diff, diff_hash, text_overlap, overlap_ratio, ui_structure_similarity, screen_status)
-                #     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                # """, (t_id, b_id, s_name, header_text, removed_j, added_j, modified_j, text_diff_j, diff_signature, text_overlap, overlap_ratio, ui_structure_similarity, screen_status))
+               
                 conn.commit()
                 logger.info(f"🧩 Guardado cambio ({diff_signature[:8]}) en screen_diffs")
     else:
@@ -1712,7 +1524,7 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
         print(f"[collect] tester={tester_norm} build={build_norm} screen={screen_name}")
 
         # -------------------- Estado inicial --------------------
-         #has_changes = False
+        has_changes = False
         prev_build_name = None
         is_new_record = True
 
@@ -2100,17 +1912,6 @@ def get_screen_diffs(
                     "pkg": node.get("pkg", ""),
                     "action": "modified"
                 })    
-            # for attr, vals in changes.items():
-            #     detailed_changes.append({
-            #         "attribute": attr,
-            #         "old_value": vals.get("old"),
-            #         "new_value": vals.get("new"),
-            #         "node_class": node.get("class"),
-            #         "node_key": node.get("key"),
-            #         "node_text": node.get("text", ""),
-            #         "pkg": node.get("pkg", ""),
-            #         "action": "modified"
-            #     })
 
         # Procesar agregados y eliminados
         for node in added:
@@ -2144,7 +1945,7 @@ def get_screen_diffs(
         })
 
     # ✅ Cálculo robusto de has_changes
-    print("DEBUG diffs:", diffs)
+    #print("DEBUG diffs:", diffs)
     # Tomamos has_changes directo de compare_trees
     for d in diffs:
         d["has_changes"] = any([

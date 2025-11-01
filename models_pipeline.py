@@ -113,6 +113,52 @@ def normalize_node(node: dict) -> dict:
                 # si no existía, no tocarlo
                 normalized[k] = node.get("checked", None)
             continue  
+        
+                # --- CASO ESPECIAL: ENABLED ---
+        if k == "enabled":
+            if "enabled" in node or node.get("android:enabled") is not None:
+                val = node.get("enabled", node.get("android:enabled"))
+                if isinstance(val, bool):
+                    normalized[k] = val
+                elif isinstance(val, str):
+                    normalized[k] = val.strip().lower() in ("true", "1", "yes", "enabled")
+                else:
+                    normalized[k] = False
+            else:
+                normalized[k] = False
+            continue
+        
+                # --- PROGRESSBAR, SEEKBAR: progress / max / value ---
+        if k in {"progress", "max", "value"}:
+            try:
+                normalized[k] = float(v)
+            except (TypeError, ValueError):
+                normalized[k] = 0.0
+            continue
+
+        # --- RATINGBAR: rating ---
+        if k == "rating":
+            try:
+                normalized[k] = float(v)
+            except (TypeError, ValueError):
+                normalized[k] = 0.0
+            continue
+        
+        # --- VISTAS CON OPACIDAD (alpha) ---
+        if k == "alpha":
+            try:
+                normalized[k] = float(v)
+            except (TypeError, ValueError):
+                normalized[k] = 1.0  # totalmente visible por defecto
+            continue        
+
+        # --- RATINGBAR: rating / level ---
+        if k in {"rating", "level"}:
+            try:
+                normalized[k] = float(v)
+            except (TypeError, ValueError):
+                normalized[k] = 0.0
+            continue    
 
         if k in BOOL_FIELDS:
             normalized[k] = bool(v) if v not in (None, "", "null") else False
@@ -140,7 +186,15 @@ def subtree_hash(node):
     return h[:20]
 
 def make_key(n):
-    nn = normalize_node(n)
+
+    # nn = normalize_node(n)
+    nn = normalize_node(n).copy()
+
+    # ⚠️ Excluir atributos efímeros del cálculo de la clave
+    for ephemeral in ("checked", "enabled", "selected", "pressed", "activated", "visible"):
+        nn.pop(ephemeral, None)
+
+    
     cls = (nn.get("className") or "").strip()
     pkg = (nn.get("pkg") or "").strip()
     view_id = (nn.get("viewId") or "").strip()
@@ -156,12 +210,10 @@ def make_key(n):
         safe_text = text_like.replace("\n", " ").strip()[:200]
         key = f"{pkg}|{full_class_sig}|textsig:{safe_text}"
     else:
-        key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
+        key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(nn)}"
 
     # estados relevantes
     state_parts = []
-    # if norm_class in ("checkbox", "radiobutton", "switch"):
-    #     state_parts.append(f"checked:{nn.get('checked')}")
     if norm_class in ("ratingbar", "seekbar"):
         if nn.get("rating") is not None:
             state_parts.append(f"rating:{nn.get('rating')}")
@@ -309,6 +361,150 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
                     changes["checked"] = {"old": old_checked, "new": new_checked}
                     #print(f"✅ Cambio CHECKED detectado: {old_checked} → {new_checked}")
 
+                    # --- chequeo extra para botones habilitados/deshabilitados ---
+            if nn.get("className") in (
+                "android.widget.Button",
+                "com.google.android.material.button.MaterialButton",
+                "android.widget.ImageButton"
+            ):
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado: {old_enabled} → {new_enabled}")
+
+            # --- chequeo extra para botones habilitados/deshabilitados ---
+            if nn.get("className") in (
+                "android.widget.Button",
+                "com.google.android.material.button.MaterialButton",
+                "android.widget.ImageButton"
+            ):
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado (Button): {old_enabled} → {new_enabled}")
+
+
+            # --- RadioButton ---
+            if nn.get("className") == "android.widget.RadioButton":
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado (RadioButton): {old_enabled} → {new_enabled}")
+
+
+            # --- Switch ---
+            if nn.get("className") == "android.widget.Switch":
+                # Detectar cambios en habilitado/deshabilitado
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado (Switch): {old_enabled} → {new_enabled}")
+
+                # Detectar cambios en el estado (encendido/apagado)
+                old_checked = to_bool(oldn.get("checked", False))
+                new_checked = to_bool(nn.get("checked", False))
+                if old_checked != new_checked:
+                    changes["checked"] = {"old": old_checked, "new": new_checked}
+                    print(f"✅ Cambio CHECKED detectado (Switch): {old_checked} → {new_checked}")
+
+
+            # --- ToggleButton ---
+            if nn.get("className") == "android.widget.ToggleButton":
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado (ToggleButton): {old_enabled} → {new_enabled}")
+
+                old_checked = to_bool(oldn.get("checked", False))
+                new_checked = to_bool(nn.get("checked", False))
+                if old_checked != new_checked:
+                    changes["checked"] = {"old": old_checked, "new": new_checked}
+                    print(f"✅ Cambio CHECKED detectado (ToggleButton): {old_checked} → {new_checked}")
+
+
+            # --- SeekBar ---
+            if nn.get("className") == "android.widget.SeekBar":
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado (SeekBar): {old_enabled} → {new_enabled}")
+
+                old_progress = float(oldn.get("progress", 0))
+                new_progress = float(nn.get("progress", 0))
+                if old_progress != new_progress:
+                    changes["progress"] = {"old": old_progress, "new": new_progress}
+                    print(f"✅ Cambio PROGRESS detectado (SeekBar): {old_progress} → {new_progress}")
+
+
+            # --- ProgressBar ---
+            if nn.get("className") == "android.widget.ProgressBar":
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado (ProgressBar): {old_enabled} → {new_enabled}")
+
+                old_progress = float(oldn.get("progress", 0))
+                new_progress = float(nn.get("progress", 0))
+                if old_progress != new_progress:
+                    changes["progress"] = {"old": old_progress, "new": new_progress}
+                    print(f"✅ Cambio PROGRESS detectado (ProgressBar): {old_progress} → {new_progress}")
+
+
+            # --- Spinner ---
+            if nn.get("className") == "android.widget.Spinner":
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado (Spinner): {old_enabled} → {new_enabled}")
+
+
+            # --- ImageView ---
+            if nn.get("className") == "android.widget.ImageView":
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado (ImageView): {old_enabled} → {new_enabled}")
+
+
+            # --- VideoView ---
+            if nn.get("className") == "android.widget.VideoView":
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado (VideoView): {old_enabled} → {new_enabled}")
+
+
+            # --- WebView ---
+            if nn.get("className") == "android.webkit.WebView":
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado (WebView): {old_enabled} → {new_enabled}")
+
+            # --- RatingBar ---
+            if nn.get("className") == "android.widget.RatingBar":
+                old_enabled = to_bool(oldn.get("enabled", True))
+                new_enabled = to_bool(nn.get("enabled", True))
+                if old_enabled != new_enabled:
+                    changes["enabled"] = {"old": old_enabled, "new": new_enabled}
+                    print(f"✅ Cambio ENABLED detectado (RatingBar): {old_enabled} → {new_enabled}")
+
+                old_rating = float(oldn.get("rating", 0))
+                new_rating = float(nn.get("rating", 0))
+                if old_rating != new_rating:
+                    changes["rating"] = {"old": old_rating, "new": new_rating}
+                    print(f"✅ Cambio RATING detectado (RatingBar): {old_rating} → {new_rating}")        
 
             if changes:
                 modified.append({"node": {"key": k, "class": nn.get("className")}, "changes": changes})
@@ -561,7 +757,11 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
     # Si detectamos ANY cambio 'checked' en la lista de modified, forzamos has_changes=True
     if any("checked" in m.get("changes", {}) for m in modified):
         logger.info("Forzando has_changes=True por cambio en 'checked' (nodo modificado)")
-        has_changes = True        
+        has_changes = True 
+
+    if any("enabled" in m.get("changes", {}) for m in modified):
+        logger.info("Forzando has_changes=True por cambio en 'enabled' (nodo modificado)")
+        has_changes = True           
 
     # Si el modelo se ignora, conservar diffs
     if model is None or pred is None:
