@@ -2,9 +2,11 @@ from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPExc
 from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from typing import Optional, Union, List, Dict, Any
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, ConfigDict
 import sqlite3, json, joblib, numpy as np, os, hashlib, logging, asyncio, re, unicodedata
 from hmmlearn import hmm
+from hmmlearn.hmm import GaussianHMM
+from sklearn.preprocessing import MinMaxScaler
 from fastapi.responses import JSONResponse
 from fastapi_utils.tasks import repeat_every
 from diff_model.predict_diff import router as diff_router
@@ -18,10 +20,15 @@ import math
 from sklearn.cluster import KMeans 
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics.pairwise import cosine_similarity
+from models_pipeline import compare_trees, _train_incremental_logic_hybrid
 import httpx
 import ast
 from packaging import version
 import difflib
+import string
+import random
+import time
+
 
 from stable_signature import normalize_node
 
@@ -64,6 +71,8 @@ IGNORED_NODE_SUFFIXES = [
     "|checked:False",
     "|selected:False",
 ]
+
+last_ui_structure_similarity = 0.0
 
 # ===================== MODELOS BASE (fallbacks) =====================
 
@@ -270,7 +279,11 @@ def init_db():
             anomaly_score REAL DEFAULT 0,
             diff_hash TEXT UNIQUE NOT NULL,
             text_diff TEXT,  
+            text_overlap REAL DEFAULT 0,
+            overlap_ratio REAL DEFAULT 0,
+            ui_structure_similarity REAL DEFAULT 0,      
             cluster_id INTEGER DEFAULT -1,  
+            screen_status TEXT DEFAULT 'unknown',  
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -298,7 +311,64 @@ def init_db():
             PRIMARY KEY(screen_id, node_key, property)
         );
     """)
-
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS login_codes (
+            codigo TEXT PRIMARY KEY,
+            usuario_id TEXT NOT NULL,
+            generado_en INTEGER NOT NULL,
+            expira_en INTEGER NOT NULL,
+            usos_permitidos INTEGER NOT NULL,
+            usos_actuales INTEGER DEFAULT 0,
+            activo INTEGER DEFAULT 1  
+        );
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pagos (
+            pago_id TEXT PRIMARY KEY,    
+            membresia_id TEXT NOT NULL,     
+            usuario_id TEXT NOT NULL,
+            proveedor TEXT NOT NULL,           
+            proveedor_id TEXT,                  
+            monto INTEGER NOT NULL,
+            moneda TEXT DEFAULT 'USD',
+            estado TEXT DEFAULT 'PENDIENTE',  
+            transaccion_id TEXT   
+            cantidad_codigos INTEGER NOT NULL,
+            fecha_creacion INTEGER NOT NULL,
+            fecha_confirmacion INTEGER 
+        );
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS membresias (
+            membresia_id TEXT PRIMARY KEY,
+            usuario_id TEXT NOT NULL,
+            tipo_plan TEXT NOT NULL,
+            cantidad_codigos INTEGER NOT NULL,
+            fecha_inicio INTEGER NOT NULL,
+            fecha_fin INTEGER NOT NULL 
+        );
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pagos_log  (
+            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pago_id TEXT NOT NULL,
+            evento TEXT NOT NULL,             -- Ej: "CREADO", "CONFIRMADO", "FALLIDO", "CODIGO_GENERADO"
+            descripcion TEXT,                 -- Detalles del evento
+            timestamp INTEGER NOT NULL,
+            FOREIGN KEY(pago_id) REFERENCES pagos(pago_id)
+        );
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS transacciones (
+            transaccion_id TEXT PRIMARY KEY,
+            proveedor TEXT NOT NULL,          -- Stripe, PayPal, Banco
+            proveedor_id TEXT,                -- ID de la transacción en el proveedor
+            monto REAL NOT NULL,
+            moneda TEXT DEFAULT 'USD',
+            estado TEXT DEFAULT 'PENDIENTE',  -- PENDIENTE, CONFIRMADA, FALLIDA
+            fecha INTEGER NOT NULL
+        );
+    """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS diff_trace (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -406,13 +476,11 @@ class AccessibilityEvent(BaseModel):
     additional_info: Optional[Dict[str, Any]] = Field(None, alias="additionalInfo")
     tree_data: Optional[Dict[str, Any]] = Field(None, alias="treeData")
 
-    class Config:
-    # Permite poblar el modelo con los nombres de campo internos o los alias del JSON
-        allow_population_by_field_name = True
-    
-    # Acepta campos extra que la app pueda enviar en el futuro sin romper validación
-        extra = "allow"
 
+    model_config = ConfigDict(
+        populate_by_name=True,
+        extra="allow"
+    )
 # =========================================================
 # UTILIDADES PARA ÁRBOLES Y HASH ESTABLE
 # =========================================================
@@ -628,446 +696,6 @@ def preprocess_tree(tree):
     # print("Flattened nodes:", flat)
     return flat
 
-
-
-
-def compare_trees(old_tree, new_tree, app_name: str = None):
-    """
-    Compara dos árboles de nodos accesibles y detecta nodos agregados, eliminados o modificados.
-    Ajustado para detectar cambios de texto y filtrar ruido de estados efímeros.
-    """
-    
-    old_tree = ensure_list(old_tree)
-    new_tree = ensure_list(new_tree)
-
-    # 🔹 Normalización estructural para ignorar wrappers o contenedores irrelevantes
-    old_tree = preprocess_tree(old_tree)
-    new_tree = preprocess_tree(new_tree)
-
-    if not old_tree:
-        print("⚠️ No hay snapshot previo para comparar, se guarda como base inicial.")
-        return {
-            "removed": [],
-            "added": [],
-            "modified": [],
-            "text_diff": {"removed_texts": [], "added_texts": []}
-        }
-
-    SAFE_KEYS = [
-        "viewId", "className", "headerText", "text", "contentDescription", "desc", "hint",
-        "checked", "enabled", "focusable", "clickable", "selected", "scrollable",
-        "password", "pressed", "activated", "visible",  
-        "progress", "max", "value", "rating", "level",
-        "inputType", "orientation", "index", "layoutParams", "pkg",
-        "textColor", "backgroundColor", "fontSize", "alpha"
-    ]
-
-    IGNORED_STATE_FIELDS = {
-        "enabled", "focusable", "clickable", "scrollable", "pressed", "activated", "visible"
-    }
-
-    TEXT_FIELDS = ["text", "contentDescription", "headerText", "hint"]
-    BOOL_FIELDS = [
-        "checked", "enabled", "focusable", "clickable", "selected", "scrollable",
-        "password", "pressed", "activated", "visible"
-    ]
-    NUM_FIELDS = ["progress", "max", "value", "rating", "level"]
-    OTHER_FIELDS = ["className", "viewId", "pkg"]
-    VISUAL_FIELDS = ["textColor", "backgroundColor", "fontSize", "alpha"]
-
-    removed_texts = locals().get("removed_texts", set())
-    diff_texts = locals().get("diff_texts", set())
-    structure_sim = locals().get("structure_sim", 0.0)
-    text_overlap = locals().get("text_overlap", 1.0)
-
-    # ---------------- flatten ----------------
-    def flatten_tree(tree):
-        """Flatten tree generando paths relativos para cada nodo."""
-        result = []
-
-        def _walk(subtree, path=[]):
-            if isinstance(subtree, dict):
-                idx = path[-1] if path else 0
-                result.append((list(path), subtree))  # Guardamos path completo
-                for i, ch in enumerate(subtree.get("children") or []):
-                    _walk(ch, path + [i])
-            elif isinstance(subtree, list):
-                for i, n in enumerate(subtree):
-                    _walk(n, path + [i])
-
-        _walk(tree, [])
-        return result
-    
-
-    def subtree_hash(node):
-        """
-        Calcula un hash estable para un nodo y todo su subárbol.
-        Útil para nodos sin viewId ni texto para detectar movimientos.
-        """
-        node_copy = dict(node)
-        children = node_copy.pop("children", [])
-        node_str = json.dumps(node_copy, sort_keys=True, ensure_ascii=False)
-        hash_value = hashlib.md5(node_str.encode()).hexdigest()
-        
-        # Combina con hashes de los hijos
-        for child in children or []:
-            hash_value = hashlib.md5((hash_value + subtree_hash(child)).encode()).hexdigest()
-        return hash_value[:20]   
-    
-    # Lista de campos efímeros que queremos ignorar
-    EPHEMERAL_FIELDS = {"pressed", "focused", "activated", "selected", "visible"}
-
-    # ---------------- normalize ----------------
-
-    def normalize_node(node: dict) -> dict:
-        normalized = {}
-        for k in SAFE_KEYS:
-            v = node.get(k)
-            if k in BOOL_FIELDS:
-                normalized[k] = bool(v) if v not in (None, "", "null") else False
-            elif k in NUM_FIELDS:
-                try:
-                    normalized[k] = float(v)
-                except (TypeError, ValueError):
-                    normalized[k] = None
-            elif v is None:
-                normalized[k] = ""
-            else:
-                normalized[k] = str(v).strip()
-
-        # 🔹 Filtrar campos efímeros automáticamente
-        for ef in EPHEMERAL_FIELDS:
-            if ef in normalized:
-                normalized.pop(ef)
-
-        # 🔧 Debug opcional de nodo final normalizado
-        if 'pressed' in node:
-            print(f"🔧 NODE DEBUG → class={node.get('className')}, view_id={node.get('viewId')}, pressed={node.get('pressed')}")
-
-        return normalized
-
-
-    print("🧩 RAW NODE → class={cls}, view_id={view_id}, text={nn.get('text')!r}")
-
-    def make_base_key(n):
-        cls = (n.get("className") or "").strip()
-        pkg = (n.get("pkg") or "").strip()
-        view_id = (n.get("viewId") or "").strip()
-        text_like = (n.get("text") or "").strip()
-
-        parts = cls.split(".")
-        norm_class = parts[-1].lower() if parts else ""
-        base_class = parts[-2].lower() if len(parts) > 1 else ""
-        full_class_sig = f"{base_class}.{norm_class}" if base_class else norm_class
-
-        if view_id:
-            base_key = f"{pkg}|{full_class_sig}|{view_id}"
-        elif text_like:
-            base_key = f"{pkg}|{full_class_sig}|text:{text_like}"
-        else:
-            base_key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
-
-        return base_key
-
-    def make_key(n, idx=None, for_qa=False):
-        nn = normalize_node(n)
-        cls = (nn.get("className") or "").strip()
-        pkg = (nn.get("pkg") or "").strip()
-        view_id = (nn.get("viewId") or "").strip()
-        text_like = (
-            nn.get("text")
-            or nn.get("desc")
-            or nn.get("contentDescription")
-            or nn.get("hint")
-            or ""
-        ).strip()
-
-        # --- Normalización de clases ---
-        parts = cls.split(".")
-        norm_class = parts[-1].lower() if parts else ""
-        base_class = parts[-2].lower() if len(parts) > 1 else ""
-        full_class_sig = f"{base_class}.{norm_class}" if base_class else norm_class
-
-        #key = None  # 🔹 asegurar que existe
-        # 🔹 Inicializamos siempre una clave base
-        key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
-        # --- Generamos el texto-hash (si existe texto) ---
-        text_sig = hashlib.md5(text_like.lower().encode()).hexdigest()[:8] if text_like else ""
-
-        if view_id:
-            # Clave estable basada en viewId y clase → no incluimos texto
-            key = f"{pkg}|{full_class_sig}|{view_id}"
-        elif text_like:
-            # Solo nodos sin viewId, usamos hash de texto para identificar nodo de texto único
-            safe_text = text_like.replace("\n", " ").strip()[:100]
-            key = f"{pkg}|{full_class_sig}|textsig:{safe_text}"
-        else:
-            # Nodo sin viewId ni texto → hash del subárbol
-            key = f"{pkg}|{full_class_sig}|subtree:{subtree_hash(n)}"
-
-        # --- 4. Estado relevante ---
-        state_parts = []
-        if norm_class in ["checkbox", "radiobutton", "switch"]:
-            state_parts.append(f"checked:{nn.get('checked')}")
-        if norm_class in ["ratingbar", "seekbar"]:
-            if nn.get("rating") is not None:
-                state_parts.append(f"rating:{nn.get('rating')}")
-            if nn.get("progress") is not None:
-                state_parts.append(f"progress:{nn.get('progress')}")
-        if norm_class == "tablayout":
-            state_parts.append(f"selected:{nn.get('selected')}")
-
-        if state_parts:
-            key += "|" + "|".join(state_parts)
-
-        return key
-
-    # ---------------- index trees ----------------
-    old_idx = {}
-    for idx, n in flatten_tree(old_tree):
-        key = make_key(n, idx)
-        #old_idx[key] = normalize_node(n)
-        key = make_key(n, idx)
-        old_idx[key] = normalize_node(n)
-
-    new_idx = {}
-    for idx, n in flatten_tree(new_tree):
-        key = make_key(n, idx)
-        new_idx[key] = normalize_node(n)
-
-        try:
-            print("🧩 --- DETALLE DE CLAVES Y TEXTOS ---")
-            if not new_idx:
-                print("⚠️ new_idx está vacío, no se generaron claves nuevas.")
-            elif not old_idx:
-                print("⚠️ old_idx está vacío, no se generaron claves viejas.")
-            else:
-                diff_count = 0
-                for k in new_idx:
-                    old_text = old_idx.get(k, {}).get("text", "<no existe>")
-                    new_text = new_idx[k].get("text", "<sin texto>")
-                    if old_text != new_text:
-                        diff_count += 1
-                        print(f"🔸 Key: {k}")
-                        print(f"   OLD TEXT: {old_text!r}")
-                        print(f"   NEW TEXT: {new_text!r}")
-                if diff_count == 0:
-                    print("✅ No se detectaron diferencias de texto (todos los textos coinciden).")
-        except Exception as e:
-            print(f"⚠️ Error al imprimir diferencias de texto: {e}")
-        # ---------------- debug: ver clases reales ----------------
-    old_nodes = [n for _, n in flatten_tree(old_tree)]
-    new_nodes = [n for _, n in flatten_tree(new_tree)]
-
-    text_overlap = overlap_ratio(old_nodes, new_nodes)
-    print(f"📊 Text overlap ratio: {text_overlap:.2f}")
-
-    added = [{"node": {"key": k, "class": v.get("className")}, "changes": {}} for k, v in new_idx.items() if k not in old_idx]
-    removed = [{"node": {"key": k, "class": v.get("className")}, "changes": {}} for k, v in old_idx.items() if k not in new_idx]
-
-    modified, ignored_changes = [], []
-
-    # ---------------- detect modifications ----------------
-    for k, nn in new_idx.items():
-        if k in old_idx:
-            oldn = old_idx[k]
-            changes = {}
-
-            for f in TEXT_FIELDS + BOOL_FIELDS + NUM_FIELDS + OTHER_FIELDS + VISUAL_FIELDS:
-                old_val, new_val = oldn.get(f), nn.get(f)
-                if old_val != new_val:
-                    if f in IGNORED_STATE_FIELDS and old_val is False and new_val is True:
-                        ignored_changes.append((nn.get("className"), f, (old_val, new_val)))
-                    else:
-                        changes[f] = {"old": old_val, "new": new_val}
-
-            if changes:
-                print(f"   ✏️ MODIFICADO: {k} ({nn.get('className')})")
-                print("🔍 Cambio detectado en nodo:", nn.get("className"))
-                for f, vals in changes.items():
-                    print(f"      • {f}: '{vals['old']}' → '{vals['new']}'")
-                    print(f"   • Campo: {f} | old='{vals['old']}' → new='{vals['new']}'")
-
-                modified.append({
-                    "node": {"key": k, "class": nn.get("className")},
-                    "changes": changes
-                })
-    print(f"\n📊 RESUMEN → removed={len(removed)}, added={len(added)}, modified={len(modified)}")
-    # ---------------- report ----------------
-    if ignored_changes:
-        print(f"🤖 Ignorados {len(ignored_changes)} cambios esperados:")
-        for c in ignored_changes[:3]:
-            print("   ", c)
-
-    print(f"🧮 Raw compare_trees → removed={len(removed)}, added={len(added)}, modified={len(modified)}")
-
-       # ---------------- filtro de recarga visual ----------------
-    total_old = len(old_idx)
-    total_new = len(new_idx)
-    total_changed = len(removed) + len(added)
-
-    reload_ratio = total_changed / max(total_old, total_new, 1)
-
-    has_loader = any(
-        "progressbar" in v.get("className", "").lower()
-        or "skeleton" in v.get("className", "").lower()
-        or "shimmer" in v.get("className", "").lower()
-        for v in new_idx.values()
-    )
-
-
-    # ============================================================
-    # 🧩 FILTRO 2: Pares estáticos (mismo texto en added/removed)
-    # ============================================================
-    
-    def extract_text_from_key(key: str) -> str:
-        """Extrae texto visible desde la clave, soportando text: o textsig:"""
-        if "textsig:" in key:
-            return key.split("textsig:")[-1].strip()
-        if "text:" in key:
-            return key.split("text:")[-1].strip()
-        return ""
-    
-
-
-
-    import difflib
-    def similarity_ratio(a: str, b: str) -> float:
-        """Calcula similitud de texto normalizada."""
-        a, b = (a or "").strip().lower(), (b or "").strip().lower()
-        if not a or not b:
-            return 0.0
-        return difflib.SequenceMatcher(None, a, b).ratio()    
-
-    # 1️⃣ Extrae los textos antes de filtrar
-    old_texts_raw = {normalize_node(n).get("text", "") for _, n in flatten_tree(old_tree) if n.get("text")}
-    new_texts_raw = {normalize_node(n).get("text", "") for _, n in flatten_tree(new_tree) if n.get("text")}
-
-    common_texts = old_texts_raw & new_texts_raw
-    total_texts = old_texts_raw | new_texts_raw
-    text_overlap = len(common_texts) / max(len(total_texts), 1)
-    print(f"📊 Text overlap ratio (raw, pre-filter): {text_overlap:.2f}")
-
-
-    same_text_removed = {extract_text_from_key(r["node"]["key"]) for r in removed if extract_text_from_key(r["node"]["key"])}
-    same_text_added = {extract_text_from_key(a["node"]["key"]) for a in added if extract_text_from_key(a["node"]["key"])}
-
-    overlap_texts = same_text_removed & same_text_added
-    
-    if overlap_texts:
-        print(f"🧩 Filtrando pares estáticos → {len(overlap_texts)} coincidencias de texto persistente")
-        removed = [r for r in removed if not any(t in r["node"]["key"] for t in overlap_texts)]
-        added = [a for a in added if not any(t in a["node"]["key"] for t in overlap_texts)]
-
-        # ============================================================
-    # 🔍 PASADA GLOBAL DE CAMBIOS DE TEXTO (Red de seguridad)
-    # ============================================================
-    try:
-        old_texts = {normalize_node(n).get("text", "") for _, n in flatten_tree(old_tree) if n.get("text")}
-        new_texts = {normalize_node(n).get("text", "") for _, n in flatten_tree(new_tree) if n.get("text")}
-
-        diff_texts = new_texts - old_texts
-        removed_texts = old_texts - new_texts
-
-        if diff_texts or removed_texts:
-            print("📝 CAMBIOS GLOBALES DE TEXTO DETECTADOS:")
-            for t in removed_texts:
-                print(f"   ❌ Texto removido: {t!r}")
-            for t in diff_texts:
-                print(f"   ➕ Texto agregado: {t!r}")
-        else:
-            print("✅ No se detectaron cambios globales de texto.")
-    except Exception as e:
-        print(f"⚠️ Error al detectar cambios globales de texto: {e}")
-
-    # ============================================================
-# 🧠 DETECCIÓN DE CAMBIO DE TEXTO EN EL MISMO NODO
-# ============================================================
-    try:
-        for k, old_node in old_idx.items():
-            if k in new_idx:
-                new_node = new_idx[k]
-                old_text = (old_node.get("text") or "").strip()
-                new_text = (new_node.get("text") or "").strip()
-
-                if old_text and new_text and old_text != new_text:
-                    # Si ya existe un modified para esa key, lo actualizamos
-                    existing = next((m for m in modified if m["node"]["key"] == k), None)
-                    if existing:
-                        existing["changes"]["text"] = {"old": old_text, "new": new_text}
-                    else:
-                        modified.append({
-                            "node": {"key": k, "class": new_node.get("className")},
-                            "changes": {"text": {"old": old_text, "new": new_text}}
-                        })
-                    print(f"✏️ Cambio de texto en nodo existente: {k}")
-                    print(f"    '{old_text}' → '{new_text}'")
-    except Exception as e:
-        print(f"⚠️ Error en detección de texto en mismo nodo: {e}")
-
-    # 🧠 Detección de cambio de texto entre nodos agregados/removidos
-    detected_text_mods = []
-    for r in removed:
-        r_text = extract_text_from_key(r["node"]["key"])
-        for a in added:
-            a_text = extract_text_from_key(a["node"]["key"])
-            if r_text and a_text and similarity_ratio(r_text, a_text) > 0.6:
-                modified.append({
-                    "node": {"key": a["node"]["key"], "class": a["node"]["class"]},
-                    "changes": {"text": {"old": r_text, "new": a_text}}
-                })
-                detected_text_mods.append((r_text, a_text))
-
-    # Si se detectan modificaciones de texto, remueve esos pares de added/removed
-    if detected_text_mods:
-        removed = [
-            r for r in removed
-            if all(similarity_ratio(extract_text_from_key(r["node"]["key"]), old) <= 0.6
-                   for old, _ in detected_text_mods)
-        ]
-        added = [
-            a for a in added
-            if all(similarity_ratio(extract_text_from_key(a["node"]["key"]), new) <= 0.6
-                   for _, new in detected_text_mods)
-        ]    
-
-     # ============================================================
-    # 🧠 SIMILITUD ESTRUCTURAL DE UI
-    # ============================================================
-    try:
-        structure_sim = ui_structure_similarity(old_tree, new_tree)
-        print(f"🏗️ Similitud estructural de UI: {structure_sim:.3f}")
-
-        # Si la similitud estructural es muy alta (>0.9) y no hay diffs,
-        # probablemente son la misma pantalla sin cambios funcionales.
-        if structure_sim > 0.9 and not (removed or added or modified):
-            print("✅ Pantalla estructuralmente igual — sin cambios relevantes.")
-    except Exception as e:
-        print(f"⚠️ Error calculando similitud estructural: {e}")
-        structure_sim = None    
-
-    has_changes = bool(
-        removed or added or modified
-        or text_overlap < 0.9
-        or removed_texts
-        or diff_texts
-    )   
-
-    #return removed, added, modified
-    return {
-        "removed": removed,
-        "added": added,
-        "modified": modified,
-        "text_diff": {
-            "removed_texts": list(removed_texts),
-            "added_texts": list(diff_texts),
-            "overlap_ratio": text_overlap,  # 👈 agregado
-        },
-        "structure_similarity": structure_sim,  # 👈 agregado
-         "has_changes": has_changes
-    }
-
-
 # =========================================================
 # VECTORIZACIÓN Y FEATURES
 # =========================================================
@@ -1127,130 +755,178 @@ def features_from_rows(rows) -> np.ndarray:
 # =========================================================
 
 # ===================== FUNCIÓN PRINCIPAL =====================
-async def _train_model_hybrid(
-    X,
-    tester_id: str = "general",
-    build_id: str = "default",
-    app_name: str = "default_app", 
-    lock: asyncio.Lock = None,
-    max_clusters=3,        # ✅ ahora 3 clusters por defecto
-    min_samples=3,         # ✅ subimos mínimo a 3 para mejor estabilidad
-    desc="",
-    n_hmm_states=3         # ✅ ahora usa 3 estados: estable, leve, estructural
-):
-    """
-    Entrena modelos HMM + KMeans combinados y los guarda por tester_id/build_id.
-    Si existen modelos previos, continúa el entrenamiento incrementalmente.
-    """
-    logger.info(f"[train_hybrid] Iniciando entrenamiento → tester_id={tester_id}, build_id={build_id}, desc={desc}")
+# async def _train_model_hybrid(
+#     X,
+#     tester_id: str = "general",
+#     build_id: str = "default",
+#     app_name: str = "default_app", 
+#     lock: asyncio.Lock = None,
+#     max_clusters=3,        # ✅ ahora 3 clusters por defecto
+#     min_samples=1,         # ✅ subimos mínimo a 3 para mejor estabilidad
+#     desc="",
+#     n_hmm_states=3         # ✅ ahora usa 3 estados: estable, leve, estructural
+# ):
+#     """
+#     Entrena modelos HMM + KMeans combinados y los guarda por tester_id/build_id.
+#     Si existen modelos previos, continúa el entrenamiento incrementalmente.
+#     """
+#     logger.info(f"[train_hybrid] Iniciando entrenamiento → tester_id={tester_id}, build_id={build_id}, desc={desc}")
 
 
-    # ✅ Asegura que siempre haya un lock
-    lock = lock or asyncio.Lock()
+#     # ✅ Asegura que siempre haya un lock
+#     lock = lock or asyncio.Lock()
 
-    async with lock:
-        if len(X) < min_samples:
-            logger.warning(f"[train_hybrid] tamaño de X={len(X)} < min_samples={min_samples}, desc={desc}")
-            return
+#     async with lock:
+#         if len(X) < min_samples:
+#             logger.warning(f"[train_hybrid] tamaño de X={len(X)} < min_samples={min_samples}, desc={desc}")
+#             return
 
-        app_dir = os.path.join(MODELS_DIR, app_name)
-        tester_dir = os.path.join(app_dir, tester_id or "general", str(build_id or "default"))
-        os.makedirs(tester_dir, exist_ok=True)
+#         app_dir = os.path.join(MODELS_DIR, app_name)
+#         tester_dir = os.path.join(app_dir, tester_id or "general", str(build_id or "default"))
+#         os.makedirs(tester_dir, exist_ok=True)
 
-        # ===================== Cargar modelos previos =====================
-        #prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", str(int(build_id) - 1), "model.pkl")
-        prev_kmeans, prev_hmm = None, None
-        prev_model_path = None
-        prev_build_id = None  
+#         # ===================== Cargar modelos previos =====================
+#         #prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", str(int(build_id) - 1), "model.pkl")
+#         prev_kmeans, prev_hmm = None, None
+#         prev_model_path = None
+#         prev_build_id = None  
 
-        try:
-            if build_id and str(build_id).isdigit():
-                prev_build_id = str(int(build_id) - 1)
-                prev_model_path = os.path.join(app_dir, tester_id, prev_build_id, "model.pkl")
-        except Exception:
-            prev_model_path = None    
+#         try:
+#             if build_id and str(build_id).isdigit():
+#                 prev_build_id = str(int(build_id) - 1)
+#                 prev_model_path = os.path.join(app_dir, tester_id, prev_build_id, "model.pkl")
+#         except Exception:
+#             prev_model_path = None    
 
-                # Cargar modelo previo si existe
-        if prev_model_path and os.path.exists(prev_model_path):
-            try:
-                prev = joblib.load(prev_model_path)
-                prev_kmeans = prev.get("kmeans")
-                prev_hmm = prev.get("hmm")
-                logger.info(f"[train_hybrid] Modelo previo encontrado → {prev_model_path}")
-            except Exception as e:
-                logger.warning(f"[train_hybrid] No se pudo cargar modelo previo: {e}")        
+#                 # Cargar modelo previo si existe
+#         if prev_model_path and os.path.exists(prev_model_path):
+#             try:
+#                 prev = joblib.load(prev_model_path)
+#                 prev_kmeans = prev.get("kmeans")
+#                 prev_hmm = prev.get("hmm")
+#                 logger.info(f"[train_hybrid] Modelo previo encontrado → {prev_model_path}")
+#             except Exception as e:
+#                 logger.warning(f"[train_hybrid] No se pudo cargar modelo previo: {e}")        
 
-        if prev_build_id:
-            prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", prev_build_id, "model.pkl")
-        else:
-            prev_model_path = None
+#         if prev_build_id:
+#             prev_model_path = os.path.join(MODELS_DIR, tester_id or "general", prev_build_id, "model.pkl")
+#         else:
+#             prev_model_path = None
 
 
-        if prev_model_path and os.path.exists(prev_model_path):
-            try:
-                prev = joblib.load(prev_model_path)
-                prev_kmeans = prev.get("kmeans")
-                prev_hmm = prev.get("hmm")
-                logger.info(f"[train_hybrid] Modelo previo encontrado → {prev_model_path}")
-            except Exception as e:
-                logger.warning(f"[train_hybrid] No se pudo cargar modelo previo: {e}")
+#         if prev_model_path and os.path.exists(prev_model_path):
+#             try:
+#                 prev = joblib.load(prev_model_path)
+#                 prev_kmeans = prev.get("kmeans")
+#                 prev_hmm = prev.get("hmm")
+#                 logger.info(f"[train_hybrid] Modelo previo encontrado → {prev_model_path}")
+#             except Exception as e:
+#                 logger.warning(f"[train_hybrid] No se pudo cargar modelo previo: {e}")
 
         # ===================== Entrenar KMeans =====================
-        try:
-            if prev_kmeans:
-                kmeans = MiniBatchKMeans(
-                    n_clusters=min(max_clusters, len(X)),
-                    random_state=42,
-                    init=prev_kmeans.cluster_centers_,
-                    n_init=1
-                ).fit(X)
-            else:
-                kmeans = MiniBatchKMeans(
-                    n_clusters=min(max_clusters, len(X)),
-                    random_state=42
-                ).fit(X)
-        except Exception as e:
-            logger.error(f"[train_hybrid] Error en KMeans: {e}")
-            kmeans = BASE_KMEANS.fit(X)
+        # try:
+        #     if prev_kmeans:
+        #         kmeans = MiniBatchKMeans(
+        #             n_clusters=min(max_clusters, len(X)),
+        #             random_state=42,
+        #             init=prev_kmeans.cluster_centers_,
+        #             n_init=1
+        #         ).fit(X)
+        #     else:
+        #         kmeans = MiniBatchKMeans(
+        #             n_clusters=min(max_clusters, len(X)),
+        #             random_state=42
+        #         ).fit(X)
+        # except Exception as e:
+        #     logger.error(f"[train_hybrid] Error en KMeans: {e}")
+        #     kmeans = BASE_KMEANS.fit(X)
+        # ===================== Entrenar KMeans (INCREMENTAL) =====================
+        # try:
+        #     n_clusters = min(max_clusters, len(X))
+
+        #     if prev_kmeans:
+        #         # Incremental update — ajusta los centroides existentes con nuevos datos
+        #         prev_kmeans.partial_fit(X)
+        #         kmeans = prev_kmeans
+        #         logger.info("[train_hybrid] 🔁 KMeans actualizado incrementalmente con partial_fit()")
+        #     else:
+        #         # Entrenamiento inicial
+        #         kmeans = MiniBatchKMeans(
+        #             n_clusters=n_clusters,
+        #             random_state=42,
+        #             batch_size=max(10, len(X))
+        #         ).fit(X)
+        #         logger.info("[train_hybrid] 🆕 KMeans inicial entrenado desde cero")
+        # except Exception as e:
+        #     logger.error(f"[train_hybrid] Error en KMeans incremental: {e}")
+        #     kmeans = BASE_KMEANS.fit(X)
 
         # ===================== Entrenar HMM =====================
-        try:
-            hmm_model = hmm.GaussianHMM(
-                n_components=min(n_hmm_states, len(X)),
-                covariance_type="diag",
-                n_iter=300,
-                tol=1e-3,
-                random_state=42,
-                verbose=False
-            )
+        # try:
+        #     hmm_model = hmm.GaussianHMM(
+        #         n_components=min(n_hmm_states, len(X)),
+        #         covariance_type="diag",
+        #         n_iter=300,
+        #         tol=1e-3,
+        #         random_state=42,
+        #         verbose=False
+        #     )
 
-            if prev_hmm:
-                hmm_model.startprob_ = prev_hmm.startprob_
-                hmm_model.transmat_ = prev_hmm.transmat_
-                hmm_model.means_ = prev_hmm.means_
-                hmm_model.covars_ = prev_hmm.covars_
+        #     if prev_hmm:
+        #         hmm_model.startprob_ = prev_hmm.startprob_
+        #         hmm_model.transmat_ = prev_hmm.transmat_
+        #         hmm_model.means_ = prev_hmm.means_
+        #         hmm_model.covars_ = prev_hmm.covars_
 
-            hmm_model.fit(X, [len(X)])
-        except Exception as e:
-            logger.error(f"[train_hybrid] Error en HMM: {e}")
-            hmm_model = BASE_HMM.fit(X)
+        #     hmm_model.fit(X, [len(X)])
+        # except Exception as e:
+        #     logger.error(f"[train_hybrid] Error en HMM: {e}")
+        #     hmm_model = BASE_HMM.fit(X)
 
-        # ===================== Guardar modelos =====================
-        try:
-            joblib.dump({"kmeans": kmeans, "hmm": hmm_model}, os.path.join(tester_dir, "model.pkl"))
-            joblib.dump(kmeans, os.path.join(tester_dir, "kmeans.joblib"))
-            joblib.dump(hmm_model, os.path.join(tester_dir, "hmm.joblib"))
+        # ===================== Entrenar HMM (PSEUDO-INCREMENTAL) =====================
+        # try:
+        #     hmm_model = hmm.GaussianHMM(
+        #         n_components=min(n_hmm_states, len(X)),
+        #         covariance_type="diag",
+        #         n_iter=300,
+        #         tol=1e-3,
+        #         random_state=42,
+        #         verbose=False
+        #     )
 
-            # ✅ Actualizar el modelo general de la app si el tester no es "general"
-            if tester_id != "general":
-                general_dir = os.path.join(app_dir, "general")
-                os.makedirs(general_dir, exist_ok=True)
-                joblib.dump({"kmeans": kmeans, "hmm": hmm_model}, os.path.join(general_dir, "model.pkl"))
-                logger.info(f"[train_hybrid] 🔄 Actualizado modelo general de {app_name}")
+        #     if prev_hmm:
+        #         hmm_model.startprob_ = prev_hmm.startprob_
+        #         hmm_model.transmat_ = prev_hmm.transmat_
+        #         hmm_model.means_ = prev_hmm.means_
+        #         hmm_model.covars_ = prev_hmm.covars_
 
-            logger.info(f"[train_hybrid] ✅ Modelos guardados correctamente en {tester_dir}")
-        except Exception as e:
-            logger.error(f"[train_hybrid] Error guardando modelos: {e}")
+        #         # Reentrenamiento leve con nuevos datos
+        #         hmm_model.fit(X, [len(X)])
+        #         logger.info("[train_hybrid] 🔁 HMM ajustado con nuevos datos (pseudo-incremental)")
+        #     else:
+        #         hmm_model.fit(X, [len(X)])
+        #         logger.info("[train_hybrid] 🆕 HMM inicial entrenado desde cero")
+        # except Exception as e:
+        #     logger.error(f"[train_hybrid] Error en HMM incremental: {e}")
+        #     hmm_model = BASE_HMM.fit(X)
+
+
+        # # ===================== Guardar modelos =====================
+        # try:
+        #     joblib.dump({"kmeans": kmeans, "hmm": hmm_model}, os.path.join(tester_dir, "model.pkl"))
+        #     joblib.dump(kmeans, os.path.join(tester_dir, "kmeans.joblib"))
+        #     joblib.dump(hmm_model, os.path.join(tester_dir, "hmm.joblib"))
+
+        #     # ✅ Actualizar el modelo general de la app si el tester no es "general"
+        #     if tester_id != "general":
+        #         general_dir = os.path.join(app_dir, "general")
+        #         os.makedirs(general_dir, exist_ok=True)
+        #         joblib.dump({"kmeans": kmeans, "hmm": hmm_model}, os.path.join(general_dir, "model.pkl"))
+        #         logger.info(f"[train_hybrid] 🔄 Actualizado modelo general de {app_name}")
+
+        #     logger.info(f"[train_hybrid] ✅ Modelos guardados correctamente en {tester_dir}")
+        # except Exception as e:
+        #     logger.error(f"[train_hybrid] Error guardando modelos: {e}")
             
 # =========================================================
 # ENTRENAMIENTO HÍBRIDO (KMeans + HMM)  – versión mejorada
@@ -1424,9 +1100,20 @@ def format_screen_diff(diffs):
             lines.append(f"    • {attr}: {old} → {new}")
     return "\n".join(lines)
 
-def diff_hash(removed, added, modified):
-    """Genera una firma única basada en el contenido del diff."""
-    concat = json.dumps([removed, added, modified], sort_keys=True)
+# def diff_hash(removed, added, modified):
+#     """Genera una firma única basada en el contenido del diff."""
+#     concat = json.dumps([removed, added, modified], sort_keys=True)
+#     return hashlib.sha1(concat.encode("utf-8")).hexdigest()
+
+def diff_hash(removed, added, modified, text_diff=None):
+    """Genera una firma única basada en los cambios detectados (estructura + texto)."""
+    def normalize(x):
+        return sorted(x, key=lambda v: json.dumps(v, sort_keys=True)) if isinstance(x, list) else x
+
+    concat = json.dumps(
+        [normalize(removed), normalize(added), normalize(modified), text_diff or {}],
+        sort_keys=True
+    )
     return hashlib.sha1(concat.encode("utf-8")).hexdigest()
 
 
@@ -1495,6 +1182,7 @@ async def analyze_and_train(event: AccessibilityEvent):
     app_name = event.package_name or "default_app"
     tester_id = event.tester_id or "general"
     build_id = event.build_id
+    header_text = event.header_text or ""
 
     # -------------------- Árbol y firma ------------------------
     latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
@@ -1533,17 +1221,18 @@ async def analyze_and_train(event: AccessibilityEvent):
                 FROM accessibility_data
                 WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
                 AND LOWER(TRIM(header_text)) != LOWER(TRIM(?))
+                AND LOWER(TRIM(event_type_name)) = LOWER(TRIM(?))
                 ORDER BY created_at DESC
                 LIMIT 1
-            """, (t_id, curr_header)).fetchone()
+            """, (t_id, curr_header, event_type_ref)).fetchone()
 
             if row:
                 prev_header = (row[0] or "").strip().lower()
 
         if prev_header and prev_header != curr_header:
             print(f"⚠️ Header cambió (detección temprana): '{prev_header}' → '{curr_header}'")
-            logger.info(f"🔤 Cambio detectado temprano en header_text: '{prev_header}' → '{curr_header}'")
             header_changed = {"before": prev_header, "after": curr_header}
+            has_changes = True
         else:
             header_changed = None
             print("✅ Header sin cambios (verificación temprana).")
@@ -1602,7 +1291,16 @@ async def analyze_and_train(event: AccessibilityEvent):
 
     for row in prev_rows:
         try:
+
+            if not row[3]:
+                # No hay vector anterior válido
+                continue
+
             prev_enriched_vec = np.array(ast.literal_eval(row[3]), dtype=float)
+
+            if prev_enriched_vec.size == 0:
+                continue
+
             min_len = min(len(prev_enriched_vec), len(enriched_vector))
             prev_vec = prev_enriched_vec[:min_len]
             curr_vec = enriched_vector[:min_len]
@@ -1612,7 +1310,7 @@ async def analyze_and_train(event: AccessibilityEvent):
             if sim > best_sim:
                 best_sim = sim
                 best_row = row
-        except Exception:
+        except Exception as e:
             continue
 
     if best_row:
@@ -1620,7 +1318,7 @@ async def analyze_and_train(event: AccessibilityEvent):
     else:
         logger.warning("⚠️ No se encontró coincidencia ni por signature ni por estructura.")
 
-    previous_row = None
+    # previous_row = None
     if prev_rows:
         latest_event = getattr(event, "event_type_name", None)
         same_event_rows = []
@@ -1674,14 +1372,36 @@ async def analyze_and_train(event: AccessibilityEvent):
     # -------------------- Comparación de árboles ----------------
     removed_all, added_all, modified_all = [], [], []
     text_diff = {}
+    diff_result = {}
+  
 
     if prev_tree:
         logger.debug(f"Comparando árboles: prev={len(prev_tree)} nodos, latest={len(latest_tree)} nodos")
         if len(prev_tree) == len(latest_tree):
             logger.debug("⚠️ Árboles del mismo tamaño, posible snapshot idéntico.")
 
+        # try:
+        #     diff_result = compare_trees(prev_tree, latest_tree)
+        #     has_changes = bool(
+        #         diff_result.get("removed") or
+        #         diff_result.get("added") or
+        #         diff_result.get("modified") or
+        #         diff_result.get("text_diff", {}).get("removed_texts") or
+        #         diff_result.get("text_diff", {}).get("added_texts") or
+        #         diff_result.get("text_diff", {}).get("diff_texts") or
+        #         diff_result.get("text_diff", {}).get("text_overlap", 1.0) < 0.9
+        #     )
         try:
-            diff_result = compare_trees(prev_tree, latest_tree)
+            diff_result = compare_trees(
+                prev_tree,
+                latest_tree,
+                app_name=app_name,
+                tester_id=tester_id,
+                build_id=build_id,
+                screen_id=event.screens_id or event.header_text or "unknown_screen",
+                use_general=TRAIN_GENERAL_ON_COLLECT  # 👈 este flag controla si se usa el modelo general
+            )
+
             has_changes = bool(
                 diff_result.get("removed") or
                 diff_result.get("added") or
@@ -1689,8 +1409,10 @@ async def analyze_and_train(event: AccessibilityEvent):
                 diff_result.get("text_diff", {}).get("removed_texts") or
                 diff_result.get("text_diff", {}).get("added_texts") or
                 diff_result.get("text_diff", {}).get("diff_texts") or
-                diff_result.get("text_diff", {}).get("text_overlap", 1.0) < 0.9
+                diff_result.get("text_diff", {}).get("overlap_ratio", 1.0) < 0.9 or
+                diff_result.get("has_changes")  # 👈 bandera directa del modelo
             )
+
         except Exception as e:
             logger.error(f"❌ Error ejecutando compare_trees: {e}")
             diff_result = {"removed": [], "added": [], "modified": [], "text_diff": {}, "has_changes": False}
@@ -1706,9 +1428,9 @@ async def analyze_and_train(event: AccessibilityEvent):
         logger.info(f"📊 compare_trees → removed={len(removed_all)}, added={len(added_all)}, modified={len(modified_all)}, has_changes={has_changes}")
 
         try:
-            structure_sim = ui_structure_similarity(prev_tree, latest_tree)
-            text_diff["ui_structure_similarity"] = structure_sim
-            logger.info(f"🏗️ Similitud estructural UI: {structure_sim:.3f}")
+            last_ui_structure_similarity = ui_structure_similarity(prev_tree, latest_tree)
+            text_diff["ui_structure_similarity"] = last_ui_structure_similarity
+            logger.info(f"🏗️ Similitud estructural UI: {last_ui_structure_similarity:.3f}")
         except Exception as e:
             logger.warning(f"⚠️ No se pudo calcular similitud estructural: {e}")
             text_diff["ui_structure_similarity"] = None
@@ -1721,7 +1443,7 @@ async def analyze_and_train(event: AccessibilityEvent):
         removed_j = json.dumps(removed_all, sort_keys=True, ensure_ascii=False)
         added_j = json.dumps(added_all, sort_keys=True, ensure_ascii=False)
         modified_j = json.dumps(modified_all, sort_keys=True, ensure_ascii=False)
-        diff_signature = diff_hash(removed_all, added_all, modified_all)
+        diff_signature = diff_hash(removed_all, added_all, modified_all, text_diff)
 
         with sqlite3.connect(DB_NAME) as conn:
             cur = conn.cursor()
@@ -1752,10 +1474,54 @@ async def analyze_and_train(event: AccessibilityEvent):
                 modified_j = json.dumps(modified_all, sort_keys=True, ensure_ascii=False)
                 text_diff_j = json.dumps(text_diff, ensure_ascii=False)
 
+                # 🧩 Asegurar que text_diff conserva overlap_ratio
+                if "overlap_ratio" not in text_diff:
+                    text_diff["overlap_ratio"] = diff_result.get("text_diff", {}).get("overlap_ratio", 1.0)
+
+                # 🧩 Asegurar que diff_result conserva structure_similarity
+                if "structure_similarity" not in diff_result:
+                    try:
+                        diff_result["structure_similarity"] = ui_structure_similarity(prev_tree, latest_tree)
+                    except Exception:
+                        diff_result["structure_similarity"] = 1.0
+
+                # Extraemos métricas desde tu dict 'diff_result' (o similar)
+                # text_overlap = diff_result.get("text_diff", {}).get("overlap_ratio", 0.0)
+                # overlap_ratio = diff_result.get("text_diff", {}).get("overlap_ratio", 0.0)
+                # ui_structure_sim_value = diff_result.get("structure_similarity", 0.0)
+
+                # ✅ Ahora que ya existen, extraemos las métricas correctamente
+                text_overlap = text_diff.get("overlap_ratio", 1.0)
+                overlap_ratio = text_overlap
+                ui_structure_sim_value = diff_result.get("structure_similarity", 1.0)
+
+                # Determinamos un estado textual para consultas posteriores
+                if ui_structure_sim_value > 0.9 and overlap_ratio > 0.8:
+                    screen_status = "identical"
+                elif overlap_ratio > 0.6:
+                    screen_status = "minor_changes"
+                else:
+                    screen_status = "different"
+
+                    
+                
                 cur.execute("""
-                    INSERT INTO screen_diffs (tester_id, build_id, header_text, removed, added, modified, text_diff, diff_hash)
-                    VALUES (?,?,?,?,?,?,?,?)
-                """, (t_id, b_id, s_name, removed_j, added_j, modified_j, text_diff_j, diff_signature))
+                    INSERT OR IGNORE INTO screen_diffs (
+                        tester_id, build_id, screen_name, header_text,
+                        removed, added, modified, text_diff, diff_hash,
+                        text_overlap, overlap_ratio, ui_structure_similarity, screen_status
+                    )
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    t_id, b_id, s_name, header_text,
+                    removed_j, added_j, modified_j, text_diff_j,
+                    diff_signature, text_overlap, overlap_ratio,
+                    ui_structure_sim_value, screen_status
+                ))
+                # cur.execute("""
+                #     INSERT OR IGNORE INTO screen_diffs (tester_id, build_id, screen_name, header_text, removed, added, modified, text_diff, diff_hash, text_overlap, overlap_ratio, ui_structure_similarity, screen_status)
+                #     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                # """, (t_id, b_id, s_name, header_text, removed_j, added_j, modified_j, text_diff_j, diff_signature, text_overlap, overlap_ratio, ui_structure_similarity, screen_status))
                 conn.commit()
                 logger.info(f"🧩 Guardado cambio ({diff_signature[:8]}) en screen_diffs")
     else:
@@ -1772,21 +1538,21 @@ async def analyze_and_train(event: AccessibilityEvent):
         conn.commit()
 
     # -------------------- Entrenamiento incremental ----------------
-    asyncio.create_task(_train_model_hybrid(
-        X=np.array([enriched_vector]),
+    asyncio.create_task(_train_incremental_logic_hybrid(
+        enriched_vector=enriched_vector,
         tester_id=tester_id,
         build_id=build_id,
         app_name=app_name,
-        desc=f"{app_name} incremental"
+        screen_id=event.screens_id or s_name or "unknown_screen"
     ))
 
     if TRAIN_GENERAL_ON_COLLECT:
-        await _train_model_hybrid(
-            X=np.array([enriched_vector]),
+        await _train_incremental_logic_hybrid(
+            enriched_vector=enriched_vector,
             tester_id="general",
             build_id="latest",
             app_name=app_name,
-            desc=f"{app_name} general"
+            screen_id=event.screens_id or s_name or "unknown_screen"
         )
     
     try:
@@ -1797,158 +1563,6 @@ async def analyze_and_train(event: AccessibilityEvent):
         added_count = removed_count = modified_count = 0
 
     return has_changes, added_count, removed_count, modified_count
-
-async def _train_incremental_logic_hybrid(
-    tester_id: str,
-    build_id: str,
-    batch_size=200,
-    min_samples=2,
-    enriched_vector=None
-):
-    model_dir = os.path.join("models", tester_id, str(build_id or "latest"))
-    os.makedirs(model_dir, exist_ok=True)
-
-    # Cargar vectores históricos
-    with sqlite3.connect(DB_NAME) as conn:
-        rows = conn.execute("""
-            SELECT enriched_vector FROM accessibility_data
-            WHERE tester_id=? AND build_id=?
-            AND enriched_vector IS NOT NULL
-        """, (tester_id, build_id)).fetchall()
-
-    vectors_db = [json.loads(r[0]) for r in rows if r[0]]
-    vectors_db = np.unique(vectors_db, axis=0) if len(vectors_db) > 0 else np.empty((0, 0))
-
-    print(f"[DEBUG] Cantidad de vectores DB (incremental): {len(vectors_db)}")
-    print(f"[DEBUG] Vectores únicos DB (incremental): {len(vectors_db)}")
-
-    if len(vectors_db) < 5:
-        print(f"⚠️ Muy pocos datos ({len(vectors_db)}) — se omite entrenamiento incremental.")
-        return
-
-    kmeans_model = MiniBatchKMeans(
-        n_clusters=min(5, len(vectors_db)),
-        random_state=42,
-        n_init="auto",
-        batch_size=batch_size
-    )
-    kmeans_model.fit(vectors_db)
-
-    joblib.dump(kmeans_model, os.path.join(model_dir, "kmeans.joblib"))
-
-    n_components = max(2, min(5, len(vectors_db) // 10))
-    try:
-        hmm_model = GaussianHMM(
-            n_components=n_components,
-            covariance_type="diag",
-            n_iter=200,
-            tol=1e-3,
-            verbose=False
-        )
-        hmm_model.fit(vectors_db)
-        joblib.dump(hmm_model, os.path.join(model_dir, "hmm.joblib"))
-    except Exception as e:
-        print(f"⚠️ Error entrenando HMM: {e}")
-        hmm_model = None
-
-    KMEANS_MODELS[tester_id] = kmeans_model
-    HMM_MODELS[tester_id] = hmm_model
-
-    print(f"✅ Modelos guardados correctamente en {model_dir}")
-
-
-async def _train_general_logic_hybrid(
-    batch_size=1000,
-    min_samples=2,
-    enriched_vector: np.ndarray | None = None
-):
-    with sqlite3.connect(DB_NAME) as conn:
-        c = conn.cursor()
-        c.execute("""
-            SELECT collect_node_tree
-            FROM accessibility_data
-            WHERE collect_node_tree IS NOT NULL
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, (batch_size,))
-        rows = c.fetchall()
-
-        if len(rows) < min_samples:
-            need = min_samples - len(rows)
-            c.execute("""
-                SELECT collect_node_tree
-                FROM accessibility_data
-                WHERE collect_node_tree IS NOT NULL
-                ORDER BY created_at ASC
-                LIMIT ?
-            """, (need,))
-            rows = c.fetchall() + rows
-
-    X_db = features_from_rows(rows)
-
-    if X_db.size > 0:
-        print(f"[DEBUG] Cantidad de vectores DB: {X_db.shape[0]}")
-        print(f"[DEBUG] Vectores únicos DB: {len(np.unique(X_db, axis=0))}")
-
-        # ===================== NORMALIZACIÓN DE VECTORES =====================
-        def normalize_vector_length(vec, expected_len):
-            vec = np.array(vec, dtype=float).flatten()
-            if len(vec) < expected_len:
-                vec = np.pad(vec, (0, expected_len - len(vec)))  # rellena con ceros
-            elif len(vec) > expected_len:
-                vec = vec[:expected_len]  # recorta si es más largo
-            return vec
-
-        # Si no llega enriched_vector, crear uno neutro
-        if enriched_vector is None:
-            print("⚠️ 'enriched_vector' no se pasó correctamente. Se usará vector neutro.")
-            enriched_vector = np.zeros(X_db.shape[1])
-
-        # Calcula longitud esperada según el mayor vector
-        EXPECTED_VECTOR_LEN = max(
-            [len(enriched_vector)] +
-            [len(v) for v in X_db if isinstance(v, (list, np.ndarray))]
-        )
-
-        # Normaliza todos los vectores
-        enriched_vector = normalize_vector_length(enriched_vector, EXPECTED_VECTOR_LEN)
-        X_db = np.array([
-            normalize_vector_length(v, EXPECTED_VECTOR_LEN)
-            for v in X_db
-        ])
-
-        logger.debug(f"[TRAIN] Longitud esperada de vector: {EXPECTED_VECTOR_LEN}")
-        logger.debug(f"[TRAIN] enriched_vector shape: {enriched_vector.shape}, X_db shape: {X_db.shape}")
-
-        # ===================== COMBINAR VECTORES =====================
-        if enriched_vector is not None and not np.all(enriched_vector == 0):
-            X = np.vstack([enriched_vector.reshape(1, -1), X_db])
-        else:
-            X = X_db
-
-        # Elimina duplicados
-        X = np.unique(X, axis=0)
-
-        if len(X) < min_samples:
-            print(f"[DEBUG] No hay suficientes muestras para entrenar: {len(X)} < {min_samples}")
-            return
-
-        # ===================== ENTRENAMIENTO HÍBRIDO =====================
-        await _train_model_hybrid(
-            X=X,
-            tester_id="general",
-            build_id="latest",
-            app_name="default_app",                # o el app real si lo tienes
-            lock=_get_lock("general:global:latest"),
-            max_clusters=5,
-            desc="general"
-        )
-
-        # ✅ Limpieza de caché
-        KMEANS_MODELS.pop("general", None)
-        HMM_MODELS.pop("general", None)
-    else:
-        print("[DEBUG] No hay datos suficientes en la base para entrenar.")
 
 
 # =========================================================
@@ -2098,7 +1712,7 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
         print(f"[collect] tester={tester_norm} build={build_norm} screen={screen_name}")
 
         # -------------------- Estado inicial --------------------
-        has_changes = False
+         #has_changes = False
         prev_build_name = None
         is_new_record = True
 
@@ -2134,10 +1748,17 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
                 removed_count=removed_count,
                 modified_count=modified_count
             )
-            return {"has_changes": has_changes}
+            #return {"has_changes": has_changes}
 
-        # -------------------- Insertar si corresponde --------------------
-        do_insert = is_new_record or has_changes
+
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            existing = cursor.execute("""
+                SELECT 1 FROM accessibility_data
+                WHERE tester_id=? AND build_id=? AND signature=?
+            """, (tester_norm, build_norm, signature)).fetchone()
+
+        do_insert = (is_new_record or has_changes) and not existing
 
         if do_insert:
             with sqlite3.connect(DB_NAME) as conn:
@@ -2156,8 +1777,10 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
                     event.screen_names, header_text,
                     json.dumps(normalized_nodes, ensure_ascii=False),
                     signature,
-                    json.dumps(event.additional_info, ensure_ascii=False) if event.additional_info else None,
-                    json.dumps(event.tree_data, ensure_ascii=False) if event.tree_data else None
+                    json.dumps(event.additional_info or {}, ensure_ascii=False),
+                    json.dumps(event.tree_data or [], ensure_ascii=False)
+                    # json.dumps(event.additional_info, ensure_ascii=False) if event.additional_info else None,
+                    # json.dumps(event.tree_data, ensure_ascii=False) if event.tree_data else None
                 ))
                 conn.commit()
             logger.info("[collect] Insert completado (nuevo build o cambios detectados).")
@@ -2352,45 +1975,64 @@ def get_screen_diffs(
     from io import StringIO
 
 
-    def capture_pretty_summary(removed_all, added_all, modified_all):
-        """Convierte los cambios en mensajes legibles tipo IA / QA."""
+    def capture_pretty_summary(removed_all, added_all, modified_all, text_diff):
         lines = []
 
         def format_node_text(node):
-            """Usar texto real si existe, sino la key."""
-            return node.get("text") or node.get("desc") or node.get("contentDescription") or node.get("hint") or node.get("key", "")
+            return (
+                node.get("text")
+                or node.get("desc")
+                or node.get("contentDescription")
+                or node.get("hint")
+                or node.get("key", "")
+            )
 
-        # --- Procesar eliminados ---
+        # --- Eliminados ---
         for node in removed_all:
             text = format_node_text(node)
             lines.append(f"🗑️ {node.get('class','unknown')} eliminado: “{text}”")
 
-        # --- Procesar agregados ---
+        # --- Agregados ---
         for node in added_all:
             text = format_node_text(node)
             lines.append(f"🆕 {node.get('class','unknown')} agregado: “{text}”")
 
-        # --- Procesar modificados ---
+        # --- Modificados ---
         for change in modified_all:
             node = change.get("node", {})
             changes = change.get("changes", {})
+
             if not changes:
-                # Sin cambios visibles, pero mismo nodo
                 text = format_node_text(node)
                 lines.append(f"✏️ {node.get('class','unknown')} sin cambios visibles: “{text}”")
-            else:
-                for attr, vals in changes.items():
+                continue
+
+            for attr, vals in changes.items():
+                # Manejar si vals no es un dict (por ejemplo, str, bool, int)
+                if isinstance(vals, dict):
                     old = vals.get("old")
                     new = vals.get("new")
-                    # Si tiene JSON largo, simplificar
-                    if isinstance(old, str) and old.startswith("{"): old = "(estructura)"
-                    if isinstance(new, str) and new.startswith("{"): new = "(estructura)"
-                    lines.append(f"✏️ {node.get('class','unknown')} modificado ({attr}): “{old}” → “{new}”")
+                else:
+                    old = None
+                    new = vals
 
+                # Simplificar estructuras grandes
+                if isinstance(old, str) and old.startswith("{"): old = "(estructura)"
+                if isinstance(new, str) and new.startswith("{"): new = "(estructura)"
+
+                lines.append(f"✏️ {node.get('class','unknown')} modificado ({attr}): “{old}” → “{new}”")
+
+        # --- Si no hay líneas ---
         if not lines:
-            return "✅ Sin cambios relevantes detectados."
+            if isinstance(text_diff, dict) and "header_changed" in text_diff:
+                before = text_diff["header_changed"].get("before", "")
+                after = text_diff["header_changed"].get("after", "")
+                return f"⚠️ Texto modificado: {before} → {after}"
+            else:
+                return "✅ Sin cambios visibles."
 
         return "\n".join(lines)
+
 
     # --- Construir lista de diffs ---
     diffs = []
@@ -2402,18 +2044,21 @@ def get_screen_diffs(
         text_diff = safe_json_load(row[8])
 
                 # 🧠 Analizar el overlap de texto
+        # Inicializar valores
         overlap_ratio = 0.0
         screen_status = "unknown"
-        try:
-            overlap_ratio = text_diff.get("overlap_ratio", 0.0)
-            if overlap_ratio >= 0.98:
-                screen_status = "identical"  # sin cambios visibles
-            elif overlap_ratio >= 0.8:
-                screen_status = "minor_changes"  # cambios pequeños
-            else:
-                screen_status = "different"  # pantalla distinta
-        except Exception:
-            pass
+
+        # Obtener overlap_ratio si existe en text_diff
+        if isinstance(text_diff, dict):
+            overlap_ratio = text_diff.get("overlap_ratio", 0.0)  # fallback a 0.0 si no existe
+
+        # Determinar estado semántico considerando cambios estructurales
+        if len(removed) == 0 and len(added) == 0 and len(modified) == 0:
+            screen_status = "identical"      # No hay cambios → idéntica
+        elif overlap_ratio >= 0.8:
+            screen_status = "minor_changes"  # Cambios menores
+        else:
+            screen_status = "different"      # Cambios grandes o sin overlap suficiente
 
         # 🔍 Expande los detalles de todos los cambios
         detailed_changes = []
@@ -2437,16 +2082,35 @@ def get_screen_diffs(
             if not changes:
                 add_node_change("modified_empty", node)
             for attr, vals in changes.items():
+                if isinstance(vals, dict):
+                    old_value = vals.get("old")
+                    new_value = vals.get("new")
+                else:
+                    # Si vals es string (o cualquier otro tipo), lo tratamos como valor antiguo/nuevo
+                    old_value = vals
+                    new_value = vals
+
                 detailed_changes.append({
                     "attribute": attr,
-                    "old_value": vals.get("old"),
-                    "new_value": vals.get("new"),
+                    "old_value": old_value,
+                    "new_value": new_value,
                     "node_class": node.get("class"),
                     "node_key": node.get("key"),
                     "node_text": node.get("text", ""),
                     "pkg": node.get("pkg", ""),
                     "action": "modified"
-                })
+                })    
+            # for attr, vals in changes.items():
+            #     detailed_changes.append({
+            #         "attribute": attr,
+            #         "old_value": vals.get("old"),
+            #         "new_value": vals.get("new"),
+            #         "node_class": node.get("class"),
+            #         "node_key": node.get("key"),
+            #         "node_text": node.get("text", ""),
+            #         "pkg": node.get("pkg", ""),
+            #         "action": "modified"
+            #     })
 
         # Procesar agregados y eliminados
         for node in added:
@@ -2456,7 +2120,7 @@ def get_screen_diffs(
             add_node_change("removed", node)
 
         # 🆕 Generar resumen elegante para cada diff
-        summary_text = capture_pretty_summary(removed, added, modified)
+        summary_text = capture_pretty_summary(removed, added, modified, text_diff)
 
         diffs.append({
             "id": row[0],
@@ -2474,7 +2138,7 @@ def get_screen_diffs(
             "text_overlap": overlap_ratio,
             "screen_status": screen_status,
             "detailed_changes": detailed_changes,
-            "created_at": row[8],
+            "created_at": row[9],
             "cluster_info": json.loads(row[10]) if row[10] else {},
             "detailed_summary": summary_text  # 🆕 Nuevo campo
         })
@@ -2483,8 +2147,12 @@ def get_screen_diffs(
     print("DEBUG diffs:", diffs)
     # Tomamos has_changes directo de compare_trees
     for d in diffs:
-        # ejemplo si cada diff viene de compare_trees
-        d["has_changes"] = d.get("has_changes", True)  # fallback True si no viene
+        d["has_changes"] = any([
+            len(d.get("removed", [])) > 0,
+            len(d.get("added", [])) > 0,
+            len(d.get("modified", [])) > 0,
+            bool(d.get("text_diff", {}))
+        ])
 
     # Si quieres un indicador global
     # has_changes = any(d["has_changes"] for d in diffs)
@@ -2855,6 +2523,111 @@ def reset_password(req: ResetPasswordRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error actualizando contraseña: {e}")
+    
+
+@router.post("/create_code")
+async def create_code(usuario_id: str, duracion_dias: int = 30, usos_permitidos: int = 1):
+    # Generar el código (formato similar al de Android)
+    chars = string.ascii_uppercase + string.digits
+    prefix_char = random.choice(chars)
+    device_prefix = ''.join(random.choices("0123456789ABCDEF", k=2))
+    random_part = str(random.randint(0, 9999)).zfill(4)
+    codigo = f"{prefix_char}{device_prefix}{random_part}"
+
+    generado_en = int(time.time())
+    expira_en = generado_en + duracion_dias * 24 * 3600
+
+    # Guardar en SQLite
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO login_codes     
+            (codigo, usuario_id, generado_en, expira_en, usos_permitidos, usos_actuales, activo)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,  (codigo, usuario_id, generado_en, expira_en, usos_permitidos, 0, 1))
+        conn.commit()
+
+    return {"codigo": codigo, "expira_en": expira_en, "duracion_dias": duracion_dias}
+
+@router.post("/validate_code")
+async def validate_code(request: Request):
+    data = await request.json()
+    codigo = data.get("codigo", "").strip().upper()
+
+    if not codigo:
+        return {"valid": False, "reason": "Código vacío"}
+
+    now = int(time.time())
+
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        row = c.execute("""
+            SELECT * FROM login_codes
+            WHERE codigo = ? AND activo = 1
+        """, (codigo,)).fetchone()
+
+        if not row:
+            return {"valid": False, "reason": "Código no encontrado"}
+
+        # Validar expiración
+        if now > row["expira_en"]:
+            return {"valid": False, "reason": "Código expirado"}
+
+        # Validar usos permitidos
+        if row["usos_actuales"] >= row["usos_permitidos"]:
+            return {"valid": False, "reason": "Límite de usos alcanzado"}
+
+        # Incrementar uso
+        c.execute("""
+            UPDATE login_codes
+            SET usos_actuales = usos_actuales + 1
+            WHERE codigo = ?
+        """, (codigo,))
+        conn.commit()
+
+        restante = row["expira_en"] - now
+
+    return {
+        "valid": True,
+        "codigo": codigo,
+        "usuario_id": row["usuario_id"],
+        "expira_en": row["expira_en"],
+        "restante_en_segundos": restante,
+        "usos_restantes": row["usos_permitidos"] - (row["usos_actuales"] + 1)
+    }
+
+@router.post("/confirm_payment")
+async def confirm_payment(request: Request):
+    data = await request.json()
+    codigo = data.get("codigo")
+    payment_token = data.get("payment_token")  # del proveedor
+
+    # 1️⃣ Validar que el código existe y no está activo
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        row = c.execute("SELECT * FROM login_codes WHERE codigo = ?", (codigo,)).fetchone()
+        if not row:
+            return {"success": False, "reason": "Código no encontrado"}
+        if row["activo"] == 1:
+            return {"success": False, "reason": "Código ya pagado"}
+
+    # 2️⃣ Verificar pago con proveedor externo (Stripe, PayPal, etc.)
+    pago_exitoso = verificar_pago_externo(payment_token)  # función que implementas según el proveedor
+
+    if pago_exitoso:
+        # 3️⃣ Activar el código
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
+            c.execute("UPDATE login_codes SET activo = 1 WHERE codigo = ?", (codigo,))
+            conn.commit()
+        return {"success": True, "codigo": codigo}
+    else:
+        return {"success": False, "reason": "Pago no validado"}
+
+
+    
 
 @router.get("/qa_summary/{build_id}")
 def qa_summary(build_id: str, db: sqlite3.Connection = Depends(get_db)):
@@ -3171,3 +2944,5 @@ async def get_change_metrics(tester_id: str = None):
             q += " ORDER BY last_updated DESC"
             rows = cur.execute(q).fetchall()
         return {"metrics": [dict(r) for r in rows]}
+
+
