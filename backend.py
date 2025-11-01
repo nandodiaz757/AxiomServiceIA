@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPException, Depends, WebSocket
+from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPException, Depends, WebSocket, Body
 from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from typing import Optional, Union, List, Dict, Any
@@ -20,7 +20,7 @@ import math
 from sklearn.cluster import KMeans 
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics.pairwise import cosine_similarity
-from models_pipeline import compare_trees, _train_incremental_logic_hybrid
+from models_pipeline import compare_trees, _train_incremental_logic_hybrid, _train_general_logic_hybrid
 import httpx
 import ast
 from packaging import version
@@ -1677,35 +1677,94 @@ async def get_status(
 
     return {"status": "changes", "diffs": diffs}
 
-
 @app.get("/train/general")
 async def trigger_general_train(
-    batch_size: int = Query(1000, ge=1),  # tamaño máximo de muestras para entrenar
-    min_samples: int = Query(2, ge=1)     # mínimo de muestras para poder entrenar
-):
-    await _train_general_logic_hybrid(batch_size=batch_size, min_samples=min_samples)
-    return {"status": "success", "message": "Entrenamiento general híbrido disparado"}
-
-
-@app.get("/train/incremental")
-async def trigger_incremental_train(
-    tester_id: str = Query(...),
-    build_id: str = Query(...),
-    batch_size: int = Query(200, ge=1),
-    min_samples: int = Query(2, ge=1)
-):
-    # ⚙️ Entrenamiento usando datos previos almacenados (sin enriched_vector directo)
-    await _train_incremental_logic_hybrid(
-        tester_id=tester_id,
-        build_id=build_id,
+    app_name: str = Query(..., description="Nombre de la aplicación"),
+    batch_size: int = Query(1000, ge=1, description="Tamaño máximo de muestras para entrenar"),
+    min_samples: int = Query(2, ge=1, description="Mínimo de muestras por pantalla para poder entrenar"),
+    # update_general: bool = Query(True, description="Forzar entrenamiento general híbrido")
+    update_general: bool = Query(True, description="Usar modelo general como base")
+):    
+    """
+    Endpoint para disparar el entrenamiento general híbrido por aplicación.
+    Llama a _train_general_logic_hybrid con los parámetros especificados.
+    """
+    await _train_general_logic_hybrid(
+        app_name=app_name,
         batch_size=batch_size,
         min_samples=min_samples,
-        enriched_vector=None  # 👈 Añadir esto
+        update_general=update_general
     )
+
     return {
         "status": "success",
-        "message": f"Entrenamiento incremental híbrido para {tester_id}/{build_id} disparado"
+        "message": f"Entrenamiento general híbrido disparado para app '{app_name}'",
+        "params": {
+            "batch_size": batch_size,
+            "min_samples": min_samples,
+             "update_general": update_general
+        }
     }
+
+
+@app.post("/train/incremental")
+async def trigger_incremental_train(
+    app_name: str = Query(..., description="Nombre de la aplicación"),
+    tester_id: str = Query(..., description="Identificador del tester"),
+    build_id: str = Query(..., description="ID del build o versión de la app"),
+    screen_id: str = Query(..., description="ID de la pantalla actual"),
+    min_samples: int = Query(2, ge=1, description="Número mínimo de muestras para entrenar"),
+    use_general_as_base: bool = Query(True, description="Usar modelo general como base"),
+    enriched_vector: Optional[List[float]] = Body(None, description="Vector enriquecido actual")
+):
+    """
+    Endpoint para disparar el entrenamiento incremental híbrido de una pantalla específica.
+    """
+    if enriched_vector is None:
+        return {
+            "status": "error",
+            "message": "Se requiere 'enriched_vector' para el entrenamiento incremental."
+        }
+
+    # Llamar al entrenamiento incremental híbrido
+    await _train_incremental_logic_hybrid(
+        enriched_vector=np.array(enriched_vector, dtype=float),
+        tester_id=tester_id,
+        build_id=build_id,
+        app_name=app_name,
+        screen_id=screen_id,
+        min_samples=min_samples,
+        use_general_as_base=use_general_as_base
+    )
+
+    return {
+        "status": "success",
+        "message": f"Entrenamiento incremental híbrido ejecutado para {app_name}/{tester_id}/{build_id}/{screen_id}",
+        "params": {
+            "min_samples": min_samples,
+            "use_general_as_base": use_general_as_base
+        }
+    }
+
+# @app.get("/train/incremental")
+# async def trigger_incremental_train(
+#     tester_id: str = Query(...),
+#     build_id: str = Query(...),
+#     batch_size: int = Query(200, ge=1),
+#     min_samples: int = Query(2, ge=1)
+# ):
+#     # ⚙️ Entrenamiento usando datos previos almacenados (sin enriched_vector directo)
+#     await _train_incremental_logic_hybrid(
+#         tester_id=tester_id,
+#         build_id=build_id,
+#         batch_size=batch_size,
+#         min_samples=min_samples,
+#         enriched_vector=None  # 👈 Añadir esto
+#     )
+#     return {
+#         "status": "success",
+#         "message": f"Entrenamiento incremental híbrido para {tester_id}/{build_id} disparado"
+#     }
 
 
 def extract_numeric_version(v: str) -> str:
