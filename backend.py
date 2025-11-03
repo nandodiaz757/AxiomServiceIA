@@ -28,6 +28,12 @@ import difflib
 import string
 import random
 import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from SiameseEncoder import SiameseEncoder
+
 
 
 from stable_signature import normalize_node
@@ -37,6 +43,11 @@ from stable_signature import normalize_node
 # =========================================================
 app = FastAPI()
 router = APIRouter() 
+siamese_model = None
+SIM_THRESHOLD = 0.90
+
+# Cargamos modelo siamés (una vez)
+
 
 if 'kmeans_model' not in globals():
     kmeans_model = KMeans(n_clusters=5)
@@ -113,6 +124,96 @@ class ResetPasswordRequest(BaseModel):
 class ResetRequest(BaseModel):
     email: EmailStr
 
+class SiameseEncoder(nn.Module):
+    def __init__(self, input_dim=128, hidden_dim=256, embedding_dim=64):
+        super().__init__()
+
+        # Bloque MLP simple: transforma features a embedding
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, embedding_dim)
+        )
+
+    # ----------------------------------------------------------
+    # Conversión de árbol UI a vector fijo de features
+    # ----------------------------------------------------------
+    def tree_to_vector(self, ui_tree):
+        """
+        Convierte un árbol de accesibilidad (lista de nodos JSON)
+        en un vector numérico simple.
+        """
+        if not ui_tree or not isinstance(ui_tree, list):
+            return np.zeros(128, dtype=np.float32)
+
+        features = []
+        for node in ui_tree[:50]:  # limita nodos para evitar overflow
+            cls = node.get("className", "")
+            txt = node.get("text", "")
+            clickable = 1.0 if node.get("clickable") else 0.0
+            enabled = 1.0 if node.get("enabled", True) else 0.0
+            size = float(node.get("bounds", {}).get("width", 0)) * \
+                   float(node.get("bounds", {}).get("height", 0))
+            size = np.log1p(size) / 10.0
+
+            # hash textual básico (reemplazable por embedding textual real)
+            text_hash = (sum(ord(c) for c in txt[:10]) % 1000) / 1000.0
+            cls_hash = (sum(ord(c) for c in cls[:10]) % 1000) / 1000.0
+
+            node_vec = [clickable, enabled, size, text_hash, cls_hash]
+            features.append(node_vec)
+
+        # Flatten y normaliza tamaño
+        flat = np.array(features, dtype=np.float32).flatten()
+        if len(flat) < 128:
+            pad = np.zeros(128 - len(flat), dtype=np.float32)
+            flat = np.concatenate([flat, pad])
+        else:
+            flat = flat[:128]
+        return flat
+
+    # ----------------------------------------------------------
+    # Encodea un árbol a embedding
+    # ----------------------------------------------------------
+    def encode_tree(self, ui_tree):
+        vec = torch.tensor(self.tree_to_vector(ui_tree), dtype=torch.float32)
+        with torch.no_grad():
+            emb = self.encoder(vec)
+            emb = F.normalize(emb, p=2, dim=0)  # normaliza L2
+        return emb
+
+    # ----------------------------------------------------------
+    # Forward siamés: compara dos árboles y devuelve similitud
+    # ----------------------------------------------------------
+    def forward(self, tree_a, tree_b):
+        va = torch.tensor(self.tree_to_vector(tree_a), dtype=torch.float32)
+        vb = torch.tensor(self.tree_to_vector(tree_b), dtype=torch.float32)
+        ea = F.normalize(self.encoder(va), p=2, dim=0)
+        eb = F.normalize(self.encoder(vb), p=2, dim=0)
+        sim = F.cosine_similarity(ea, eb, dim=0)
+        return sim
+
+    # ----------------------------------------------------------
+    # Utilidades
+    # ----------------------------------------------------------
+    def save(self, path="ui_encoder.pt"):
+        torch.save(self.state_dict(), path)
+
+    @classmethod
+    def load(cls, path="ui_encoder.pt"):
+        model = cls()
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        return model
+    
+@app.on_event("startup")
+async def startup_event():
+    """Carga inicial del modelo al arrancar el servidor."""
+    global siamese_model
+    from SiameseEncoder import SiameseEncoder
+
+    siamese_model = SiameseEncoder.load("ui_encoder.pt")
+    siamese_model.eval()
+    print("✅ Modelo siamés cargado en memoria.")   
 
 # === Reentrenamiento automático del modelo diff ===
 @app.on_event("startup")
@@ -122,8 +223,22 @@ def retrain_model() -> None:
     Reentrena el modelo diff con las últimas aprobaciones/rechazos
     sin necesidad de parar el servidor.
     """
+    """Carga inicial del modelo al arrancar el servidor."""
+
+    global siamese_model
     from diff_model.train_diff_model import train_and_save
+    print("🧠 Iniciando reentrenamiento del modelo siamés...")
+
+    # Entrena y guarda nuevo modelo
     train_and_save()
+
+    #from SiameseEncoder import SiameseEncoder
+
+    siamese_model = SiameseEncoder.load("ui_encoder.pt")
+    siamese_model.eval()
+    print("✅ Reentrenamiento completado y modelo actualizado en memoria.")
+
+
 
 
 def _get_lock(key: str) -> asyncio.Lock:
@@ -334,7 +449,7 @@ def init_db():
             estado TEXT DEFAULT 'PENDIENTE',  
             transaccion_id TEXT   
             cantidad_codigos INTEGER NOT NULL,
-            fecha_creacion INTEGER NOT NULL,
+            fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             fecha_confirmacion INTEGER 
         );
     """)
@@ -354,7 +469,7 @@ def init_db():
             pago_id TEXT NOT NULL,
             evento TEXT NOT NULL,             -- Ej: "CREADO", "CONFIRMADO", "FALLIDO", "CODIGO_GENERADO"
             descripcion TEXT,                 -- Detalles del evento
-            timestamp INTEGER NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(pago_id) REFERENCES pagos(pago_id)
         );
     """)
@@ -366,7 +481,7 @@ def init_db():
             monto REAL NOT NULL,
             moneda TEXT DEFAULT 'USD',
             estado TEXT DEFAULT 'PENDIENTE',  -- PENDIENTE, CONFIRMADA, FALLIDA
-            fecha INTEGER NOT NULL
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
     c.execute("""
@@ -1009,7 +1124,7 @@ async def analyze_and_train(event: AccessibilityEvent):
     tester_id = event.tester_id or "general"
     build_id = event.build_id
     header_text = event.header_text or ""
-
+    global siamese_model
     # -------------------- Árbol y firma ------------------------
     latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
     sig = stable_signature(latest_tree)
@@ -1054,7 +1169,7 @@ async def analyze_and_train(event: AccessibilityEvent):
 
             if row:
                 prev_header = (row[0] or "").strip().lower()
-
+        print(f"curr_header: '{curr_header}' | prev_header: '{prev_header}'")
         if prev_header and prev_header != curr_header:
             print(f"⚠️ Header cambió (detección temprana): '{prev_header}' → '{curr_header}'")
             header_changed = {"before": prev_header, "after": curr_header}
@@ -1089,6 +1204,54 @@ async def analyze_and_train(event: AccessibilityEvent):
         except Exception:
             pass
         return ""
+   
+# normalizar latest_tree: asegurar lista de dicts, eliminar Nones
+    def sanitize_tree(tree):
+        if not tree:
+            return []
+        cleaned = []
+        for n in tree:
+            # aceptamos dicts; también aceptamos strings JSON (por si llegan así)
+            if n is None:
+                continue
+            if isinstance(n, str):
+                try:
+                    obj = json.loads(n)
+                    if isinstance(obj, dict):
+                        cleaned.append(obj)
+                    elif isinstance(obj, list):
+                        # si vino un lista serializada, extenderla
+                        cleaned.extend([x for x in obj if isinstance(x, dict)])
+                except Exception:
+                    continue
+            elif isinstance(n, dict):
+                cleaned.append(n)
+            # ignorar otros tipos
+        return cleaned
+
+    latest_tree = sanitize_tree(latest_tree)
+    if not latest_tree:
+        logger.warning("⚠️ latest_tree vacío o todos sus nodos son None/invalid — usando embedding neutro")
+        # crear embedding neutro (mismo tamaño que modelo devuelve)
+        try:
+            emb_dim = siamese_model.embedding_dim  # define esto en la clase SiameseEncoder
+            emb_curr = np.zeros((1, emb_dim), dtype=float)
+        except Exception:
+            emb_curr = np.zeros((1, 64), dtype=float)  # fallback si no conoces dim
+    else:
+        try:
+            with torch.no_grad():
+                emb_tensor = siamese_model.encode_tree(latest_tree)  # debe devolver tensor 1D o 2D
+            # asegurar formato numpy (1, -1)
+            emb_curr = emb_tensor.cpu().numpy().reshape(1, -1)
+        except Exception as e:
+            # log detallado y fallback neutro pero no abortar proceso
+            logger.exception(f"Error generando embedding: {e} -- fallback embedding neutro usado")
+            try:
+                emb_dim = getattr(siamese_model, "embedding_dim", 64)
+                emb_curr = np.zeros((1, emb_dim), dtype=float)
+            except Exception:
+                emb_curr = np.zeros((1, 64), dtype=float)
 
     with sqlite3.connect(DB_NAME) as conn:
         prev_rows = conn.execute("""
@@ -1100,258 +1263,86 @@ async def analyze_and_train(event: AccessibilityEvent):
             LIMIT 5
         """, (t_id, b_id)).fetchall()
 
-    if not prev_rows:
-        with sqlite3.connect(DB_NAME) as conn:
-            prev_rows = conn.execute("""
-                SELECT collect_node_tree, header_text, signature, enriched_vector, build_id, event_type_name
-                FROM accessibility_data
-                WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
-                  AND LOWER(TRIM(header_text)) = LOWER(TRIM(?))
-                  AND LOWER(TRIM(event_type_name)) = LOWER(TRIM(?))
-                ORDER BY created_at DESC
-                LIMIT 3
-            """, (t_id, s_name, event_type_ref)).fetchall()
-
-    best_row = None
-    best_sim = 0.0
-
-    for row in prev_rows:
-        try:
-
-            if not row[3]:
-                # No hay vector anterior válido
-                continue
-
-            prev_enriched_vec = np.array(ast.literal_eval(row[3]), dtype=float)
-
-            if prev_enriched_vec.size == 0:
-                continue
-
-            min_len = min(len(prev_enriched_vec), len(enriched_vector))
-            prev_vec = prev_enriched_vec[:min_len]
-            curr_vec = enriched_vector[:min_len]
-            sim = np.dot(curr_vec, prev_vec) / (
-                np.linalg.norm(curr_vec) * np.linalg.norm(prev_vec) + 1e-8
-            )
-            if sim > best_sim:
-                best_sim = sim
-                best_row = row
-        except Exception as e:
-            continue
-
-    if best_row:
-        logger.info(f"🤝 Coincidencia estructural detectada entre builds (similitud={best_sim:.3f})")
-    else:
-        logger.warning("⚠️ No se encontró coincidencia ni por signature ni por estructura.")
-
-    # previous_row = None
-    if prev_rows:
-        latest_event = getattr(event, "event_type_name", None)
-        same_event_rows = []
-
-        if latest_event:
-            current_class = root_class_name or get_class_name(prev_rows[-1])
-            current_signature = sig
-            same_event_rows = [
-                r for r in prev_rows
-                if (
-                    r[5] == latest_event and
-                    get_class_name(r) == current_class and
-                    (r[2] == current_signature or not current_signature)
-                )
-            ]
-
-        if not same_event_rows and prev_rows:
-            same_event_rows = [prev_rows[-1]]
-
-        latest_vec = enriched_vector.reshape(1, -1)
-        best_sim, best_row = 0, None
-
-        for r in same_event_rows:
-            try:
-                prev_vec = np.array(json.loads(r[3])).reshape(1, -1)
-                sim = float(cosine_similarity(latest_vec, prev_vec)[0][0])
-                if sim > best_sim:
-                    best_sim, best_row = sim, r
-            except Exception:
-                continue
-
-        if best_row and best_sim > 0.90:
-            previous_row = best_row
-            prev_tree = ensure_list(json.loads(best_row[0]))
-            logger.info(f"🤝 Coincidencia alta por similitud vectorial ({best_sim:.3f})")
+    # esto es nuevo tocar o eliminar 
+        if not prev_rows:
+            logger.info("ℹ️ No hay snapshots previos para comparar.")
+            has_changes = True
+            prev_tree = None
         else:
-            latest_tree_norm = [normalize_node(n) for n in latest_tree]
-            for r in same_event_rows:
+            # -------------------- 4. Calcular similitud aprendida --------------------
+            best_sim, best_row = 0.0, None
+            for row in prev_rows:
                 try:
-                    prev_candidate = ensure_list(json.loads(r[0]))
-                    if trees_are_structurally_similar(latest_tree_norm, prev_candidate):
-                        previous_row = r
-                        prev_tree = prev_candidate
-                        logger.info("🔄 Coincidencia por estructura (layout similar, texto distinto)")
-                        break
+                    prev_tree = ensure_list(json.loads(row[0]))
+                    with torch.no_grad():
+                        emb_prev = siamese_model.encode_tree(prev_tree)
+                    emb_prev = emb_prev.cpu().numpy().reshape(1, -1)
+
+                    sim_torch = torch.nn.functional.cosine_similarity(
+                        torch.tensor(emb_curr, dtype=torch.float32),
+                        torch.tensor(emb_prev, dtype=torch.float32),
+                        dim=1
+                    )
+                    print("Similitud (torch):", sim_torch.mean().item())
+
+                    sim = float(cosine_similarity(emb_curr, emb_prev)[0][0])
+                    # sim = torch.nn.functional.cosine_similarity(emb1, emb2, dim=0)
+                    # print("Similitud:", sim.item())
+                    # sim = float(cosine_similarity(emb_curr, emb_prev)[0][0])
+                    if sim > best_sim:
+                        best_sim, best_row = sim, row
                 except Exception:
                     continue
-            else:
-                logger.warning("⚠️ No hay coincidencia por signature, vector ni estructura.")
 
-    # -------------------- Comparación de árboles ----------------
+            if best_sim > SIM_THRESHOLD and best_row:
+                logger.info(f"🤝 Coincidencia detectada por modelo siamés (sim={best_sim:.3f})")
+                prev_tree = ensure_list(json.loads(best_row[0]))
+            else:
+                logger.warning("⚠️ No se encontró coincidencia fuerte, usar estructura directa.")
+                prev_tree = ensure_list(json.loads(prev_rows[0][0]))    
+    
     removed_all, added_all, modified_all = [], [], []
     text_diff = {}
     diff_result = {}
-  
-
+    
+    # esto es nuevo  tocar o eliminar  
     if prev_tree:
-        logger.debug(f"Comparando árboles: prev={len(prev_tree)} nodos, latest={len(latest_tree)} nodos")
-        if len(prev_tree) == len(latest_tree):
-            logger.debug("⚠️ Árboles del mismo tamaño, posible snapshot idéntico.")
-
         try:
             diff_result = compare_trees(
-                prev_tree,
-                latest_tree,
+                prev_tree, latest_tree,
                 app_name=app_name,
                 tester_id=tester_id,
                 build_id=build_id,
-                screen_id=event.screens_id or event.header_text or "unknown_screen",
-                use_general=TRAIN_GENERAL_ON_COLLECT  # 👈 este flag controla si se usa el modelo general
+                screen_id=event.screens_id or event.header_text or "unknown_screen"
             )
 
             has_changes = bool(
-                diff_result.get("removed") or
-                diff_result.get("added") or
-                diff_result.get("modified") or
-                diff_result.get("text_diff", {}).get("removed_texts") or
-                diff_result.get("text_diff", {}).get("added_texts") or
-                diff_result.get("text_diff", {}).get("diff_texts") or
+                diff_result.get("removed") or diff_result.get("added") or diff_result.get("modified") or
                 diff_result.get("text_diff", {}).get("overlap_ratio", 1.0) < 0.9 or
-                diff_result.get("has_changes")  # 👈 bandera directa del modelo
+                diff_result.get("has_changes")
             )
 
         except Exception as e:
-            logger.error(f"❌ Error ejecutando compare_trees: {e}")
-            diff_result = {"removed": [], "added": [], "modified": [], "text_diff": {}, "has_changes": False}
-            has_changes = False
-
-        removed_all = diff_result.get("removed", [])
-        added_all = diff_result.get("added", [])
-        modified_all = diff_result.get("modified", [])
-        text_diff = diff_result.get("text_diff", {})
-
-
-        print(f"📊 [DEBUG DIFF RESULT] removed={len(removed_all)}, added={len(added_all)}, modified={len(modified_all)}, has_changes={has_changes}")
-        logger.info(f"📊 compare_trees → removed={len(removed_all)}, added={len(added_all)}, modified={len(modified_all)}, has_changes={has_changes}")
-
-        try:
-            last_ui_structure_similarity = ui_structure_similarity(prev_tree, latest_tree)
-            text_diff["ui_structure_similarity"] = last_ui_structure_similarity
-            logger.info(f"🏗️ Similitud estructural UI: {last_ui_structure_similarity:.3f}")
-        except Exception as e:
-            logger.warning(f"⚠️ No se pudo calcular similitud estructural: {e}")
-            text_diff["ui_structure_similarity"] = None
+            logger.error(f"Error comparando árboles: {e}")
+            has_changes = True
     else:
-        logger.info("ℹ️ No hay árbol previo — se omite comparación estructural.")
         has_changes = True
 
-    # -------------------- Guardar en screen_diffs ----------------
-    if has_changes:
-        removed_j = json.dumps(removed_all, sort_keys=True, ensure_ascii=False)
-        added_j = json.dumps(added_all, sort_keys=True, ensure_ascii=False)
-        modified_j = json.dumps(modified_all, sort_keys=True, ensure_ascii=False)
-        diff_signature = diff_hash(removed_all, added_all, modified_all, text_diff)
-
-        with sqlite3.connect(DB_NAME) as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT s.id, a.approved
-                FROM screen_diffs AS s
-                LEFT JOIN diff_approvals AS a ON a.diff_id = s.id
-                WHERE s.diff_hash = ?
-            """, (diff_signature,))
-            existing = cur.fetchone()
-
-            # --- Header changed ya detectado, aseguramos que se incluya en text_diff ---
-            if header_changed:
-                print(f"⚠️ Header cambió: '{header_changed['before']}' → '{header_changed['after']}'")
-                text_diff["header_changed"] = header_changed
-                has_changes = has_changes or True
-            else:
-                print("✅ Header sin cambios.")
-
-            # --- Decidir si insertar ---
-            if existing and existing[1]:
-                logger.info(f"✅ Diff {diff_signature[:8]} ya aprobado — no se inserta.")
-            elif existing:
-                logger.info(f"⚠️ Diff {diff_signature[:8]} ya existente sin aprobación.")
-            elif has_changes:
-                removed_j = json.dumps(removed_all, sort_keys=True, ensure_ascii=False)
-                added_j = json.dumps(added_all, sort_keys=True, ensure_ascii=False)
-                modified_j = json.dumps(modified_all, sort_keys=True, ensure_ascii=False)
-                text_diff_j = json.dumps(text_diff, ensure_ascii=False)
-
-                # 🧩 Asegurar que text_diff conserva overlap_ratio
-                if "overlap_ratio" not in text_diff:
-                    text_diff["overlap_ratio"] = diff_result.get("text_diff", {}).get("overlap_ratio", 1.0)
-
-                # 🧩 Asegurar que diff_result conserva structure_similarity
-                if "structure_similarity" not in diff_result:
-                    try:
-                        diff_result["structure_similarity"] = ui_structure_similarity(prev_tree, latest_tree)
-                    except Exception:
-                        diff_result["structure_similarity"] = 1.0
-
-                # Extraemos métricas desde tu dict 'diff_result' (o similar)
-                # text_overlap = diff_result.get("text_diff", {}).get("overlap_ratio", 0.0)
-                # overlap_ratio = diff_result.get("text_diff", {}).get("overlap_ratio", 0.0)
-                # ui_structure_sim_value = diff_result.get("structure_similarity", 0.0)
-
-                # ✅ Ahora que ya existen, extraemos las métricas correctamente
-                text_overlap = text_diff.get("overlap_ratio", 1.0)
-                overlap_ratio = text_overlap
-                ui_structure_sim_value = diff_result.get("structure_similarity", 1.0)
-
-                # Determinamos un estado textual para consultas posteriores
-                if ui_structure_sim_value > 0.9 and overlap_ratio > 0.8:
-                    screen_status = "identical"
-                elif overlap_ratio > 0.6:
-                    screen_status = "minor_changes"
-                else:
-                    screen_status = "different"
-
-                    
-                
-                cur.execute("""
-                    INSERT OR IGNORE INTO screen_diffs (
-                        tester_id, build_id, screen_name, header_text,
-                        removed, added, modified, text_diff, diff_hash,
-                        text_overlap, overlap_ratio, ui_structure_similarity, screen_status
-                    )
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    t_id, b_id, s_name, header_text,
-                    removed_j, added_j, modified_j, text_diff_j,
-                    diff_signature, text_overlap, overlap_ratio,
-                    ui_structure_sim_value, screen_status
-                ))
-               
-                conn.commit()
-                logger.info(f"🧩 Guardado cambio ({diff_signature[:8]}) en screen_diffs")
-    else:
-        logger.info(f"🧩 has_changes={has_changes} | total_diffs={len(removed_all)+len(added_all)+len(modified_all)}")
-
-    # -------------------- Actualizar enriched_vector ----------------
+    # -------------------- 6. Guardar diff + enriquecimiento --------------------
     with sqlite3.connect(DB_NAME) as conn:
+        emb_json = json.dumps(emb_curr.tolist())
         conn.execute("""
             UPDATE accessibility_data
             SET enriched_vector=?
             WHERE TRIM(LOWER(header_text)) LIKE '%' || TRIM(LOWER(?)) || '%'
               AND TRIM(tester_id)=TRIM(?)
-        """, (json.dumps(enriched_vector.tolist(), ensure_ascii=False), s_name, t_id))
+        """, (emb_json, s_name, t_id))
         conn.commit()
 
-    # -------------------- Entrenamiento incremental ----------------
+    # -------------------- 7. Entrenamiento incremental --------------------
+    # opcional: puedes volver a entrenar el encoder con nuevos ejemplos
     asyncio.create_task(_train_incremental_logic_hybrid(
-        enriched_vector=enriched_vector,
+        enriched_vector=emb_curr.flatten(),
         tester_id=tester_id,
         build_id=build_id,
         app_name=app_name,
@@ -1360,84 +1351,166 @@ async def analyze_and_train(event: AccessibilityEvent):
 
     if TRAIN_GENERAL_ON_COLLECT:
         await _train_incremental_logic_hybrid(
-            enriched_vector=enriched_vector,
+            enriched_vector=emb_curr.flatten(),
             tester_id="general",
             build_id="latest",
             app_name=app_name,
             screen_id=event.screens_id or s_name or "unknown_screen"
         )
-    
-    try:
-        added_count = len(added_all or [])
-        removed_count = len(removed_all or [])
-        modified_count = len(modified_all or [])
-    except Exception:
-        added_count = removed_count = modified_count = 0
 
+    # -------------------- 9. Guardar en screen_diffs --------------------
+    try:
+        if has_changes:
+            removed_all = diff_result.get("removed", [])
+            added_all = diff_result.get("added", [])
+            modified_all = diff_result.get("modified", [])
+            text_diff = diff_result.get("text_diff", {})
+            header_changed = text_diff.get("header_changed", None)
+
+            # --- Generar firma hash del diff ---
+            diff_signature = diff_hash(removed_all, added_all, modified_all, text_diff)
+
+            with sqlite3.connect(DB_NAME) as conn:
+                cur = conn.cursor()
+
+                # Buscar si ya existe este diff
+                cur.execute("""
+                    SELECT s.id, a.approved
+                    FROM screen_diffs AS s
+                    LEFT JOIN diff_approvals AS a ON a.diff_id = s.id
+                    WHERE s.diff_hash = ?
+                """, (diff_signature,))
+                existing = cur.fetchone()
+
+                if existing and existing[1]:
+                    logger.info(f"✅ Diff {diff_signature[:8]} ya aprobado — no se inserta.")
+                elif existing:
+                    logger.info(f"⚠️ Diff {diff_signature[:8]} ya existente sin aprobación.")
+                else:
+                    # Enriquecer text_diff si falta overlap_ratio o structure_similarity
+                    if "overlap_ratio" not in text_diff:
+                        text_diff["overlap_ratio"] = diff_result.get("text_diff", {}).get("overlap_ratio", 1.0)
+
+                    if "structure_similarity" not in diff_result:
+                        try:
+                            diff_result["structure_similarity"] = ui_structure_similarity(prev_tree, latest_tree)
+                        except Exception:
+                            diff_result["structure_similarity"] = 1.0
+
+                    text_overlap = text_diff.get("overlap_ratio", 1.0)
+                    overlap_ratio = text_overlap
+                    ui_structure_sim_value = diff_result.get("structure_similarity", 1.0)
+
+                    # Determinar estado textual
+                    if ui_structure_sim_value > 0.9 and overlap_ratio > 0.8:
+                        screen_status = "identical"
+                    elif overlap_ratio > 0.6:
+                        screen_status = "minor_changes"
+                    else:
+                        screen_status = "different"
+
+                    # Serializar
+                    removed_j = json.dumps(removed_all, sort_keys=True, ensure_ascii=False)
+                    added_j = json.dumps(added_all, sort_keys=True, ensure_ascii=False)
+                    modified_j = json.dumps(modified_all, sort_keys=True, ensure_ascii=False)
+                    text_diff_j = json.dumps(text_diff, ensure_ascii=False)
+
+
+                    print("\n--- DEBUG INSERT INTO screen_diffs ---")
+                    print(f"tester_id={t_id}, build_id={b_id}, screen_name={s_name}")
+                    print(f"has_changes={has_changes}, removed={len(removed_all)}, added={len(added_all)}, modified={len(modified_all)}")
+                    print(f"diff_hash={diff_signature[:10]}, text_overlap={text_diff.get('overlap_ratio')}")
+                    print(f"existing={existing}")
+                    print("-------------------------------\n")
+
+
+                    cur.execute("""
+                        INSERT OR IGNORE INTO screen_diffs (
+                            tester_id, build_id, screen_name, header_text,
+                            removed, added, modified, text_diff, diff_hash,
+                            text_overlap, overlap_ratio, ui_structure_similarity, screen_status
+                        )
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        t_id, b_id, s_name, header_text,
+                        removed_j, added_j, modified_j, text_diff_j,
+                        diff_signature, text_overlap, overlap_ratio,
+                        ui_structure_sim_value, screen_status
+                    ))
+
+                    conn.commit()
+                    logger.info(f"🧩 Guardado cambio ({diff_signature[:8]}) en screen_diffs")
+
+        else:
+            logger.info(f"🧩 Sin cambios detectados para {s_name}")
+    except Exception as e:
+        logger.exception(f"❌ Error guardando diff en screen_diffs: {e}")
+
+
+    # -------------------- 8. Retornar métricas --------------------
+    added_count = len(diff_result.get("added", []))
+    removed_count = len(diff_result.get("removed", []))
+    modified_count = len(diff_result.get("modified", []))
     return has_changes, added_count, removed_count, modified_count
 
 
-# =========================================================
-# UTILIDADES PARA NORMALIZAR CAMPOS
-        
-def _insert_diff_trace(tester_id, build_id, screen, message):
-    # Normalizar el screen_name
-    screen_normalized = normalize_header(screen)
-
+def _insert_diff_trace(tester_id, build_id, screen_normalized, message):
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
-        # Verificar si ya existe exactamente el mismo registro
         exists = c.execute("""
             SELECT 1 FROM diff_trace
             WHERE tester_id=? AND build_id=? AND screen_name=? AND message=?
             LIMIT 1
         """, (tester_id, build_id, screen_normalized, message)).fetchone()
-
-        # Insertar solo si no existe
         if not exists:
             c.execute("""
                 INSERT INTO diff_trace (tester_id, build_id, screen_name, message)
                 VALUES (?, ?, ?, ?)
             """, (tester_id, build_id, screen_normalized, message))
-            conn.commit()        
+            conn.commit()
             logger.info(f"📝 Trace guardado: {message}")
 
-            
-def update_diff_trace(tester_id: str, build_id: str, screen: str, changes: List[str]) -> None:
+ 
+
+
+def update_diff_trace(tester_id: str, build_id: str, screen: str, changes: list) -> None:
     """
     Actualiza la tabla diff_trace:
-      - Si hay cambios, borra mensajes 'No hay cambios' y agrega cada cambio.
-      - Si no hay cambios, asegura que quede un único registro 'No hay cambios'.
+      - Si hay cambios, borra registros "No hay cambios" y agrega cada cambio.
+      - Si no hay cambios, asegura que quede un único registro "No hay cambios".
     """
     screen_normalized = normalize_header(screen)
 
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
+
         if changes:
-            # eliminar registros "No hay cambios" para ese tester/pantalla/build
+            # Eliminar registros "No hay cambios" para este tester/pantalla/build
             c.execute("""
-                DELETE FROM diff_trace 
-                WHERE tester_id=? AND build_id=? AND screen_name=? 
-                AND message='No hay cambios'
+                DELETE FROM diff_trace
+                WHERE tester_id=? AND build_id=? AND screen_name=? AND message='No hay cambios'
             """, (tester_id, build_id, screen_normalized))
+
+            # Insertar cada cambio, ignorando duplicados automáticamente
             for ch in changes:
-                _insert_diff_trace(tester_id, build_id, screen_normalized, ch)
+                c.execute("""
+                    INSERT OR IGNORE INTO diff_trace (tester_id, build_id, screen_name, message)
+                    VALUES (?, ?, ?, ?)
+                """, (tester_id, build_id, screen_normalized, ch))
+
         else:
-            # borrar otros mensajes y dejar solo "No hay cambios"
+            # Borrar otros mensajes distintos de "No hay cambios"
             c.execute("""
-                DELETE FROM diff_trace 
-                WHERE tester_id=? AND build_id=? AND screen_name=? 
-                AND message <> 'No hay cambios'
+                DELETE FROM diff_trace
+                WHERE tester_id=? AND build_id=? AND screen_name=? AND message <> 'No hay cambios'
             """, (tester_id, build_id, screen_normalized))
+
+            # Asegurar que exista solo un registro "No hay cambios"
             c.execute("""
-                INSERT INTO diff_trace (tester_id, build_id, screen_name, message)
-                SELECT ?, ?, ?, 'No hay cambios'
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM diff_trace 
-                    WHERE tester_id=? AND build_id=? AND screen_name=? 
-                    AND message='No hay cambios'
-                )
-            """, (tester_id, build_id, screen_normalized, tester_id, build_id, screen_normalized))
+                INSERT OR IGNORE INTO diff_trace (tester_id, build_id, screen_name, message)
+                VALUES (?, ?, ?, 'No hay cambios')
+            """, (tester_id, build_id, screen_normalized))
+
         conn.commit()
 
 
@@ -1549,7 +1622,6 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
             is_new_record = build_norm != prev_build_name
 
             # Ejecutar análisis y obtener cambios
-            # has_changes = await analyze_and_train(event)
             has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
 
             update_metrics(
@@ -1591,8 +1663,6 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
                     signature,
                     json.dumps(event.additional_info or {}, ensure_ascii=False),
                     json.dumps(event.tree_data or [], ensure_ascii=False)
-                    # json.dumps(event.additional_info, ensure_ascii=False) if event.additional_info else None,
-                    # json.dumps(event.tree_data, ensure_ascii=False) if event.tree_data else None
                 ))
                 conn.commit()
             logger.info("[collect] Insert completado (nuevo build o cambios detectados).")
@@ -1746,26 +1816,6 @@ async def trigger_incremental_train(
         }
     }
 
-# @app.get("/train/incremental")
-# async def trigger_incremental_train(
-#     tester_id: str = Query(...),
-#     build_id: str = Query(...),
-#     batch_size: int = Query(200, ge=1),
-#     min_samples: int = Query(2, ge=1)
-# ):
-#     # ⚙️ Entrenamiento usando datos previos almacenados (sin enriched_vector directo)
-#     await _train_incremental_logic_hybrid(
-#         tester_id=tester_id,
-#         build_id=build_id,
-#         batch_size=batch_size,
-#         min_samples=min_samples,
-#         enriched_vector=None  # 👈 Añadir esto
-#     )
-#     return {
-#         "status": "success",
-#         "message": f"Entrenamiento incremental híbrido para {tester_id}/{build_id} disparado"
-#     }
-
 
 def extract_numeric_version(v: str) -> str:
     """Extrae el número de versión (por ejemplo, 'v1.2.3-beta' → '1.2.3')."""
@@ -1884,7 +1934,7 @@ def get_screen_diffs(
                     old = vals.get("old")
                     new = vals.get("new")
                 else:
-                    old = None
+                    old = new = vals
                     new = vals
 
                 # Simplificar estructuras grandes
@@ -1918,6 +1968,7 @@ def get_screen_diffs(
         # Inicializar valores
         overlap_ratio = 0.0
         screen_status = "unknown"
+        changes_list = []
 
         # Obtener overlap_ratio si existe en text_diff
         if isinstance(text_diff, dict):
@@ -1978,6 +2029,35 @@ def get_screen_diffs(
 
         for node in removed:
             add_node_change("removed", node)
+
+
+        for node in removed:
+            changes_list.append(f"Removed: {node.get('class','unknown')} ({node.get('text','')})")
+
+        for node in added:
+            changes_list.append(f"Added: {node.get('class','unknown')} ({node.get('text','')})")
+
+        for change in modified:
+            node = change.get("node", {})
+            changes = change.get("changes", {})
+            if not changes:
+                changes_list.append(f"Modified (no details): {node.get('class','unknown')} ({node.get('text','')})")
+            for attr, vals in changes.items():
+                if isinstance(vals, dict):
+                    old = vals.get("old")
+                    new = vals.get("new")
+                else:
+                    old = new = vals
+                changes_list.append(f"Modified: {node.get('class','unknown')} {attr}: {old} → {new}")
+    
+
+        # update_diff_trace(
+        #     tester_id=tester_id,
+        #     build_id=build_id,
+        #     screen=row[3],  # screen_name
+        #     changes=changes_list
+        # )
+    
 
         # 🆕 Generar resumen elegante para cada diff
         summary_text = capture_pretty_summary(removed, added, modified, text_diff)

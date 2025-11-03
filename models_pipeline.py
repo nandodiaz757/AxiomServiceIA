@@ -5,14 +5,21 @@ import sqlite3
 import hashlib
 import logging
 from typing import Optional, Tuple
-
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
-import joblib
-
+import joblib 
+from joblib import dump, load
 # sklearn helpers (KMeans, classifier for hybrid)
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
+from typing import List
+import logging
+from difflib import SequenceMatcher
+from SiameseEncoder import SiameseEncoder
+import difflib
 
 # HMM
 try:
@@ -22,10 +29,12 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 DB_NAME = "accessibility.db"  # ajusta según tu config
-MIN_HMM_SAMPLES = 50  # mínimo para entrenar HMM por pantalla
+MIN_HMM_SAMPLES = 15  # mínimo para entrenar HMM por pantalla
 MODEL_BASE = "models"  # estructura confirmada:
 # models/{app_name}/{tester_id}/{build_id}/{screen_id}/hmm.joblib
 # models/{app_name}/general/{screen_id}/hmm.joblib
+TRAIN_GENERAL_ON_COLLECT = True
+encoder = SiameseEncoder()  
 
 # ----------------------------
 # Helpers de I/O de modelos
@@ -39,10 +48,13 @@ def model_dir_general(app_name: str, screen_id: str) -> str:
 def save_model(obj, path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     joblib.dump(obj, path)
+    logger.info(f"✅ Modelo guardado en: {path}")
 
 def load_model(path: str):
     if os.path.exists(path):
+        logger.info(f"📦 Cargando modelo desde: {path}")
         return joblib.load(path)
+    logger.warning(f"⚠️ No se encontró modelo en: {path}")
     return None
 
 def load_incremental_model(tester_id: str, build_id: str, app_name: str, screen_id: str):
@@ -143,7 +155,7 @@ def normalize_node(node: dict) -> dict:
             except (TypeError, ValueError):
                 normalized[k] = 0.0
             continue
-        
+
         # --- VISTAS CON OPACIDAD (alpha) ---
         if k == "alpha":
             try:
@@ -511,6 +523,12 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
                 #print(f"🔹 Nodo modificado registrado: {changes}")
 
     # detectar cambios de texto entre removed/added (moved text)
+
+
+        # ---------------------------------------------------------
+    # 🔹 Detección de cambios de texto entre nodos (versión semántica)
+    # ---------------------------------------------------------
+    
     def extract_text_from_key(key: str) -> str:
         if not key:
             return ""
@@ -518,26 +536,47 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
         for p in parts:
             if "text:" in p:
                 return p.split("text:")[-1].strip()
-        # fallback: busca trozos legibles
         if len(parts) > 1 and len(parts[-1]) > 2:
             return parts[-1].strip()
         return ""
 
-    import difflib
-    def similarity_ratio(a: str, b: str) -> float:
+    def literal_similarity(a: str, b: str) -> float:
+        """Similitud literal rápida"""
         a, b = (a or "").strip().lower(), (b or "").strip().lower()
         if not a or not b:
             return 0.0
-        return difflib.SequenceMatcher(None, a, b).ratio()
+        return SequenceMatcher(None, a, b).ratio()
+
+    def semantic_similarity(a: str, b: str) -> float:
+        """Similitud semántica usando el encoder siamés"""
+        if not a or not b:
+            return 0.0
+        try:
+            emb_a = encoder.encode_tree([{"text": a, "className": "TextView"}])
+            emb_b = encoder.encode_tree([{"text": b, "className": "TextView"}])
+            return float(torch.nn.functional.cosine_similarity(emb_a, emb_b, dim=0))
+        except Exception:
+            return literal_similarity(a, b)  # fallback
 
     text_diff = {}
-
     detected_text_mods = []
+
     for r in list(removed):
         r_text = extract_text_from_key(r["node"]["key"])
         for a in list(added):
             a_text = extract_text_from_key(a["node"]["key"])
-            sim = similarity_ratio(r_text, a_text)
+
+            # 1️⃣ primero evalúa literal
+            sim_lit = literal_similarity(r_text, a_text)
+
+            # 2️⃣ si la similitud literal es incierta (0.2–0.8), usa el encoder
+            if 0.2 < sim_lit < 0.8:
+                sim_sem = semantic_similarity(r_text, a_text)
+                sim = max(sim_lit, sim_sem)
+            else:
+                sim = sim_lit
+
+            # 3️⃣ decide si es cambio real de texto
             if r_text and a_text and sim > 0.6:
                 modified.append({
                     "node": {"key": a["node"]["key"], "class": a["node"]["class"]},
@@ -548,25 +587,179 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
                 })
                 detected_text_mods.append((r_text, a_text))
 
-    # 🔹 Elimina de removed/added los que ya fueron pareados
+    # 🔹 Limpieza de nodos ya pareados
     if detected_text_mods:
         removed = [
             r for r in removed
-            if all(similarity_ratio(extract_text_from_key(r["node"]["key"]), old) <= 0.6 for old, _ in detected_text_mods)
+            if all(literal_similarity(extract_text_from_key(r["node"]["key"]), old) <= 0.6 for old, _ in detected_text_mods)
         ]
         added = [
             a for a in added
-            if all(similarity_ratio(extract_text_from_key(a["node"]["key"]), new) <= 0.6 for _, new in detected_text_mods)
+            if all(literal_similarity(extract_text_from_key(a["node"]["key"]), new) <= 0.6 for _, new in detected_text_mods)
         ]
 
-        # 🧩 NUEVO: registrar los cambios de texto detectados
         text_diff["modified_texts"] = detected_text_mods
-        print(f"⚠️ Cambios de texto detectados: {detected_text_mods}")
-
-        # 🧩 NUEVO: asegurar que se marque el diff como cambio real
+        print(f"⚡ Cambios de texto detectados (híbrido): {detected_text_mods}")
         has_changes = True
+    
+    
+    
+    # def extract_text_from_key(key: str) -> str:
+    #     if not key:
+    #         return ""
+    #     parts = key.split("|")
+    #     for p in parts:
+    #         if "text:" in p:
+    #             return p.split("text:")[-1].strip()
+    #     if len(parts) > 1 and len(parts[-1]) > 2:
+    #         return parts[-1].strip()
+    #     return ""
+
+    # import difflib
+    # def string_similarity(a: str, b: str) -> float:
+    #     a, b = (a or "").strip().lower(), (b or "").strip().lower()
+    #     if not a or not b:
+    #         return 0.0
+    #     return difflib.SequenceMatcher(None, a, b).ratio()
+
+    # # ✅ Inicializa el encoder semántico una sola vez
+    # siamese = getattr(globals(), "_siamese_encoder", None)
+    # if siamese is None:
+    #     siamese = SiameseEncoder()
+    #     globals()["_siamese_encoder"] = siamese
+
+    # def semantic_similarity(a: str, b: str) -> float:
+    #     if not a or not b:
+    #         return 0.0
+    #     fake_tree_a = [{"text": a, "className": "TextView"}]
+    #     fake_tree_b = [{"text": b, "className": "TextView"}]
+    #     with torch.no_grad():
+    #         return float(siamese.forward(fake_tree_a, fake_tree_b))
+
+    # text_diff = {}
+    # detected_text_mods = []
+
+    # for r in list(removed):
+    #     r_text = extract_text_from_key(r["node"]["key"])
+    #     for a in list(added):
+    #         a_text = extract_text_from_key(a["node"]["key"])
+    #         if not r_text or not a_text:
+    #             continue
+
+    #         sim_text = string_similarity(r_text, a_text)
+    #         sim_semantic = semantic_similarity(r_text, a_text)
+    #         sim_final = (sim_text * 0.4) + (sim_semantic * 0.6)
+
+    #         print(f"🔍 Comparando: '{r_text}' → '{a_text}' | sim_text={sim_text:.2f}, sim_semantic={sim_semantic:.2f}, total={sim_final:.2f}")
+
+    #         if sim_final >= 0.35:
+    #             modified.append({
+    #                 "node": {"key": a["node"]["key"], "class": a["node"]["class"]},
+    #                 "changes": {
+    #                     "text": {"old": r_text, "new": a_text},
+    #                     "similarity": f"{sim_final:.2f}"
+    #                 }
+    #             })
+    #             detected_text_mods.append((r_text, a_text))
+
+    # if detected_text_mods:
+    #     removed = [
+    #         r for r in removed
+    #         if all(string_similarity(extract_text_from_key(r["node"]["key"]), old) <= 0.4 for old, _ in detected_text_mods)
+    #     ]
+    #     added = [
+    #         a for a in added
+    #         if all(string_similarity(extract_text_from_key(a["node"]["key"]), new) <= 0.4 for _, new in detected_text_mods)
+    #     ]
+
+    #     text_diff["modified_texts"] = detected_text_mods
+    #     print(f"⚠️ Cambios de texto detectados: {detected_text_mods}")
+    #     has_changes = True
+
+    # def extract_text_from_key(key: str) -> str:
+    #     if not key:
+    #         return ""
+    #     parts = key.split("|")
+    #     for p in parts:
+    #         if "text:" in p:
+    #             return p.split("text:")[-1].strip()
+    #     # fallback: busca trozos legibles
+    #     if len(parts) > 1 and len(parts[-1]) > 2:
+    #         return parts[-1].strip()
+    #     return ""
+
+    # import difflib
+    # def similarity_ratio(a: str, b: str) -> float:
+    #     a, b = (a or "").strip().lower(), (b or "").strip().lower()
+    #     if not a or not b:
+    #         return 0.0
+    #     return difflib.SequenceMatcher(None, a, b).ratio()
+
+    # text_diff = {}
+
+    # detected_text_mods = []
+
+    # for r in list(removed):
+    #     r_text = extract_text_from_key(r["node"]["key"])
+    #     for a in list(added):
+    #         a_text = extract_text_from_key(a["node"]["key"])
+    #         sim = similarity_ratio(r_text, a_text)
+            
+    #         # ojo con este cambio es nuevo eliminar si no sirve
+    #         if not r_text or not a_text:
+    #             continue
+    #                     # 🔍 Log para depuración
+    #         print(f"🔍 Comparando textos: '{r_text}' → '{a_text}' | sim={sim:.3f}")
+
+    #         # 🔹 Detectar tanto textos parecidos como muy distintos
+    #         if sim >= 0.4 or sim < 0.4:
+    #             modified.append({
+    #                 "node": {"key": a["node"]["key"], "class": a["node"]["class"]},
+    #                 "changes": {
+    #                     "text": {"old": r_text, "new": a_text},
+    #                     "similarity": f"{sim:.2f}"
+    #                 }
+    #             })
+    #             detected_text_mods.append((r_text, a_text))
+    #         # ojo con este cambio
+    #         # if r_text and a_text and sim > 0.6:
+
+    #         #     modified.append({
+    #         #         "node": {"key": a["node"]["key"], "class": a["node"]["class"]},
+    #         #         "changes": {
+    #         #             "text": {"old": r_text, "new": a_text},
+    #         #             "similarity": f"{sim:.2f}"
+    #         #         }
+    #         #     })
+    #         #     detected_text_mods.append((r_text, a_text))
+
+    # # 🔹 Elimina de removed/added los que ya fueron pareados
+    # if detected_text_mods:
+    #     removed = [
+    #         r for r in removed
+    #         if all(similarity_ratio(extract_text_from_key(r["node"]["key"]), old) <= 0.4 for old, _ in detected_text_mods)
+    #     ]
+    #     added = [
+    #         a for a in added
+    #         if all(similarity_ratio(extract_text_from_key(a["node"]["key"]), new) <= 0.4 for _, new in detected_text_mods)
+    #     ]
+
+    #     # 🧩 NUEVO: registrar los cambios de texto detectados
+    #     text_diff["modified_texts"] = detected_text_mods
+    #     print(f"⚠️ Cambios de texto detectados: {detected_text_mods}")
+
+    #     # 🧩 NUEVO: asegurar que se marque el diff como cambio real
+    #     has_changes = True
 
     # 🔹 Detectar cambios de texto entre nodos iguales por key
+
+    def similarity_ratio(a: str, b: str) -> float:
+        """Calcula la similitud entre dos textos (0-1) usando difflib."""
+        a, b = (a or "").strip().lower(), (b or "").strip().lower()
+        if not a or not b:
+            return 0.0
+        return difflib.SequenceMatcher(None, a, b).ratio()
+
     for old_path, old_node in flatten_tree(old_tree):
         old_text = normalize_node(old_node).get("text", "").strip()
         if not old_text:
@@ -577,7 +770,7 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
                 new_text = normalize_node(new_node).get("text", "").strip()
                 if old_text and new_text and old_text != new_text:
                     sim = similarity_ratio(old_text, new_text)
-                    if sim > 0.6:  # umbral de similitud
+                    if sim > 0.3:  # umbral de similitud
                         modified.append({
                             "node": {"key": old_node.get("key"), "class": old_node.get("className")},
                             "changes": {
