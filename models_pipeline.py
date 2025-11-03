@@ -602,157 +602,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
         print(f"⚡ Cambios de texto detectados (híbrido): {detected_text_mods}")
         has_changes = True
     
-    
-    
-    # def extract_text_from_key(key: str) -> str:
-    #     if not key:
-    #         return ""
-    #     parts = key.split("|")
-    #     for p in parts:
-    #         if "text:" in p:
-    #             return p.split("text:")[-1].strip()
-    #     if len(parts) > 1 and len(parts[-1]) > 2:
-    #         return parts[-1].strip()
-    #     return ""
-
-    # import difflib
-    # def string_similarity(a: str, b: str) -> float:
-    #     a, b = (a or "").strip().lower(), (b or "").strip().lower()
-    #     if not a or not b:
-    #         return 0.0
-    #     return difflib.SequenceMatcher(None, a, b).ratio()
-
-    # # ✅ Inicializa el encoder semántico una sola vez
-    # siamese = getattr(globals(), "_siamese_encoder", None)
-    # if siamese is None:
-    #     siamese = SiameseEncoder()
-    #     globals()["_siamese_encoder"] = siamese
-
-    # def semantic_similarity(a: str, b: str) -> float:
-    #     if not a or not b:
-    #         return 0.0
-    #     fake_tree_a = [{"text": a, "className": "TextView"}]
-    #     fake_tree_b = [{"text": b, "className": "TextView"}]
-    #     with torch.no_grad():
-    #         return float(siamese.forward(fake_tree_a, fake_tree_b))
-
-    # text_diff = {}
-    # detected_text_mods = []
-
-    # for r in list(removed):
-    #     r_text = extract_text_from_key(r["node"]["key"])
-    #     for a in list(added):
-    #         a_text = extract_text_from_key(a["node"]["key"])
-    #         if not r_text or not a_text:
-    #             continue
-
-    #         sim_text = string_similarity(r_text, a_text)
-    #         sim_semantic = semantic_similarity(r_text, a_text)
-    #         sim_final = (sim_text * 0.4) + (sim_semantic * 0.6)
-
-    #         print(f"🔍 Comparando: '{r_text}' → '{a_text}' | sim_text={sim_text:.2f}, sim_semantic={sim_semantic:.2f}, total={sim_final:.2f}")
-
-    #         if sim_final >= 0.35:
-    #             modified.append({
-    #                 "node": {"key": a["node"]["key"], "class": a["node"]["class"]},
-    #                 "changes": {
-    #                     "text": {"old": r_text, "new": a_text},
-    #                     "similarity": f"{sim_final:.2f}"
-    #                 }
-    #             })
-    #             detected_text_mods.append((r_text, a_text))
-
-    # if detected_text_mods:
-    #     removed = [
-    #         r for r in removed
-    #         if all(string_similarity(extract_text_from_key(r["node"]["key"]), old) <= 0.4 for old, _ in detected_text_mods)
-    #     ]
-    #     added = [
-    #         a for a in added
-    #         if all(string_similarity(extract_text_from_key(a["node"]["key"]), new) <= 0.4 for _, new in detected_text_mods)
-    #     ]
-
-    #     text_diff["modified_texts"] = detected_text_mods
-    #     print(f"⚠️ Cambios de texto detectados: {detected_text_mods}")
-    #     has_changes = True
-
-    # def extract_text_from_key(key: str) -> str:
-    #     if not key:
-    #         return ""
-    #     parts = key.split("|")
-    #     for p in parts:
-    #         if "text:" in p:
-    #             return p.split("text:")[-1].strip()
-    #     # fallback: busca trozos legibles
-    #     if len(parts) > 1 and len(parts[-1]) > 2:
-    #         return parts[-1].strip()
-    #     return ""
-
-    # import difflib
-    # def similarity_ratio(a: str, b: str) -> float:
-    #     a, b = (a or "").strip().lower(), (b or "").strip().lower()
-    #     if not a or not b:
-    #         return 0.0
-    #     return difflib.SequenceMatcher(None, a, b).ratio()
-
-    # text_diff = {}
-
-    # detected_text_mods = []
-
-    # for r in list(removed):
-    #     r_text = extract_text_from_key(r["node"]["key"])
-    #     for a in list(added):
-    #         a_text = extract_text_from_key(a["node"]["key"])
-    #         sim = similarity_ratio(r_text, a_text)
-            
-    #         # ojo con este cambio es nuevo eliminar si no sirve
-    #         if not r_text or not a_text:
-    #             continue
-    #                     # 🔍 Log para depuración
-    #         print(f"🔍 Comparando textos: '{r_text}' → '{a_text}' | sim={sim:.3f}")
-
-    #         # 🔹 Detectar tanto textos parecidos como muy distintos
-    #         if sim >= 0.4 or sim < 0.4:
-    #             modified.append({
-    #                 "node": {"key": a["node"]["key"], "class": a["node"]["class"]},
-    #                 "changes": {
-    #                     "text": {"old": r_text, "new": a_text},
-    #                     "similarity": f"{sim:.2f}"
-    #                 }
-    #             })
-    #             detected_text_mods.append((r_text, a_text))
-    #         # ojo con este cambio
-    #         # if r_text and a_text and sim > 0.6:
-
-    #         #     modified.append({
-    #         #         "node": {"key": a["node"]["key"], "class": a["node"]["class"]},
-    #         #         "changes": {
-    #         #             "text": {"old": r_text, "new": a_text},
-    #         #             "similarity": f"{sim:.2f}"
-    #         #         }
-    #         #     })
-    #         #     detected_text_mods.append((r_text, a_text))
-
-    # # 🔹 Elimina de removed/added los que ya fueron pareados
-    # if detected_text_mods:
-    #     removed = [
-    #         r for r in removed
-    #         if all(similarity_ratio(extract_text_from_key(r["node"]["key"]), old) <= 0.4 for old, _ in detected_text_mods)
-    #     ]
-    #     added = [
-    #         a for a in added
-    #         if all(similarity_ratio(extract_text_from_key(a["node"]["key"]), new) <= 0.4 for _, new in detected_text_mods)
-    #     ]
-
-    #     # 🧩 NUEVO: registrar los cambios de texto detectados
-    #     text_diff["modified_texts"] = detected_text_mods
-    #     print(f"⚠️ Cambios de texto detectados: {detected_text_mods}")
-
-    #     # 🧩 NUEVO: asegurar que se marque el diff como cambio real
-    #     has_changes = True
-
-    # 🔹 Detectar cambios de texto entre nodos iguales por key
-
     def similarity_ratio(a: str, b: str) -> float:
         """Calcula la similitud entre dos textos (0-1) usando difflib."""
         a, b = (a or "").strip().lower(), (b or "").strip().lower()
@@ -980,6 +829,7 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
 # ----------------------------
 # Entrenamiento incremental y general (por pantalla)
 # ----------------------------
+
 async def _train_incremental_logic_hybrid(
     enriched_vector: np.ndarray,
     tester_id: str,
@@ -991,76 +841,89 @@ async def _train_incremental_logic_hybrid(
 ):
     """
     Entrena modelos híbridos por pantalla para QA (incremental).
+    Usa embeddings del SiameseEncoder si hay árboles disponibles.
     Guarda: models/{app}/{tester}/{build}/{screen}/hybrid_incremental.joblib
     """
     if enriched_vector is None or np.count_nonzero(enriched_vector) == 0:
         logger.debug("enriched_vector vacío - skip")
         return
 
-    # tomar últimos N vectores de la DB para esa pantalla (reciente)
+    # === Recuperar los árboles UI previos ===
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
         c.execute("""
-            SELECT enriched_vector
+            SELECT collect_node_tree
             FROM accessibility_data
-            WHERE enriched_vector IS NOT NULL AND screens_id = ?
+            WHERE collect_node_tree IS NOT NULL AND screens_id = ?
             ORDER BY created_at DESC
             LIMIT ?
-        """, (screen_id, max(10, min_samples*10)))
+        """, (screen_id, max(10, min_samples * 10)))
         rows = c.fetchall()
-    X_db = []
+
+    trees = []
     for r in rows:
         try:
-            vec = json.loads(r[0])
-            X_db.append(vec)
+            tree = json.loads(r[0])
+            if isinstance(tree, list):
+                trees.append(tree)
         except Exception:
             continue
-    if not X_db:
-        X = np.array([enriched_vector])
-    else:
-        X_db = [np.array(v, dtype=float).flatten() for v in X_db]
-        # normalizar longitud
-        EXPECTED_LEN = max(len(enriched_vector), max(len(v) for v in X_db))
-        def pad(v):
-            v = np.array(v, dtype=float).flatten()
-            if len(v) < EXPECTED_LEN:
-                return np.pad(v, (0, EXPECTED_LEN - len(v)))
-            return v[:EXPECTED_LEN]
-        X_db = np.array([pad(v) for v in X_db if np.count_nonzero(v) > 0])
-        enriched_vector = pad(enriched_vector)
-        X = np.unique(np.vstack([enriched_vector.reshape(1, -1), X_db]), axis=0)
 
-    # filtrar vectores vacíos
-    X = np.array([v for v in X if np.count_nonzero(v) > 0])
+    # === Generar embeddings con el modelo siamés (si hay árboles) ===
+    from SiameseEncoder import SiameseEncoder # asegúrate de tenerlo global o importado
+    siamese_model = SiameseEncoder()
+
+    X = None
+    if trees:
+        try:
+            emb_batch = siamese_model.encode_batch(trees)
+            X = emb_batch.cpu().numpy()
+            logger.info(f"✅ Generados {len(X)} embeddings desde árboles UI.")
+        except Exception as e:
+            logger.warning(f"Fallo al generar embeddings con SiameseEncoder: {e}")
+            X = None
+
+    # Si no hay árboles válidos, usar enriched_vector como respaldo
+    if X is None or len(X) == 0:
+        X = np.array([enriched_vector])
+
+    # Normalizar longitudes
+    EXPECTED_LEN = X.shape[1]
+    enriched_vector = enriched_vector.flatten()
+    if len(enriched_vector) < EXPECTED_LEN:
+        enriched_vector = np.pad(enriched_vector, (0, EXPECTED_LEN - len(enriched_vector)))
+    else:
+        enriched_vector = enriched_vector[:EXPECTED_LEN]
+
+    # Agregar vector actual al dataset
+    X = np.unique(np.vstack([enriched_vector.reshape(1, -1), X]), axis=0)
 
     if len(X) < min_samples:
         logger.debug("No hay suficientes muestras para incremental: %s < %s", len(X), min_samples)
         return
 
-    # KMeans para clusters + un clasificador simple (RandomForest) como "híbrido"
-    kmeans = MiniBatchKMeans(n_clusters=min(5, max(1, len(X))), random_state=42, batch_size= min(100, len(X)))
+    # === Entrenamiento híbrido (KMeans + RF) ===
+    kmeans = MiniBatchKMeans(
+        n_clusters=min(5, max(1, len(X))),
+        random_state=42,
+        batch_size=min(100, len(X))
+    )
     kmeans.fit(X)
-    labels = kmeans.predict(X)
-
-    # pipeline simple: scaler + classifier
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
-    clf = RandomForestClassifier(n_estimators=50)
-    # etiqueta: 0 = identical (usaremos heurística: clusters con baja variabilidad = identical)
-    # como ejemplo, generamos etiquetas dummy: si vector igual al enriched_vector -> 0 else 1
-    # En producción, reemplaza etiquetas por ground-truth de QA (aprobado/no aprobado)
-    y = []
-    for v in X:
-        y.append(0 if np.allclose(v, enriched_vector, atol=1e-8) else 1)
+    clf = RandomForestClassifier(n_estimators=50, random_state=42)
+
+    # Etiquetas dummy (idéntico o distinto)
+    y = [0 if np.allclose(v, enriched_vector, atol=1e-8) else 1 for v in X]
     clf.fit(Xs, y)
 
-    # ensamblar objeto a guardar (kmeans + scaler + clf)
+    # === Guardado del modelo híbrido ===
     model_obj = {"kmeans": kmeans, "scaler": scaler, "clf": clf}
     path = os.path.join(model_dir_for(app_name, tester_id, build_id, screen_id), "hybrid_incremental.joblib")
     save_model(model_obj, path)
-    logger.info("Saved incremental hybrid model: %s", path)
+    logger.info("💾 Saved incremental hybrid model: %s", path)
 
-    # Entrenar HMM si hay suficientes muestras y biblioteca disponible
+    # === HMM opcional ===
     if GaussianHMM is not None and len(X) >= MIN_HMM_SAMPLES:
         try:
             n_components = max(2, min(5, len(X) // 10))
@@ -1069,7 +932,7 @@ async def _train_incremental_logic_hybrid(
             save_model(hmm, os.path.join(model_dir_for(app_name, tester_id, build_id, screen_id), "hmm.joblib"))
             logger.info("Saved incremental HMM: %s", os.path.join(model_dir_for(app_name, tester_id, build_id, screen_id), "hmm.joblib"))
         except Exception as e:
-            logger.warning("HMM incremental failed: %s", e)
+            logger.warning(f"HMM incremental failed: {e}")
 
 async def _train_general_logic_hybrid(
     app_name: str,
@@ -1079,6 +942,7 @@ async def _train_general_logic_hybrid(
 ):
     """
     Entrena modelos generales por pantalla (solo si update_general=True).
+    Usa embeddings del SiameseEncoder si hay árboles disponibles.
     Guarda: models/{app}/general/{screen}/hybrid_general.joblib
     """
     if not update_general:
@@ -1090,56 +954,104 @@ async def _train_general_logic_hybrid(
         c.execute("""
             SELECT collect_node_tree, enriched_vector, screens_id
             FROM accessibility_data
-            WHERE collect_node_tree IS NOT NULL AND enriched_vector IS NOT NULL
+            WHERE collect_node_tree IS NOT NULL
             ORDER BY created_at DESC
             LIMIT ?
         """, (batch_size,))
         rows = c.fetchall()
 
-    # agrupar por pantalla
+    if not rows:
+        logger.warning("⚠️ No hay datos para entrenamiento general.")
+        return
+
+    # agrupar árboles y vectores por pantalla
     groups = {}
     for collect_node_tree, enriched_vec, screen_id in rows:
         if not screen_id:
             continue
+
+        entry = groups.setdefault(screen_id, {"trees": [], "vecs": []})
+
+        # árbol de accesibilidad
         try:
-            vec = json.loads(enriched_vec)
+            tree = json.loads(collect_node_tree)
+            if isinstance(tree, list):
+                entry["trees"].append(tree)
+        except Exception:
+            pass
+
+        # vector enriquecido
+        try:
+            if enriched_vec:
+                entry["vecs"].append(np.array(json.loads(enriched_vec), dtype=float).flatten())
         except Exception:
             continue
-        groups.setdefault(screen_id, []).append(np.array(vec, dtype=float).flatten())
 
-    for screen_id, vecs in groups.items():
-        # filtrar y normalizar longitud
-        if not vecs:
-            continue
-        EXPECTED_LEN = max(len(v) for v in vecs)
-        def pad(v):
-            if len(v) < EXPECTED_LEN:
-                return np.pad(v, (0, EXPECTED_LEN - len(v)))
-            return v[:EXPECTED_LEN]
-        X = np.array([pad(v) for v in vecs if np.count_nonzero(v) > 0])
-        X = np.unique(X, axis=0)
+    from SiameseEncoder import SiameseEncoder  # asegúrate de tenerlo global
+    siamese_model = SiameseEncoder()
+
+    # entrenar un modelo general por pantalla
+    for screen_id, data in groups.items():
+        trees = data["trees"]
+        vecs = data["vecs"]
+
+        X = None
+        # 1️⃣ intentar generar embeddings desde árboles
+        if trees:
+            try:
+                emb_batch = siamese_model.encode_batch(trees)
+                X = emb_batch.cpu().numpy()
+                logger.info(f"✅ Generados {len(X)} embeddings Siamese para screen {screen_id}")
+            except Exception as e:
+                logger.warning(f"Fallo al generar embeddings Siamese para {screen_id}: {e}")
+                X = None
+
+        # 2️⃣ fallback: usar enriched_vectors si no hay árboles válidos
+        if X is None or len(X) == 0:
+            if vecs:
+                X = np.array(vecs)
+                logger.debug(f"Usando enriched_vectors para screen {screen_id} ({len(X)} muestras)")
+            else:
+                logger.debug(f"No hay datos válidos para screen {screen_id}")
+                continue
+
+        # 3️⃣ limpieza
+        X = np.array([v for v in X if np.count_nonzero(v) > 0])
         if len(X) < min_samples:
+            logger.debug("No hay suficientes muestras para general: %s < %s", len(X), min_samples)
             continue
 
-        # entrenar KMeans + classifier
-        kmeans = MiniBatchKMeans(n_clusters=min(5, max(1, len(X))), random_state=42, batch_size=min(100, len(X)))
+        # 4️⃣ clustering + clasificador
+        kmeans = MiniBatchKMeans(
+            n_clusters=min(5, max(1, len(X))),
+            random_state=42,
+            batch_size=min(100, len(X))
+        )
         kmeans.fit(X)
+
         scaler = StandardScaler()
         Xs = scaler.fit_transform(X)
-        clf = RandomForestClassifier(n_estimators=100)
-        # etiqueta dummy: 0/1 unknown -> en producción reemplazar por ground truth
-        y = [0 if i == 0 else 1 for i in range(len(Xs))]
+
+        clf = RandomForestClassifier(n_estimators=100, random_state=42)
+        # etiquetas dummy (0/1 aleatorias o secuenciales)
+        y = [0 if i % 2 == 0 else 1 for i in range(len(Xs))]
         clf.fit(Xs, y)
 
         model_obj = {"kmeans": kmeans, "scaler": scaler, "clf": clf}
-        save_model(model_obj, os.path.join(model_dir_general(app_name, screen_id), "hybrid_general.joblib"))
-        logger.info("Saved general hybrid model for %s / screen %s", app_name, screen_id)
+        model_path = os.path.join(model_dir_general(app_name, screen_id), "hybrid_general.joblib")
+        save_model(model_obj, model_path)
+        logger.info("💾 Saved general hybrid model: %s", model_path)
 
-        # HMM general
+        # 5️⃣ HMM opcional
         if GaussianHMM is not None and len(X) >= MIN_HMM_SAMPLES:
             try:
                 n_components = max(2, min(5, len(X) // 10))
-                hmm = GaussianHMM(n_components=n_components, covariance_type="diag", n_iter=200, tol=1e-3)
+                hmm = GaussianHMM(
+                    n_components=n_components,
+                    covariance_type="diag",
+                    n_iter=200,
+                    tol=1e-3
+                )
                 hmm.fit(X)
                 save_model(hmm, os.path.join(model_dir_general(app_name, screen_id), "hmm.joblib"))
                 logger.info("Saved general HMM for %s / screen %s", app_name, screen_id)

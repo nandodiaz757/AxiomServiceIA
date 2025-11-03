@@ -78,6 +78,16 @@ class SiameseEncoder(nn.Module):
     #         emb = self.encoder(vec)
     #         emb = F.normalize(emb, p=2, dim=0)  # normaliza L2
     #     return emb
+    
+    def encode_batch(self, trees: list):
+        vecs = [self.tree_to_vector(t) for t in trees]
+        vecs = torch.tensor(vecs, dtype=torch.float32)
+        with torch.no_grad():
+            emb = self.encoder(vecs)
+            norms = emb.norm(p=2, dim=1, keepdim=True)
+            emb = torch.where(norms == 0, torch.zeros_like(emb), emb / norms)
+        return emb
+    
     def encode_tree(self, ui_tree):
         vec = torch.tensor(self.tree_to_vector(ui_tree), dtype=torch.float32)
 

@@ -3,7 +3,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from typing import Optional, Union, List, Dict, Any
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
-import sqlite3, json, joblib, numpy as np, os, hashlib, logging, asyncio, re, unicodedata
+import sqlite3, json, numpy as np, os, hashlib, logging, asyncio, re, unicodedata
+from joblib import dump, load
 from hmmlearn import hmm
 from hmmlearn.hmm import GaussianHMM
 from sklearn.preprocessing import MinMaxScaler
@@ -17,6 +18,7 @@ import random, time
 from PIL import Image
 from collections import Counter
 import math
+import uuid
 from sklearn.cluster import KMeans 
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics.pairwise import cosine_similarity
@@ -45,7 +47,8 @@ app = FastAPI()
 router = APIRouter() 
 siamese_model = None
 SIM_THRESHOLD = 0.90
-
+FLOW_MODEL_DIR = "models/flows"
+FLOW_MODELS = {}
 # Cargamos modelo siamés (una vez)
 
 
@@ -181,6 +184,15 @@ class SiameseEncoder(nn.Module):
             emb = self.encoder(vec)
             emb = F.normalize(emb, p=2, dim=0)  # normaliza L2
         return emb
+    
+    def load_app_flows(app_name: str):
+        path = os.path.join(FLOW_MODEL_DIR, f"{app_name}_flows.joblib")
+        if os.path.exists(path):
+            FLOW_MODELS[app_name] = load(path)
+            logger.info(f"💾 Modelo de flujos cargado en memoria para {app_name}")
+        else:
+            FLOW_MODELS[app_name] = {}
+            logger.info(f"⚠️ No hay modelo previo para {app_name}, se inicia vacío")
 
     # ----------------------------------------------------------
     # Forward siamés: compara dos árboles y devuelve similitud
@@ -377,6 +389,7 @@ def init_db():
             cluster_id INTEGER,
             is_stable INTEGER DEFAULT 0,
             anomaly_score REAL,
+            session_key TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -1125,6 +1138,7 @@ async def analyze_and_train(event: AccessibilityEvent):
     build_id = event.build_id
     header_text = event.header_text or ""
     global siamese_model
+    flow_trees = FLOW_MODELS.get(app_name, {})
     # -------------------- Árbol y firma ------------------------
     latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
     sig = stable_signature(latest_tree)
@@ -1346,16 +1360,16 @@ async def analyze_and_train(event: AccessibilityEvent):
         tester_id=tester_id,
         build_id=build_id,
         app_name=app_name,
-        screen_id=event.screens_id or s_name or "unknown_screen"
+        screen_id=event.screens_id or s_name or "unknown_screen",
+        use_general_as_base=True
     ))
 
     if TRAIN_GENERAL_ON_COLLECT:
-        await _train_incremental_logic_hybrid(
-            enriched_vector=emb_curr.flatten(),
-            tester_id="general",
-            build_id="latest",
+        await _train_general_logic_hybrid(
             app_name=app_name,
-            screen_id=event.screens_id or s_name or "unknown_screen"
+            batch_size=500,
+            min_samples=3,
+             update_general=True
         )
 
     # -------------------- 9. Guardar en screen_diffs --------------------
@@ -1445,6 +1459,42 @@ async def analyze_and_train(event: AccessibilityEvent):
             logger.info(f"🧩 Sin cambios detectados para {s_name}")
     except Exception as e:
         logger.exception(f"❌ Error guardando diff en screen_diffs: {e}")
+
+
+    # --------------------------------------
+    # 🔍 VALIDACIÓN DE FLUJOS DE NAVEGACIÓN
+    # --------------------------------------
+    from FlowValidator import (
+        validate_flow_sequence,
+        update_flow_trees_incremental,
+        build_flow_trees_from_db,
+        get_sequence_from_db
+    )
+
+    ENABLE_FLOW_VALIDATION = True  # puedes apagarlo según config
+
+    if ENABLE_FLOW_VALIDATION:
+        try:
+            # 1️⃣ Actualiza el modelo de flujos con la nueva sesión
+            update_flow_trees_incremental(app_name, event.session_key)
+
+            # 2️⃣ Recupera la secuencia completa de esa sesión
+            seq = get_sequence_from_db(event.session_key)
+            if len(seq) < 2:
+                logger.info(f"🔹 Secuencia demasiado corta para validar flujo: {seq}")
+            else:
+
+                flow_trees = FLOW_MODELS.get(app_name, {})
+                
+                result = validate_flow_sequence(flow_trees, seq)
+                if result["valid"]:
+                    logger.info(f"✅ Flujo válido: {seq}")
+                else:
+                    logger.warning(f"⚠️ Flujo anómalo ({result['reason']}) → {seq}")
+
+        except Exception as e:
+            logger.error(f"Error al validar flujo: {e}")
+
 
 
     # -------------------- 8. Retornar métricas --------------------
@@ -1578,12 +1628,17 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
         normalized_nodes = normalize_tree(raw_nodes)
         signature = stable_signature(raw_nodes)
         norm = _normalize_event_fields(event)
-
         tester_norm = norm.get("tester_id_norm")
         build_norm = norm.get("build_id_norm")
         screen_name = event.screen_names or ""
         header_text = event.header_text or ""
         screens_id_val = event.screens_id or norm.get("screensId") or None
+
+
+        # -------------------- 🧠 Generar o recuperar session_key --------------------
+        base = tester_norm or getattr(event, "tester_id", "anon")
+        minute_block = int(time.time() // 60)
+        event.session_key = getattr(event, "session_key", None) or f"{base}_{minute_block}"
 
         # Class raíz
         if normalized_nodes and isinstance(normalized_nodes, list):
@@ -1652,8 +1707,8 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
                         tester_id, build_id, timestamp, event_type, event_type_name,
                         package_name, class_name, text, content_description, screens_id,
                         screen_names, header_text, collect_node_tree, signature,
-                        additional_info, tree_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        additional_info, tree_data, session_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     tester_norm, build_norm, event.timestamp, event.event_type,
                     event.event_type_name, event.package_name, root_class_name,
@@ -1662,7 +1717,8 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
                     json.dumps(normalized_nodes, ensure_ascii=False),
                     signature,
                     json.dumps(event.additional_info or {}, ensure_ascii=False),
-                    json.dumps(event.tree_data or [], ensure_ascii=False)
+                    json.dumps(event.tree_data or [], ensure_ascii=False),
+                    event.session_key
                 ))
                 conn.commit()
             logger.info("[collect] Insert completado (nuevo build o cambios detectados).")

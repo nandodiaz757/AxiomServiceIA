@@ -12,35 +12,6 @@ from SiameseEncoder import SiameseEncoder  # tu clase encoder
 
 DB_NAME = "accessibility.db"  # 👈 ajusta si tu base de datos tiene otro nombre
 
-# def ensure_mock_data():
-#     with sqlite3.connect(DB_NAME) as conn:
-#         conn.execute("""
-#             CREATE TABLE IF NOT EXISTS accessibility_data (
-#                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-#                 collect_node_tree TEXT,
-#                 build_id TEXT,
-#                 header_text TEXT,
-#                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-#             );
-#         """)
-#         # Agregar datos falsos si la tabla está vacía
-#         count = conn.execute("SELECT COUNT(*) FROM accessibility_data").fetchone()[0]
-#         if count == 0:
-#             print("⚙️ Insertando datos de ejemplo...")
-#             sample_tree = json.dumps([{"text": "Botón OK", "class": "Button"}])
-#             for i in range(10):
-#                 conn.execute("""
-#                     INSERT INTO accessibility_data (collect_node_tree, build_id, header_text)
-#                     VALUES (?, ?, ?)
-#                 """, (sample_tree, f"build_{i//2}", f"Pantalla {i//3}"))
-#             conn.commit()
-#             print("✅ Datos de ejemplo insertados.")
-
-# Llamar antes de cargar pares
-# ensure_mock_data()
-# only dev environment
-
-
 
 # ---------------------------------------------------------------------
 # Función para obtener pares (árbol_A, árbol_B, etiqueta)
