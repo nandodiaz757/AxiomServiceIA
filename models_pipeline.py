@@ -20,6 +20,7 @@ import logging
 from difflib import SequenceMatcher
 from SiameseEncoder import SiameseEncoder
 import difflib
+ 
 
 # HMM
 try:
@@ -65,6 +66,16 @@ def load_general_model(app_name: str, screen_id: str):
     path = os.path.join(model_dir_general(app_name, screen_id), "hybrid_general.joblib")
     return load_model(path)
 
+def normalize_class_name(cls):
+    """Normaliza nombres de clase para evitar duplicaciones entre Compose y Views."""
+    if not cls:
+        return ""
+    if "ComposeView" in cls:
+        return "ComposeContainer"
+    if "ViewFactoryHolder" in cls:
+        return "ComposeInterop"
+    return cls
+
 # ----------------------------
 # Feature extraction helpers
 # ----------------------------
@@ -95,6 +106,7 @@ def flatten_tree(tree):
 
 def normalize_node(node: dict) -> dict:
     # Mantén la lógica de normalización que ya tienes (SAFE_KEYS, tipos, etc.)
+    node["className"] = normalize_class_name(node.get("className"))
     SAFE_KEYS = [
         "viewId", "className", "headerText", "text", "contentDescription", "desc", "hint",
         "checked", "enabled", "focusable", "clickable", "selected", "scrollable",
@@ -103,6 +115,7 @@ def normalize_node(node: dict) -> dict:
     ]
     BOOL_FIELDS = {"checked", "enabled", "focusable", "clickable", "selected", "scrollable", "password", "pressed", "activated", "visible"}
     NUM_FIELDS = {"progress", "max", "value", "rating", "level"}
+    
 
     normalized = {}
     for k in SAFE_KEYS:
@@ -236,15 +249,36 @@ def make_key(n):
     return key
 
 def overlap_ratio(old_nodes, new_nodes):
-    # texto simple overlap
-    old_texts = {normalize_node(n).get("text","").strip().lower() for n in old_nodes if normalize_node(n).get("text")}
-    new_texts = {normalize_node(n).get("text","").strip().lower() for n in new_nodes if normalize_node(n).get("text")}
+    def extract_texts(nodes):
+        texts = set()
+        for n in nodes:
+            nn = normalize_node(n)
+            txt = (nn.get("text") or "").strip().lower()
+            if txt:
+                texts.add(txt)
+        return texts
+
+    old_texts = extract_texts(old_nodes)
+    new_texts = extract_texts(new_nodes)
 
     if not old_texts and not new_texts:
         return 1.0
+
     inter = len(old_texts & new_texts)
     union = len(old_texts | new_texts)
     return inter / max(union, 1)
+
+
+# def overlap_ratio(old_nodes, new_nodes):
+#     # texto simple overlap
+#     old_texts = {normalize_node(n).get("text","").strip().lower() for n in old_nodes if normalize_node(n).get("text")}
+#     new_texts = {normalize_node(n).get("text","").strip().lower() for n in new_nodes if normalize_node(n).get("text")}
+
+#     if not old_texts and not new_texts:
+#         return 1.0
+#     inter = len(old_texts & new_texts)
+#     union = len(old_texts | new_texts)
+#     return inter / max(union, 1)
 
 def to_bool(val):
     """
@@ -265,36 +299,119 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
     """
     Compare two accessibility trees with high sensitivity to ANY textual/node change.
     Integrates hybrid model feedback (incremental or general) controlled by use_general flag.
+    Early pre-check uses global_signature and partial_signature.
     """
 
-    # 🔹 Filtrar nodos efímeros ANTES de indexar
+    old_tree = ensure_list(old_tree)
+    new_tree = ensure_list(new_tree)
+
+    from backend import stable_signature 
+    # ---------------------------
+    # 🔹 Detección rápida por firma global / parcial
+    # ---------------------------
+    old_sig = stable_signature(old_tree)
+    new_sig = stable_signature(new_tree)
+
+    # if old_sig["global_signature"] == new_sig["global_signature"]:
+    #     logger.info("💡 No hay cambios globales (estructura UI idéntica).")
+    #     if old_sig["partial_signature"] == new_sig["partial_signature"]:
+    #         # Nada cambió ni en layout ni en contenido clave
+    #         return {
+    #             "removed": [], "added": [], "modified": [],
+    #             "text_diff": {"removed_texts": [], "added_texts": [], "overlap_ratio": 1.0},
+    #             "structure_similarity": 1.0,
+    #             "has_changes": False,
+    #             "signature_check": "identical",
+    #             "signatures": {"old": old_sig, "new": new_sig}
+    #         }
+    #     else:
+    #         logger.info("⚠️ Mismo layout global pero distinto contenido parcial. Continuando análisis fino...")
+    # else:
+    #     logger.info("🔄 Cambio de firma global detectado → posible cambio de pantalla completa.")
+
+
+     # 🔹 Filtrar nodos efímeros ANTES de indexar
     EPHEMERAL_CLASSES = {
         "android.view.View",
         "android.widget.FrameLayout",
         "androidx.compose.ui.platform.ComposeView",
         "androidx.compose.ui.viewinterop.ViewFactoryHolder",
+        "androidx.compose.ui.node.ComposeNode",
+        "androidx.compose.ui.platform.AbstractComposeView",
     }
 
-    def filter_ephemeral_nodes(tree):
-        """Elimina nodos efímeros que no afectan la UI visible."""
-        return [
-            n for _, n in flatten_tree(tree)
-            if not (
-                n.get("className") in EPHEMERAL_CLASSES
-                and not (n.get("text") or n.get("contentDescription"))
-            )
-        ]
+    COMPOSE_PREFIXES = (
+        "androidx.compose.",
+        "com.google.accompanist.",
+    )
 
-    old_tree = ensure_list(old_tree)
-    new_tree = ensure_list(new_tree)
+
+    def filter_ephemeral_nodes(tree):
+        """Elimina nodos efímeros que no afectan la UI visible, pero mantiene los Compose visibles."""
+        filtered = []
+        for _, n in flatten_tree(tree):
+            cls = n.get("className", "")
+            has_visible_info = bool(n.get("text") or n.get("contentDescription") or n.get("stateDescription"))
+            # Si es Compose y tiene semántica, no lo elimines
+            if is_compose_node(n) and has_visible_info:
+                filtered.append(n)
+            elif cls in EPHEMERAL_CLASSES and not has_visible_info:
+                continue
+            else:
+                filtered.append(n)
+        return filtered
+
+    # def filter_ephemeral_nodes(tree):
+    #     """Elimina nodos efímeros que no afectan la UI visible."""
+    #     return [
+    #         n for _, n in flatten_tree(tree)
+    #         if not (
+    #             n.get("className") in EPHEMERAL_CLASSES
+    #             and not (n.get("text") or n.get("contentDescription"))
+    #         )
+    #     ]
 
     old_tree = preprocess_tree(old_tree)
     new_tree = preprocess_tree(new_tree)
 
-    old_tree = filter_ephemeral_nodes(old_tree)
-    new_tree = filter_ephemeral_nodes(new_tree)
+    # 🔹 Aplanar una sola vez para todo el análisis
+    flat_old = flatten_tree(old_tree)
+    flat_new = flatten_tree(new_tree)
 
-    if not old_tree:
+    # filtered_old_nodes = filter_ephemeral_nodes(old_tree)
+    # filtered_new_nodes = filter_ephemeral_nodes(new_tree)
+
+
+    # old_tree = filter_ephemeral_nodes(old_tree)
+    # new_tree = filter_ephemeral_nodes(new_tree)
+
+    # if not filtered_old_nodes:
+    #     logger.info("No previous snapshot - base initial")
+    #     return {
+    #         "removed": [], "added": [], "modified": [],
+    #         "text_diff": {"removed_texts": [], "added_texts": [], "overlap_ratio": 1.0},
+    #         "structure_similarity": 1.0,
+    #         "has_changes": True  # new snapshot counts as change
+    #     }
+
+        # 🔹 Filtrar nodos efímeros sobre las listas aplanadas
+    filtered_old_nodes = [
+        n for _, n in flat_old
+        if not (
+            n.get("className") in EPHEMERAL_CLASSES and
+            not (n.get("text") or n.get("contentDescription"))
+        )
+    ]
+    filtered_new_nodes = [
+        n for _, n in flat_new
+        if not (
+            n.get("className") in EPHEMERAL_CLASSES and
+            not (n.get("text") or n.get("contentDescription"))
+        )
+    ]
+
+    # 🔹 Si no hay snapshot previo válido
+    if not filtered_old_nodes:
         logger.info("No previous snapshot - base initial")
         return {
             "removed": [], "added": [], "modified": [],
@@ -303,19 +420,50 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
             "has_changes": True  # new snapshot counts as change
         }
 
-    # ---------------- index trees (keys)
-    old_idx = {}
-    for path, node in flatten_tree(old_tree):
-        old_idx[make_key(node)] = normalize_node(node)
 
-    new_idx = {}
-    for path, node in flatten_tree(new_tree):
-        new_idx[make_key(node)] = normalize_node(node)
+    # ---------------- index trees (keys)
+
+    for i, n in enumerate(filtered_old_nodes[:10]):
+        if not isinstance(n, dict):
+            print(f"⚠️ old_tree[{i}] no es dict, es {type(n).__name__}: {str(n)[:120]}")
+
+    for i, n in enumerate(filtered_new_nodes[:10]):
+        if not isinstance(n, dict):
+            print(f"⚠️ new_tree[{i}] no es dict, es {type(n).__name__}: {str(n)[:120]}")
+
+    old_idx = {make_key(n): normalize_node(n) for n in filtered_old_nodes}
+    new_idx = {make_key(n): normalize_node(n) for n in filtered_new_nodes}
+
+    print(f"\n📊 Total nodos old={len(old_idx)}, new={len(new_idx)}")
+    print(f"🔑 Ejemplo claves old: {list(old_idx.keys())[:5]}")
+    print(f"🔑 Ejemplo claves new: {list(new_idx.keys())[:5]}")
+
+    common_keys = set(old_idx.keys()) & set(new_idx.keys())
+    removed_keys = set(old_idx.keys()) - set(new_idx.keys())
+    added_keys = set(new_idx.keys()) - set(old_idx.keys())
+
+    print(f"➡️ Common: {len(common_keys)}, Added: {len(added_keys)}, Removed: {len(removed_keys)}")
+
+    if removed_keys:
+        print("❌ Removed keys (sample):", list(removed_keys)[:3])
+    if added_keys:
+        print("🆕 Added keys (sample):", list(added_keys)[:3])
+
+    # old_idx = {}
+    # for path, node in flatten_tree(old_tree):
+    #     old_idx[make_key(node)] = normalize_node(node)
+
+    # new_idx = {}
+    # for path, node in flatten_tree(new_tree):
+    #     new_idx[make_key(node)] = normalize_node(node)
 
     # debug text overlap raw
-    old_nodes = [n for _, n in flatten_tree(old_tree)]
-    new_nodes = [n for _, n in flatten_tree(new_tree)]
-    text_overlap_raw = overlap_ratio(old_nodes, new_nodes)
+    # old_nodes = [n for _, n in flatten_tree(old_tree)]
+    # new_nodes = [n for _, n in flatten_tree(new_tree)]
+
+    # text_overlap_raw = overlap_ratio(old_nodes, new_nodes)
+    text_overlap_raw = overlap_ratio(filtered_old_nodes, filtered_new_nodes)
+
 
     # added / removed
     added = [{"node": {"key": k, "class": v.get("className")}, "changes": {}} for k, v in new_idx.items() if k not in old_idx]
@@ -334,10 +482,13 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
     ignored_changes = []
 
     for k, nn in new_idx.items():
+        changes = {}
+        
         if k in old_idx:
             oldn = old_idx[k]
             changes = {}
-
+            print(f"\n🔍 Comparando nodo {k}")
+            print(f"    ↳ old_text={oldn.get('text')} | new_text={nn.get('text')}")
             print(f"\n🔹 Comparando nodo: {k} ({nn.get('className')})")
 
             for f in TEXT_FIELDS + BOOL_FIELDS + NUM_FIELDS + OTHER_FIELDS + VISUAL_FIELDS:
@@ -348,6 +499,8 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
                     old_val, new_val = to_bool(old_val), to_bool(new_val)
 
                 if old_val != new_val:
+                    print(f"    ⚠️ Campo distinto: {f}  ({old_val} → {new_val})")
+
                     # si es campo efímero y no relevante, lo ignoramos como cambio funcional
                     if f in IGNORED_STATE_FIELDS and old_val is False and new_val is True:
                         ignored_changes.append((nn.get("className"), f, (old_val, new_val)))
@@ -356,6 +509,56 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
                         changes[f] = {"old": old_val, "new": new_val}
                         #print(f"✅ Cambio detectado {f}: {old_val} → {new_val}")
                     # --- chequeo extra para CheckBox y Switch ---
+
+                
+                if old_val != new_val:
+                    print(f"    ⚠️ Campo distinto 2: {f}  ({old_val} → {new_val})")
+
+                    cls = nn.get("className", "")
+                    is_compose = cls.startswith("androidx.compose") or "compose" in cls.lower()
+
+                    # 🔸 Caso 1: Vista clásica → ignora cambios efímeros (enabled, focusable, etc.)
+                    if not is_compose and f in IGNORED_STATE_FIELDS and old_val is False and new_val is True:
+                        ignored_changes.append((cls, f, (old_val, new_val)))
+                        #print(f"⚠️ Ignorado (efímero View) {f}: {old_val} → {new_val}")
+
+                    # 🔸 Caso 2: Compose → conserva incluso cambios en campos efímeros
+                    elif is_compose and f in IGNORED_STATE_FIELDS:
+                        changes[f] = {"old": old_val, "new": new_val}
+                        #print(f"✅ Cambio Compose significativo {f}: {old_val} → {new_val}")
+
+                    # 🔸 Caso 3: Resto de campos normales (texto, checked, etc.)
+                    else:
+                        changes[f] = {"old": old_val, "new": new_val}
+                        #print(f"✅ Cambio detectado {f}: {old_val} → {new_val}")
+
+                # def is_compose_class(cls: str) -> bool:
+                #     cls = (cls or "").lower()
+                #     return (
+                #         "androidx.compose" in cls or
+                #         "composeview" in cls or
+                #         "viewfactoryholder" in cls
+                #     )
+
+                # if old_val != new_val:
+                #     cls = nn.get("className", "")
+
+                #     if is_compose_class(cls):
+                #         # Jetpack Compose → no ignorar cambios efímeros
+                #         changes[f] = {"old": old_val, "new": new_val}
+                #         #print(f"✅ Compose change {f}: {old_val} → {new_val}")
+
+                #     elif f in IGNORED_STATE_FIELDS and old_val is False and new_val is True:
+                #         # Views clásicas → ignorar efímeros
+                #         ignored_changes.append((cls, f, (old_val, new_val)))
+                #         #print(f"⚠️ Ignorado (efímero View) {f}: {old_val} → {new_val}")
+
+                #     else:
+                #         # Caso normal
+                #         changes[f] = {"old": old_val, "new": new_val}
+                #         #print(f"✅ Cambio detectado {f}: {old_val} → {new_val}")
+                # --- Fin del bloque de comparación de campos -
+
             if nn.get("className") in ("android.widget.CheckBox", "android.widget.Switch"):
                 print(f"[DEBUG CHECKED ATTR] oldn={oldn.get('checked')} | nn={nn.get('checked')}")
                 old_checked = to_bool(oldn.get("checked", False))
@@ -518,27 +721,62 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
                     changes["rating"] = {"old": old_rating, "new": new_rating}
                     print(f"✅ Cambio RATING detectado (RatingBar): {old_rating} → {new_rating}")        
 
-            if changes:
-                modified.append({"node": {"key": k, "class": nn.get("className")}, "changes": changes})
-                #print(f"🔹 Nodo modificado registrado: {changes}")
+        if changes:
+            modified.append({"node": {"key": k, "class": nn.get("className")}, "changes": changes})
+            #print(f"🔹 Nodo modificado registrado: {changes}")
 
     # detectar cambios de texto entre removed/added (moved text)
 
 
-        # ---------------------------------------------------------
+    # ---------------------------------------------------------
     # 🔹 Detección de cambios de texto entre nodos (versión semántica)
     # ---------------------------------------------------------
     
+    # def extract_text_from_key(key: str) -> str:
+    #     if not key:
+    #         return ""
+    #     parts = key.split("|")
+    #     for p in parts:
+    #         if "text:" in p:
+    #             return p.split("text:")[-1].strip()
+    #     if len(parts) > 1 and len(parts[-1]) > 2:
+    #         return parts[-1].strip()
+    #     return ""
+
     def extract_text_from_key(key: str) -> str:
+        """Extrae el texto representativo de un nodo (tanto Views como Compose)."""
         if not key:
             return ""
+        
         parts = key.split("|")
+        candidates = []
+
         for p in parts:
+            p = p.strip()
+            # Android clásico
             if "text:" in p:
-                return p.split("text:")[-1].strip()
-        if len(parts) > 1 and len(parts[-1]) > 2:
-            return parts[-1].strip()
+                candidates.append(p.split("text:")[-1].strip())
+            elif "contentDescription:" in p:
+                candidates.append(p.split("contentDescription:")[-1].strip())
+            elif "hint:" in p:
+                candidates.append(p.split("hint:")[-1].strip())
+            # Jetpack Compose
+            elif "stateDescription:" in p:
+                candidates.append(p.split("stateDescription:")[-1].strip())
+            elif "label:" in p:
+                candidates.append(p.split("label:")[-1].strip())
+            elif "role:" in p:
+                candidates.append(p.split("role:")[-1].strip())
+            elif "testTag:" in p:
+                candidates.append(p.split("testTag:")[-1].strip())
+
+        # Devolver el más significativo
+        for c in candidates:
+            if c and c.lower() not in {"", "null", "none"}:
+                return c
+
         return ""
+
 
     def literal_similarity(a: str, b: str) -> float:
         """Similitud literal rápida"""
@@ -752,13 +990,13 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
                 else:
                     logger.warning(f"Error general al predecir modelo híbrido: {e}")
 
-                # si el modelo es HMM (caso especial)
-                if GaussianHMM is not None and isinstance(model, GaussianHMM):
-                    score = float(model.score(feat))
-                    pred = "hmm_score"
-                    conf = score
-                else:
-                    logger.warning(f"Error general al predecir modelo híbrido: {e}")
+                # # si el modelo es HMM (caso especial)
+                # if GaussianHMM is not None and isinstance(model, GaussianHMM):
+                #     score = float(model.score(feat))
+                #     pred = "hmm_score"
+                #     conf = score
+                # else:
+                #     logger.warning(f"Error general al predecir modelo híbrido: {e}")
             model_prediction = pred
             model_confidence = conf
 

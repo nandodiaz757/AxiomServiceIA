@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPException, Depends, WebSocket, Body
+from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPException, Depends, WebSocket, Body, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from typing import Optional, Union, List, Dict, Any
@@ -11,11 +11,13 @@ from sklearn.preprocessing import MinMaxScaler
 from fastapi.responses import JSONResponse
 from fastapi_utils.tasks import repeat_every
 from diff_model.predict_diff import router as diff_router
-from datetime import datetime
+from datetime import datetime, timedelta  
+from contextlib import asynccontextmanager
 from email_service import send_email
 from reset_service import generate_code, validate_code
 import random, time
 from PIL import Image
+import asyncio
 from collections import Counter
 import math
 import uuid
@@ -35,6 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from SiameseEncoder import SiameseEncoder
+from contextvars import ContextVar
 
 
 
@@ -51,6 +54,11 @@ FLOW_MODEL_DIR = "models/flows"
 FLOW_MODELS = {}
 # Cargamos modelo siamés (una vez)
 
+event_queue: asyncio.Queue = asyncio.Queue()
+BATCH_SIZE = 10           # número máximo de eventos por batch
+BATCH_INTERVAL = 2        # tiempo máximo de espera en segundos antes de procesar batch
+last_processed = {}
+DEBOUNCE_TIME = 2
 
 if 'kmeans_model' not in globals():
     kmeans_model = KMeans(n_clusters=5)
@@ -85,6 +93,18 @@ IGNORED_NODE_SUFFIXES = [
     "|checked:False",
     "|selected:False",
 ]
+
+class TrainModeRequest(BaseModel):
+    train_general: bool
+    app_name: str
+    tester_id: str | None = None
+    build_id: str | None = None
+    screen_id: str | None = None
+    enriched_vector: list[float] | None = None
+
+
+semantic_screen_id_ctx = ContextVar("screen_id_final", default=None)
+semantic_screen_id_ctf = ContextVar("screen_id_final", default=None)
 
 last_ui_structure_similarity = 0.0
 
@@ -179,7 +199,8 @@ class SiameseEncoder(nn.Module):
     # Encodea un árbol a embedding
     # ----------------------------------------------------------
     def encode_tree(self, ui_tree):
-        vec = torch.tensor(self.tree_to_vector(ui_tree), dtype=torch.float32)
+        #vec = torch.tensor(self.tree_to_vector(ui_tree), dtype=torch.float32)
+        vec = torch.from_numpy(np.array(self.tree_to_vector(ui_tree), dtype=np.float32))
         with torch.no_grad():
             emb = self.encoder(vec)
             emb = F.normalize(emb, p=2, dim=0)  # normaliza L2
@@ -217,38 +238,863 @@ class SiameseEncoder(nn.Module):
         model.load_state_dict(torch.load(path, map_location="cpu"))
         return model
     
-@app.on_event("startup")
-async def startup_event():
-    """Carga inicial del modelo al arrancar el servidor."""
+ 
+
+# ==========================================
+# FUNCIONES AUXILIARES
+# ==========================================
+# async def worker_process_queue():
+#     while True:
+#         # Aquí procesas eventos de tu cola
+#         await asyncio.sleep(1)  # evita bloqueo total
+
+
+
+
+# # --- mapeos multilenguaje / canonical labels ---
+# CANONICAL = {
+#     # home / inicio
+#     "home": {"home", "inicio", "inicio.", "home_page"},
+#     # account / cuenta / profile
+#     "account": {"account", "cuenta", "perfil", "profile", "account_settings"},
+#     # favorites
+#     "favorites": {"favorites", "favoritos", "mis_favoritos", "mis favoritos", "favorito"},
+#     # offers
+#     "offers": {"offers", "ofertas", "promociones"},
+#     # search
+#     "search": {"search", "buscar", "busqueda", "buscar productos"},
+#     # cart / checkout
+#     "cart": {"cart", "carrito", "checkout", "pagar", "pago"},
+#     # orders / pedidos
+#     "orders": {"orders", "pedidos", "mis pedidos"},
+#     # login
+#     "login": {"login", "iniciar_sesion", "iniciar sesión", "sign_in"},
+#     # settings
+#     "settings": {"settings", "ajustes", "configuracion", "configuración"},
+#     # social
+#     "social": {"social", "sociales"},
+#     # help
+#     "help": {"help", "ayuda", "soporte"},
+# }
+
+# # invertir para lookup rápido
+# _CANON_LOOKUP = {}
+# for k, s in CANONICAL.items():
+#     for v in s:
+#         _CANON_LOOKUP[v] = k
+
+# # palabras/ruido a ignorar en headers (multilenguaje)
+# NOISE_PREFIXES = {"¡", "!", "(", "["}
+# DYNAMIC_PATTERNS = [
+#     r"https?://",  # urls
+#     r"\d{2,}",     # números largos (ids, timestamps)
+#     r"%",          # porcentajes
+# ]
+
+# # features template (mantener estructura)
+# DEFAULT_FEATURES = {
+#     # Android clásico
+#     "Button": 0, "MaterialButton": 0, "ImageButton": 0, "EditText": 0, "TextView": 0,
+#     "ImageView": 0, "CheckBox": 0, "RadioButton": 0, "Switch": 0, "Spinner": 0,
+#     "SeekBar": 0, "ProgressBar": 0, "RecyclerView": 0, "ListView": 0, "ScrollView": 0,
+#     "LinearLayout": 0, "RelativeLayout": 0, "ConstraintLayout": 0, "FrameLayout": 0,
+#     "CardView": 0,
+#     # Compose
+#     "ComposeView": 0, "Text": 0, "ButtonComposable": 0,
+#     # Híbridas / RN / Flutter / Ionic
+#     "RCTView": 0, "RCTText": 0, "RCTImageView": 0, "FlutterView": 0,
+#     "WebView": 0, "IonContent": 0, "IonButton": 0, "IonInput": 0,
+# }
+
+# # util: slugify / normalize (quita acentos y no-alfanum)
+# def slugify(text):
+#     if not text:
+#         return ""
+#     text = unicodedata.normalize("NFKD", text)
+#     text = "".join(ch for ch in text if not unicodedata.combining(ch))
+#     text = text.lower()
+#     text = re.sub(r"[^a-z0-9\s/_-]", "", text)
+#     text = re.sub(r"\s+", "_", text).strip("_")
+#     return text or ""
+
+# def looks_dynamic(txt):
+#     if not txt:
+#         return False
+#     t = txt.lower()
+#     if any(t.startswith(p) for p in NOISE_PREFIXES):
+#         return True
+#     for pat in DYNAMIC_PATTERNS:
+#         if re.search(pat, t):
+#             return True
+#     return False
+
+# def canonical_map(text):
+#     """Devuelve la etiqueta canonical si coincide con un conjunto de sinónimos."""
+#     if not text:
+#         return None
+#     t = slugify(text).replace("_", "")
+#     # buscar coincidencia por subcadena con los lookup keys
+#     for k in _CANON_LOOKUP:
+#         if k in t:
+#             return _CANON_LOOKUP[k]
+#     return None
+
+# # ========================
+# # Función principal
+# # ========================
+# def extract_semantic_screen_id(raw_nodes, *, return_components=False):
+#     """
+#     Genera un screen_id semántico y estable a partir de raw_nodes.
+#     - raw_nodes: lista de dicts tal como la tuya.
+#     - return_components: si True devuelve (screen_id, components_dict)
+#     """
+#     if not raw_nodes:
+#         return ("unknown_screen", {}) if return_components else "unknown_screen"
+
+#     # copia features
+#     features = dict(DEFAULT_FEATURES)
+
+#     texts = []          # textos detectados (tuplas (index, text, className, desc, selected_flag))
+#     nav_candidates = [] # (index, text)
+#     indices_map = []    # para posición
+
+#     # flags framework / ui
+#     frameworks = {"compose": False, "flutter": False, "reactnative": False, "webview": False, "ionic": False, "native": False}
+#     ui = {"bottomnav": False, "tabs": False, "modal": False, "scroll": False, "list": False, "form": False}
+
+#     for idx, node in enumerate(raw_nodes):
+#         cls = (node.get("className") or "").strip()
+#         cls_low = cls.lower()
+#         txt = (node.get("text") or "") or (node.get("desc") or "")
+#         txt = txt.strip() if txt else ""
+#         selected = node.get("selected") or node.get("checked") or False
+#         xpath = node.get("xpath") or ""
+#         signature = (node.get("signature") or "").lower()
+
+#         # recolectar textos "útiles"
+#         if txt and not looks_dynamic(txt) and len(txt) > 1:
+#             texts.append((idx, txt, cls, node.get("desc")))
+
+#         # detectar labels de navegación (multilenguaje)
+#         candidate = slugify(txt).replace("_", "")
+#         if candidate in _CANON_LOOKUP:
+#             nav_candidates.append((idx, txt))
+
+#         # framework detection
+#         if "compose" in cls_low or "composeview" in cls_low:
+#             frameworks["compose"] = True
+#         if "flutter" in cls_low or "flutterview" in cls_low or "flutter" in signature:
+#             frameworks["flutter"] = True
+#         if cls_low.startswith("rct") or "reactnative" in cls_low or "rct" in signature:
+#             frameworks["reactnative"] = True
+#         if "webview" in cls_low or "html" in cls_low or "web" in signature:
+#             frameworks["webview"] = True
+#         if "ion" in cls_low or "ionic" in signature:
+#             frameworks["ionic"] = True
+
+#         # simple fallback: si ninguno detectado, será native
+#         # (lo seteamos al final si todos son False)
+#         # ui pattern heuristics
+#         if "scroll" in cls_low or "recycler" in cls_low or "listview" in cls_low or "recyclerview" in cls_low or "lazycolumn" in cls_low:
+#             ui["scroll"] = True
+#         if "recycler" in cls_low or "listview" in cls_low or "recyclerview" in cls_low or "collection" in signature:
+#             ui["list"] = True
+#         if "edittext" in cls_low or "input" in cls_low or "textbox" in cls_low:
+#             ui["form"] = True
+#         if "dialog" in cls_low or "popup" in cls_low or "alert" in cls_low:
+#             ui["modal"] = True
+#         if "tab" in cls_low or "tablayout" in cls_low or "viewpager" in cls_low:
+#             ui["tabs"] = True
+
+#         # features counting (si clase contiene key)
+#         for f in list(features.keys()):
+#             if f.lower() in cls_low:
+#                 features[f] = features.get(f, 0) + 1
+
+#     # if no specific framework flagged, assume native
+#     if not any(frameworks.values()):
+#         frameworks["native"] = True
+
+#     # --- Bottom nav detection robusta ---
+#     # heurística:
+#     #  - si hay >=3 nav candidates -> bottomnav True
+#     #  - si alguno de esos nav candidates aparece con selected=True -> pick it
+#     #  - si nav candidates aparecen en indices cercanos al final del tree -> bottomnav True
+#     bottom_tab = None
+#     if len(nav_candidates) >= 3:
+#         ui["bottomnav"] = True
+#         # elegir el candidato "activo": el que tenga selected o el más cercano al final
+#         selected_candidates = []
+#         for idx, txt in nav_candidates:
+#             node = raw_nodes[idx]
+#             if node.get("selected") or node.get("checked"):
+#                 selected_candidates.append((idx, txt))
+#         if selected_candidates:
+#             bottom_tab = selected_candidates[0][1]
+#         else:
+#             # tomar el de mayor indice (más abajo en el árbol)
+#             idx_sorted = sorted(nav_candidates, key=lambda x: x[0], reverse=True)
+#             bottom_tab = idx_sorted[0][1]
+
+#     else:
+#         # fallback: si header coincide con a canonical nav label, treat as bottom (ej: "Cuenta")
+#         # o si vemos varios labels del conjunto en el entire texts (aunque <3), assum bottom
+#         all_texts_lower = [slugify(t[1]).replace("_", "") for t in texts]
+#         found_navs = [t for t in all_texts_lower if t in _CANON_LOOKUP]
+#         if len(found_navs) >= 2:
+#             ui["bottomnav"] = True
+#             # pick last occurrence in texts
+#             for idx, txt, *_ in reversed(texts):
+#                 s = slugify(txt).replace("_", "")
+#                 if s in _CANON_LOOKUP:
+#                     bottom_tab = txt
+#                     break
+
+#     # --- Elección del text semántico (header) ---
+#     semantic_name = None
+#     # 1) Prefer text nodes that look like headers: TextView, large texts, not nav labels
+#     header_candidates = []
+#     for idx, txt, cls, desc in texts:
+#         cls_low = (cls or "").lower()
+#         # penalizar si parece nav label
+#         key = slugify(txt).replace("_", "")
+#         is_nav_label = key in _CANON_LOOKUP
+#         score = 0
+#         # prefer TextView / Title-like classes
+#         if "textview" in cls_low or "text" in cls_low:
+#             score += 3
+#         # prefer nodes that appear early (headers typically near top)
+#         score += max(0, 10 - idx // 20)
+#         # length bonus (titles no muy largas, pero más representativo)
+#         score += min(5, len(txt) // 10)
+#         if is_nav_label:
+#             score -= 5
+#         if not looks_dynamic(txt):
+#             header_candidates.append((score, idx, txt))
+
+#     if header_candidates:
+#         header_candidates.sort(reverse=True)  # highest score first
+#         # top candidate
+#         semantic_name = header_candidates[0][2]
+
+#     # 2) fallback: if none, use bottom_tab if exists
+#     if not semantic_name and bottom_tab:
+#         semantic_name = bottom_tab
+
+#     # 3) fallback: longest text
+#     if not semantic_name:
+#         all_text_raw = [t[1] for t in texts]
+#         if all_text_raw:
+#             semantic_name = max(all_text_raw, key=len)
+#         else:
+#             semantic_name = "screen"
+
+#     # normalize semantic_name
+#     sem_slug = slugify(semantic_name)
+#     # try canonical mapping to group synonyms across languages
+#     canonical = canonical_map(semantic_name)
+#     if canonical:
+#         sem_key = canonical
+#     else:
+#         sem_key = sem_slug or "screen"
+
+#     # --- construir jerarquía:
+#     # si bottomnav detected, base path = canonical(bottom_tab) or slug(bottom_tab)
+#     path_parts = []
+#     if ui["bottomnav"] and bottom_tab:
+#         bcanon = canonical_map(bottom_tab) or slugify(bottom_tab)
+#         path_parts.append(str(bcanon))
+#         # sub-level: semantic (if semantic different from bottom)
+#         if sem_key and sem_key != bcanon:
+#             path_parts.append(sem_key)
+#     else:
+#         # cuando no hay bottomnav, se puede usar sem_key and possible parent inference
+#         path_parts.append(sem_key)
+
+#     # tratar de inferir tercer nivel (lista vs detail)
+#     if ui["list"]:
+#         # si pantalla muestra lista, suffix 'list' o 'items'
+#         path_parts.append("list")
+#     elif ui["form"]:
+#         path_parts.append("form")
+#     # else no third level
+
+#     hierarchical = "/".join(path_parts)
+
+#     # --- construir flags string (orden estable)
+#     ui_flags = "|".join(f"{k}={str(ui[k]).lower()}" for k in ["bottomnav", "tabs", "modal", "scroll", "list", "form"])
+#     fw_flags = "|".join(f"{k}={str(frameworks[k]).lower()}" for k in ["compose", "flutter", "reactnative", "webview", "ionic", "native"])
+
+#     # --- short hash para evitar colisiones (8 hex)
+#     canonical_signature = f"{hierarchical}|{ui_flags}|{fw_flags}"
+#     short_hash = hashlib.sha1(canonical_signature.encode("utf-8")).hexdigest()[:8]
+
+#     # --- Final screen_id (jerárquico + flags + short hash)
+#     screen_id = f"{hierarchical}|{ui_flags}|{fw_flags}|h={short_hash}"
+
+#     # components for debugging / storage
+#     components = {
+#         "hierarchical": hierarchical,
+#         "semantic_name": semantic_name,
+#         "semantic_key": sem_key,
+#         "bottom_tab": bottom_tab,
+#         "ui": ui,
+#         "frameworks": frameworks,
+#         "features": features,
+#         "short_hash": short_hash,
+#         "canonical_signature": canonical_signature,
+#     }
+
+#     return (screen_id, components) if return_components else screen_id
+
+def extract_model_key(semantic_screen_id: str) -> str:
+    """
+    Devuelve una key corta y safe para usar como nombre de carpeta.
+    - Toma solo 1 o 2 primeras palabras del root semántico.
+    - Quita flags.
+    - Limpia caracteres ilegales en Windows.
+    """
+    # 1. separar por "_"
+    parts = semantic_screen_id.split("_")
+
+    # 2. cortar donde empiezan los flags (cuando detectamos '=')
+    clean_parts = []
+    for p in parts:
+        if "=" in p:  # flag detectado
+            break
+        clean_parts.append(p)
+
+    # 3. mantener máximo 2 palabras de contexto
+    clean_parts = clean_parts[:2]
+
+    # fallback si está vacío
+    if not clean_parts:
+        clean_parts = ["screen"]
+
+    model_key = "_".join(clean_parts)
+
+    # 4. limpiar caracteres ilegales para Windows
+    illegal = '<>:"/\\|?*'
+
+    for ch in illegal:
+        model_key = model_key.replace(ch, "")
+
+    return model_key
+
+
+def extract_model_key(semantic_screen_id: str) -> str:
+    """
+    Devuelve una key corta y safe para usar como nombre de carpeta.
+    - Toma solo 1 o 2 primeras palabras del root semántico.
+    - Quita flags.
+    - Limpia caracteres ilegales en Windows.
+    """
+    # 1. separar por "_"
+    parts = semantic_screen_id.split("_")
+
+    # 2. cortar donde empiezan los flags (cuando detectamos '=')
+    clean_parts = []
+    for p in parts:
+        if "=" in p:  # flag detectado
+            break
+        clean_parts.append(p)
+
+    # 3. mantener máximo 2 palabras de contexto
+    clean_parts = clean_parts[:2]
+
+    # fallback si está vacío
+    if not clean_parts:
+        clean_parts = ["screen"]
+
+    model_key = "_".join(clean_parts)
+
+    # 4. limpiar caracteres ilegales para Windows
+    illegal = '<>:"/\\|?*'
+
+    for ch in illegal:
+        model_key = model_key.replace(ch, "")
+
+    return model_key
+
+
+
+# def extract_short_screen_id(semantic_screen_id: str) -> str:
+#     """
+#     Genera un ID corto, estable y seguro para carpetas.
+#     Formato: <short_name>_<8char_hash>
+
+#     Ejemplo:
+#         semantic="account_explore_bottomnav=true_scroll=false_h=3df11a86"
+#         → "account_3df11a86"
+#     """
+
+#     if not semantic_screen_id:
+#         return "unknown_" + hashlib.md5("empty".encode()).hexdigest()[:8]
+
+#     # --- 1. Tomar la primera parte semántica antes de flags (/|= etc) ---
+#     # Split por '_' pero algunos nombres pueden tener muchos _
+#     # Ejemplo: "account_favorites_bottomnav=true"
+#     base = semantic_screen_id.split("_")[0]
+
+#     # --- 2. Hacer folder-safe (solo letras y números) ---
+#     # Evita nombres vacíos o ilegales en Windows
+#     base = re.sub(r'[^a-zA-Z0-9]+', '', base)
+
+#     if not base:
+#         base = "screen"
+
+#     # --- 3. Hash estable del semantic_screen_id completo ---
+#     h = hashlib.md5(semantic_screen_id.encode()).hexdigest()[:8]
+
+#     # --- 4. Construir el ID final ---
+#     return f"{base}_{h}"
+
+def extract_short_screen_id(semantic_screen_id: str, max_base_len: int = 20) -> str:
+    """
+    Genera un ID corto y seguro.
+    Formato: <shortname>_<hash8>
+    Siempre corto, siempre estable.
+    """
+
+    if not semantic_screen_id:
+        return "unknown_" + hashlib.md5("empty".encode()).hexdigest()[:8]
+
+    # --- 1. Tomar solo letras y números del inicio ---
+    base = re.findall(r'[a-zA-Z0-9]+', semantic_screen_id)
+    base = base[0] if base else "screen"
+
+    # --- 2. Limitar longitud máxima del nombre base ---
+    base = base[:max_base_len]
+
+    # --- 3. Hash estable de TODO el semantic id ---
+    h = hashlib.md5(semantic_screen_id.encode()).hexdigest()[:8]
+
+    # --- 4. Construir id final ---
+    return f"{base}_{h}"
+
+
+def sanitize_screen_id_for_fs(screen_id: str) -> str:
+    """Sanitiza el screen_id para usarlo en paths del file system."""
+    import re
+        
+    # Remover caracteres ilegales en Windows
+    screen_id = re.sub(r'[<>:"/\\|?*]', '_', screen_id)
+
+    # Limitar longitud (Windows falla > 240 chars)
+    if len(screen_id) > 120:  # seguro para paths largos
+        import hashlib
+        h = hashlib.sha1(screen_id.encode()).hexdigest()[:8]
+        screen_id = screen_id[:110] + "_h" + h
+
+    return screen_id   
+
+def sanitize_screen_id_for_fs(screen_id: str) -> str:
+    """Sanitiza el screen_id para usarlo en paths del file system."""
+    import re
+        
+    # Reemplazar caracteres ilegales en Windows
+    screen_id = re.sub(r'[<>:"/\\|?*]', '_', screen_id)
+
+    # Limitar longitud
+    if len(screen_id) > 120:
+        import hashlib
+        h = hashlib.sha1(screen_id.encode()).hexdigest()[:8]
+        screen_id = screen_id[:110] + "_h" + h
+
+    return screen_id
+
+# =====================================================
+# Sanitizador para filesystem (nuevo en versión 3.0)
+# =====================================================
+def sanitize_for_fs(name: str) -> str:
+    """
+    Convierte un screen_id en un nombre seguro para usar como nombre de archivo.
+    - Reemplaza caracteres no permitidos
+    - Limita longitud
+    """
+    if not name:
+        return "unknown"
+
+    # Solo permitir letras, números, guion y underscore.
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", name)
+
+    # Truncar si es demasiado largo (Windows tiene límite de path)
+    return safe[:120]
+
+# =====================================================
+# Funciones auxiliares previas: slugify / dynamic / canonical
+# =====================================================
+NOISE_PREFIXES = {"¡", "!", "(", "["}
+DYNAMIC_PATTERNS = [
+    r"https?://",
+    r"\d{2,}",
+    r"%",
+]
+
+def slugify(text):
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s/_-]", "", text)
+    text = re.sub(r"\s+", "_", text).strip("_")
+    return text
+
+def looks_dynamic(txt):
+    if not txt:
+        return False
+    t = txt.lower()
+    if any(t.startswith(p) for p in NOISE_PREFIXES):
+        return True
+    for pat in DYNAMIC_PATTERNS:
+        if re.search(pat, t):
+            return True
+    return False
+
+# =====================================================
+# Canonical mapping
+# =====================================================
+CANONICAL = {
+    "home": {"home", "inicio", "home_page"},
+    "account": {"account", "cuenta", "perfil", "profile"},
+    "favorites": {"favorites", "favoritos", "mis_favoritos"},
+    "offers": {"offers", "ofertas", "promociones"},
+    "search": {"search", "buscar", "busqueda"},
+    "cart": {"cart", "carrito", "checkout", "pagar"},
+    "orders": {"orders", "pedidos", "mis_pedidos"},
+    "login": {"login", "iniciar_sesion", "sign_in"},
+    "settings": {"settings", "ajustes", "configuracion"},
+    "social": {"social", "sociales"},
+    "help": {"help", "ayuda", "soporte"},
+}
+
+_CANON_LOOKUP = {}
+for k, s in CANONICAL.items():
+    for v in s:
+        _CANON_LOOKUP[v] = k
+
+def canonical_map(text):
+    if not text:
+        return None
+    t = slugify(text).replace("_", "")
+    for k in _CANON_LOOKUP:
+        if k in t:
+            return _CANON_LOOKUP[k]
+    return None
+
+# =====================================================
+# Plantilla de features (igual que antes)
+# =====================================================
+DEFAULT_FEATURES = {
+    "Button": 0, "MaterialButton": 0, "ImageButton": 0, "EditText": 0,
+    "TextView": 0, "ImageView": 0, "CheckBox": 0, "RadioButton": 0, "Switch": 0,
+    "Spinner": 0, "SeekBar": 0, "ProgressBar": 0, "RecyclerView": 0,
+    "ListView": 0, "ScrollView": 0, "LinearLayout": 0, "RelativeLayout": 0,
+    "ConstraintLayout": 0, "FrameLayout": 0, "CardView": 0,
+    "ComposeView": 0, "Text": 0, "ButtonComposable": 0,
+    "RCTView": 0, "RCTText": 0, "RCTImageView": 0,
+    "FlutterView": 0, "WebView": 0,
+    "IonContent": 0, "IonButton": 0, "IonInput": 0,
+}
+
+# =====================================================
+# EXTRACTOR SEMÁNTICO v3.0
+# =====================================================
+def extract_semantic_screen_id(raw_nodes, *, return_components=False):
+    if not raw_nodes:
+        sid = "unknown_screen"
+        return (sid, sanitize_for_fs(sid), {}) if return_components else sid
+
+    # ---- (1) Recopilar info
+    features = dict(DEFAULT_FEATURES)
+    texts = []
+    nav_candidates = []
+    frameworks = {"compose": False, "flutter": False, "reactnative": False, "webview": False, "ionic": False, "native": False}
+    ui = {"bottomnav": False, "tabs": False, "modal": False, "scroll": False, "list": False, "form": False}
+
+    bottom_tab = None
+
+    # Loop principal
+    for idx, node in enumerate(raw_nodes):
+        cls = (node.get("className") or "").strip()
+        cls_low = cls.lower()
+        signature = (node.get("signature") or "").lower()
+        txt = (node.get("text") or "") or (node.get("desc") or "")
+        txt = txt.strip()
+
+        # recolectar textos útiles
+        if txt and not looks_dynamic(txt):
+            texts.append((idx, txt, cls))
+
+        # detectar nav labels
+        slug = slugify(txt).replace("_", "")
+        if slug in _CANON_LOOKUP:
+            nav_candidates.append((idx, txt))
+
+        # detectar framework
+        if "compose" in cls_low:
+            frameworks["compose"] = True
+        if "flutter" in cls_low or "flutter" in signature:
+            frameworks["flutter"] = True
+        if "rct" in cls_low or "reactnative" in signature:
+            frameworks["reactnative"] = True
+        if "webview" in cls_low:
+            frameworks["webview"] = True
+        if "ion" in cls_low:
+            frameworks["ionic"] = True
+
+        # UI patterns
+        if "scroll" in cls_low or "recycler" in cls_low or "lazycolumn" in cls_low:
+            ui["scroll"] = True
+        if "recycler" in cls_low or "listview" in cls_low:
+            ui["list"] = True
+        if "edittext" in cls_low or "input" in cls_low:
+            ui["form"] = True
+        if "dialog" in cls_low or "alert" in cls_low:
+            ui["modal"] = True
+        if "tab" in cls_low:
+            ui["tabs"] = True
+
+        # features counting
+        for f in features:
+            if f.lower() in cls_low:
+                features[f] += 1
+
+    # fallback -> native
+    if not any(frameworks.values()):
+        frameworks["native"] = True
+
+    # ---- (2) Detectar bottom nav
+    if len(nav_candidates) >= 3:
+        ui["bottomnav"] = True
+        bottom_tab = nav_candidates[-1][1]
+
+    # ---- (3) Elegir semantic header
+    semantic_name = None
+
+    header_candidates = []
+    for idx, txt, cls in texts:
+        score = 0
+        cl = cls.lower()
+        if "text" in cl:
+            score += 3
+        score += max(0, 10 - idx // 20)
+        score += min(5, len(txt) // 10)
+        header_candidates.append((score, idx, txt))
+
+    if header_candidates:
+        header_candidates.sort(reverse=True)
+        semantic_name = header_candidates[0][2]
+
+    if not semantic_name:
+        semantic_name = bottom_tab or "screen"
+
+    sem_slug = slugify(semantic_name)
+    sem_key = canonical_map(semantic_name) or sem_slug or "screen"
+
+    # ---- (4) Jerarquía
+    path_parts = []
+    if ui["bottomnav"] and bottom_tab:
+        bcanon = canonical_map(bottom_tab) or slugify(bottom_tab)
+        path_parts.append(bcanon)
+        if sem_key != bcanon:
+            path_parts.append(sem_key)
+    else:
+        path_parts.append(sem_key)
+
+    if ui["list"]:
+        path_parts.append("list")
+    elif ui["form"]:
+        path_parts.append("form")
+
+    hierarchical = "/".join(path_parts)
+
+    # ---- (5) Flags
+    ui_flags = "|".join(f"{k}={str(ui[k]).lower()}" for k in ui)
+    fw_flags = "|".join(f"{k}={str(frameworks[k]).lower()}" for k in frameworks)
+
+    # ---- (6) Hash corto
+    canonical_signature = f"{hierarchical}|{ui_flags}|{fw_flags}"
+    short_hash = hashlib.sha1(canonical_signature.encode()).hexdigest()[:8]
+
+    # ---- (7) screen_id final
+    screen_id = f"{hierarchical}|{ui_flags}|{fw_flags}|h={short_hash}"
+
+    # ---- (8) screen_id seguro para filesystem
+    screen_id_fs = sanitize_for_fs(screen_id)
+
+    components = {
+        "hierarchical": hierarchical,
+        "semantic_name": semantic_name,
+        "semantic_key": sem_key,
+        "bottom_tab": bottom_tab,
+        "ui": ui,
+        "frameworks": frameworks,
+        "features": features,
+        "short_hash": short_hash,
+        "canonical_signature": canonical_signature,
+        "screen_id": screen_id,
+        "screen_id_fs": screen_id_fs,
+    }
+
+    return (screen_id, screen_id_fs, components) if return_components else screen_id
+
+
+
+def clean_old_diff_records(days: int = 90):
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""
+        DELETE FROM screen_diffs
+        WHERE id IN (
+            SELECT s.id
+            FROM screen_diffs s
+            JOIN diff_approvals a ON a.diff_id = s.id
+            WHERE s.created_at < ?
+        )
+    """, (cutoff_str,))
+    c.execute("""
+        DELETE FROM screen_diffs
+        WHERE id IN (
+            SELECT s.id
+            FROM screen_diffs s
+            JOIN diff_rejections r ON r.diff_id = s.id
+            WHERE s.created_at < ?
+        )
+    """, (cutoff_str,))
+    c.execute("DELETE FROM diff_approvals WHERE created_at < ?", (cutoff_str,))
+    c.execute("DELETE FROM diff_rejections WHERE created_at < ?", (cutoff_str,))
+    conn.commit()
+    conn.close()
+    logger.info(f"🧹 Limpieza de registros antiguos completada (>{days} días).")
+
+
+def load_siamese_model(path: str = "ui_encoder.pt"):
     global siamese_model
     from SiameseEncoder import SiameseEncoder
-
-    siamese_model = SiameseEncoder.load("ui_encoder.pt")
+    siamese_model = SiameseEncoder.load(path)
     siamese_model.eval()
-    print("✅ Modelo siamés cargado en memoria.")   
+    print("✅ Modelo siamés cargado en memoria.")
+
+    
+def retrain_diff_model():
+    from diff_model.train_diff_model import train_and_save
+    #print("🧠 Iniciando reentrenamiento del modelo siamés...")
+    train_and_save()
+    load_siamese_model()  # recarga el modelo actualizado
+    #print("✅ Reentrenamiento completado y modelo actualizado en memoria.")
+
+
+# ==============================
+# TAREAS PERIÓDICAS
+# ==============================
+
+#@repeat_every(seconds=3600, wait_first=True)
+@repeat_every(seconds=3600, wait_first=False)
+async def periodic_retrain():
+    """Reentrenamiento del modelo cada hora."""
+    await asyncio.to_thread(retrain_diff_model)
+
+
+@repeat_every(seconds=86400, wait_first=True)
+async def daily_cleanup():
+    """Limpieza de registros cada 24 horas."""
+    await asyncio.to_thread(clean_old_diff_records, days=90)
+
+
+# ==========================================
+# LIFESPAN HANDLER (startup + shutdown)
+# ==========================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- Startup ---
+    logger.info("🚀 Iniciando FastAPI y cargando modelo siamés...")
+    load_siamese_model()
+
+    # Inicia tareas en background
+    # periodic_retrain()
+    # daily_cleanup()
+
+    # Inicia tareas en background correctamente
+    asyncio.create_task(periodic_retrain())
+    asyncio.create_task(daily_cleanup())
+
+    # Si tuvieras un worker asíncrono:
+    # worker_task = asyncio.create_task(worker_process_queue())
+
+    yield  # Aquí la app ya está corriendo
+
+    # --- Shutdown ---
+    logger.info("🛑 Apagando aplicación y limpiando tareas...")
+    # worker_task.cancel()
+
+
+# ==============================
+# APP PRINCIPAL
+# ==============================
+
+app = FastAPI(lifespan=lifespan)
+
+
+# @app.on_event("startup")
+# async def startup_tasks():
+#     # 1️⃣ Iniciar worker
+#     logger.info("Iniciando worker profesional de eventos...")
+#     asyncio.create_task(worker_process_queue())
+
+#     # 2️⃣ Cargar modelo siamés
+#     global siamese_model
+#     from SiameseEncoder import SiameseEncoder
+#     siamese_model = SiameseEncoder.load("ui_encoder.pt")
+#     siamese_model.eval()
+#     print("✅ Modelo siamés cargado en memoria.")
+
+#     # 3️⃣ Lanzar reentrenamiento periódico
+#     from fastapi_utils.tasks import repeat_every
+#     @repeat_every(seconds=3600)
+#     def retrain_model() -> None:
+#         from diff_model.train_diff_model import train_and_save
+#         print("🧠 Iniciando reentrenamiento del modelo siamés...")
+#         train_and_save()    
+    
+# @app.on_event("startup")
+# async def startup_event():
+#     """Carga inicial del modelo al arrancar el servidor."""
+#     global siamese_model
+#     from SiameseEncoder import SiameseEncoder
+
+#     siamese_model = SiameseEncoder.load("ui_encoder.pt")
+#     siamese_model.eval()
+#     print("✅ Modelo siamés cargado en memoria.")   
 
 # === Reentrenamiento automático del modelo diff ===
-@app.on_event("startup")
-@repeat_every(seconds=3600)  # cada hora, ajusta el intervalo a lo que necesites
-def retrain_model() -> None:
-    """
-    Reentrena el modelo diff con las últimas aprobaciones/rechazos
-    sin necesidad de parar el servidor.
-    """
-    """Carga inicial del modelo al arrancar el servidor."""
 
-    global siamese_model
-    from diff_model.train_diff_model import train_and_save
-    print("🧠 Iniciando reentrenamiento del modelo siamés...")
 
-    # Entrena y guarda nuevo modelo
-    train_and_save()
+# @app.on_event("startup")
+# @repeat_every(seconds=3600)  # cada hora, ajusta el intervalo a lo que necesites
+# def retrain_model() -> None:
+#     """
+#     Reentrena el modelo diff con las últimas aprobaciones/rechazos
+#     sin necesidad de parar el servidor.
+#     """
+#     """Carga inicial del modelo al arrancar el servidor."""
 
-    #from SiameseEncoder import SiameseEncoder
+#     global siamese_model
+#     from diff_model.train_diff_model import train_and_save
+#     print("🧠 Iniciando reentrenamiento del modelo siamés...")
 
-    siamese_model = SiameseEncoder.load("ui_encoder.pt")
-    siamese_model.eval()
-    print("✅ Reentrenamiento completado y modelo actualizado en memoria.")
+#     # Entrena y guarda nuevo modelo
+#     train_and_save()
+
+#     #from SiameseEncoder import SiameseEncoder
+
+#     siamese_model = SiameseEncoder.load("ui_encoder.pt")
+#     siamese_model.eval()
+#     print("✅ Reentrenamiento completado y modelo actualizado en memoria.")
 
 
 
@@ -369,7 +1215,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tester_id TEXT,
             build_id TEXT,
-            timestamp INTEGER,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             event_type TEXT,
             event_type_name TEXT,
             package_name TEXT,
@@ -380,11 +1226,15 @@ def init_db():
             screen_names TEXT,
             header_text TEXT,
             actual_device TEXT,
+            global_signature TEXT,
+            partial_signature TEXT,
+            scroll_type TEXT,
             signature TEXT,
             version TEXT,
             collect_node_tree TEXT,
             additional_info TEXT,
             tree_data TEXT,
+            is_baseline INTEGER DEFAULT 0,   
             enriched_vector TEXT,
             cluster_id INTEGER,
             is_stable INTEGER DEFAULT 0,
@@ -415,6 +1265,29 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS metrics_summary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            metric_group TEXT NOT NULL,   -- screen / build / global
+            metric_name TEXT NOT NULL,
+            metric_value TEXT
+        )
+    """)
+    c.execute("""
+		CREATE TABLE IF NOT EXISTS diff_items (
+		  id INTEGER PRIMARY KEY,
+		  diff_id INTEGER NOT NULL REFERENCES screen_diffs(id),
+		  action TEXT NOT NULL,          
+		  node_class TEXT,
+		  node_key TEXT,
+		  node_text TEXT,
+		  changes_json TEXT,            
+		  raw_json TEXT,               
+		  label TEXT,                   
+		  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+	""")
     c.execute("""
        CREATE TABLE IF NOT EXISTS ignored_changes_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -439,17 +1312,65 @@ def init_db():
             PRIMARY KEY(screen_id, node_key, property)
         );
     """)
+    # Crear la tabla
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS active_plans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,  -- <--- aquí va el nombre
+        plan_name TEXT UNIQUE NOT NULL,
+        description TEXT NOT NULL,
+        active INTEGER DEFAULT 1,
+        currency TEXT CHECK(currency IN ('USD', 'COP', 'EUR')) NOT NULL DEFAULT 'USD',
+        rate_usd REAL DEFAULT 1.0,       
+        rate_cop REAL DEFAULT 4100.0,   
+        rate_eur REAL DEFAULT 0.94,      
+        rate REAL DEFAULT 1.0,
+        price REAL NOT NULL,
+        no_associate REAL DEFAULT 0.0,  -- costo por código sin plan activo
+        max_tester INTEGER NOT NULL,      
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+    # Insertar los planes por defecto
+    default_plans = [
+        ('BASIC', 'Basic Plan', 'USD', 1.0, 1, 1),
+        ('STANDARD', 'Standard Plan', 'USD', 1.0, 25, 5)
+    ]
+
+    for plan in default_plans:
+        c.execute("""
+            INSERT OR IGNORE INTO active_plans (plan_name, description, currency, rate, price, max_tester)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, plan)
+
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS login_codes (
             codigo TEXT PRIMARY KEY,
             usuario_id TEXT NOT NULL,
+            plan_id INTEGER,  
             generado_en INTEGER NOT NULL,
             expira_en INTEGER NOT NULL,
             usos_permitidos INTEGER NOT NULL,
             usos_actuales INTEGER DEFAULT 0,
-            activo INTEGER DEFAULT 1  
+            pago_confirmado INTEGER DEFAULT 0,  
+            activo INTEGER DEFAULT 1,  
+            is_paid INTEGER DEFAULT 0,
+            FOREIGN KEY (plan_id) REFERENCES active_plans(id)  
         );
     """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id TEXT PRIMARY KEY,
+            nombre TEXT,
+            rol TEXT CHECK(rol IN ('owner', 'tester')) DEFAULT 'tester',
+            plan_id INTEGER,
+            FOREIGN KEY(plan_id) REFERENCES active_plans(id)
+        );
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS pagos (
             pago_id TEXT PRIMARY KEY,    
@@ -557,6 +1478,8 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_diffs_tester_build_screen
         ON screen_diffs(tester_id, build_id, screen_name, created_at DESC)
     """)
+
+
     conn.commit()
     conn.close()
     
@@ -596,14 +1519,18 @@ class AccessibilityEvent(BaseModel):
     
     # Árbol de nodos capturado (puede ser dict o lista de nodos)
     # collect_node_tree: Optional[Union[Dict, List]] = Field(None, alias="collectNodeTree")
-    collect_node_tree: Optional[Union[Dict[str, Any], List[Any]]] = Field(
-        None, alias="collectNodeTree"
+    # collect_node_tree: Optional[Union[Dict[str, Any], List[Any]]] = Field(
+    #     None, alias="collectNodeTree"
+    # )
+
+    collect_node_tree: Optional[List[Dict[str, Any]]] = Field(
+    None, alias="collectNodeTree"
     )
     
     # Datos adicionales para enriquecer el modelo (libres)
     additional_info: Optional[Dict[str, Any]] = Field(None, alias="additionalInfo")
     tree_data: Optional[Dict[str, Any]] = Field(None, alias="treeData")
-
+    session_key: Optional[str] = None
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -686,17 +1613,149 @@ def ensure_list(tree):
             return []
     return tree or []
 
+
+def build_stable_list(tree):
+    """Aplana el árbol en una lista ordenada con firmas estables."""
+    result = []
+
+    def walk(node, depth=0):
+        if not isinstance(node, dict):
+            return
+
+        cls = node.get("className", "")
+        text = node.get("text") or ""
+        desc = node.get("desc") or ""
+        viewId = node.get("viewId") or ""
+
+        # firma estable del nodo
+        signature = f"{depth}|{cls}|{viewId}|{text or desc}"
+
+        result.append(signature)
+
+        children = node.get("children") or []
+        for child in children:
+            walk(child, depth + 1)
+
+    if isinstance(tree, list):
+        for n in tree:
+            walk(n)
+    else:
+        walk(tree)
+
+    return result
+
+
+def compare_ui_orders(tree_a, tree_b):
+    """Compara el orden relativo y detecta reordenamientos sin usar coordenadas."""
+    a_list = build_stable_list(tree_a)
+    b_list = build_stable_list(tree_b)
+
+    sm = difflib.SequenceMatcher(None, a_list, b_list)
+
+    result = {
+        "missing_in_b": [],
+        "new_in_b": [],
+        "reordered": [],
+        "same_structure_score": sm.ratio()
+    }
+
+    # detectar elementos que faltan
+    for x in a_list:
+        if x not in b_list:
+            result["missing_in_b"].append(x)
+
+    # detectar elementos nuevos
+    for x in b_list:
+        if x not in a_list:
+            result["new_in_b"].append(x)
+
+    # detectar reordenamientos
+    opcodes = sm.get_opcodes()
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "replace" or tag == "delete" or tag == "insert":
+            result["reordered"].append({
+                "from_a": a_list[i1:i2],
+                "to_b": b_list[j1:j2]
+            })
+
+    return result
+
+
 # def normalize_node(node: Dict) -> Dict:
 #     return {k: (node.get(k) or "") for k in SAFE_KEYS}
 
-def normalize_tree(nodes: List[Dict]) -> List[Dict]:
-    return sorted([normalize_node(n) for n in nodes if isinstance(n, dict)],
-                  key=lambda n: (n["className"], n["text"]))
+# def normalize_tree(nodes: List[Dict]) -> List[Dict]:
+#     return sorted([normalize_node(n) for n in nodes if isinstance(n, dict)],
+#                   key=lambda n: (n["className"], n["text"]))
 
-def stable_signature(nodes: List[Dict]) -> str:
-    return hashlib.sha256(
-        json.dumps(normalize_tree(nodes), sort_keys=True, ensure_ascii=False).encode("utf-8")
+# def stable_signature(nodes: List[Dict]) -> str:
+#     return hashlib.sha256(
+#         json.dumps(normalize_tree(nodes), sort_keys=True, ensure_ascii=False).encode("utf-8")
+#     ).hexdigest()
+
+
+def detect_scroll_type(nodes: List[Dict]) -> str:
+    for n in nodes:
+        cls = n.get("className", "")
+        if "ScrollView" in cls or "RecyclerView" in cls:
+            return "vertical"
+        if "HorizontalScrollView" in cls or "ViewPager" in cls:
+            return "horizontal"
+    return "none"
+
+def stable_signatures(nodes: List[Dict], header_text: str = "") -> Dict[str, str]:
+    """Genera firmas global y parcial para distinguir scrolls y pantallas."""
+    if not nodes:
+        return {"global_signature": "none", "partial_signature": "none"}
+
+    norm = normalize_tree(nodes)
+    root = norm[0] if isinstance(norm[0], dict) else {}
+
+    # --- Global signature (identifica pantalla base) ---
+    root_class = root.get("className", "")
+    main_id = root.get("resourceId", "")
+    global_data = f"{root_class}|{main_id}"
+    global_signature = hashlib.sha256(global_data.encode("utf-8")).hexdigest()
+
+    # --- Partial signature (lo visible actualmente + pantalla) ---
+    visible_nodes = [n for n in norm if n.get("visibleToUser")]
+    partial_data = {
+        "header_text": header_text,  # <-- ahora incluido
+        "nodes": visible_nodes
+    }
+    partial_signature = hashlib.sha256(
+        json.dumps(partial_data, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
+
+    return {
+        "global_signature": global_signature,
+        "partial_signature": partial_signature
+    }
+
+# def stable_signatures(nodes: List[Dict]) -> Dict[str, str]:
+#     """Genera firmas global y parcial para distinguir scrolls."""
+#     if not nodes:
+#         return {"global_signature": "none", "partial_signature": "none"}
+
+#     norm = normalize_tree(nodes)
+#     root = norm[0] if isinstance(norm[0], dict) else {}
+
+#     # --- Global signature (identifica pantalla base) ---
+#     root_class = root.get("className", "")
+#     main_id = root.get("resourceId", "")
+#     global_data = f"{root_class}|{main_id}"
+#     global_signature = hashlib.sha256(global_data.encode("utf-8")).hexdigest()
+
+#     # --- Partial signature (lo visible actualmente) ---
+#     visible_nodes = [n for n in norm if n.get("visibleToUser")]
+#     partial_signature = hashlib.sha256(
+#         json.dumps(visible_nodes, sort_keys=True, ensure_ascii=False).encode("utf-8")
+#     ).hexdigest()
+
+#     return {
+#         "global_signature": global_signature,
+#         "partial_signature": partial_signature
+#     }    
 
 def generate_code():
     """Genera un código de 6 dígitos"""
@@ -714,7 +1773,7 @@ def save_reset_code(email: str, code: str):
         """, (email, code, expires_at))
         conn.commit()
         conn.close()
-        print(f"✅ Código guardado para {email}")
+        #print(f"✅ Código guardado para {email}")
     except Exception as e:
         print(f"❌ Error guardando código en BD: {e}")
 
@@ -1106,7 +2165,7 @@ def overlap_ratio(old_nodes, new_nodes):
             text = n.get("text", "")
             if text:
                 texts.add(text.strip().lower())
-        print(f"[{label}] Textos extraídos ({len(texts)}): {texts}")
+        #print(f"[{label}] Textos extraídos ({len(texts)}): {texts}")
         return texts
 
     r_texts = extract_texts(old_nodes, "REMOVED")
@@ -1114,24 +2173,66 @@ def overlap_ratio(old_nodes, new_nodes):
 
     # ✅ Manejo de casos vacíos para evitar falsos positivos y divisiones por cero
     if not r_texts and not a_texts:
-        print("⚪ Ambos sets vacíos → overlap = 1.0 (sin cambios detectados)")
+        #print("⚪ Ambos sets vacíos → overlap = 1.0 (sin cambios detectados)")
         return 1.0
     elif not r_texts or not a_texts:
-        print("⚠️ Uno de los sets está vacío → overlap = 0.0 (sin elementos para comparar)")
+        #print("⚠️ Uno de los sets está vacío → overlap = 0.0 (sin elementos para comparar)")
         return 0.0
 
     common = r_texts.intersection(a_texts)
     total = r_texts.union(a_texts)
     overlap = len(common) / len(total)
-    print(f"➡️ Overlap: {len(common)}/{len(total)} = {overlap:.2f}")
+    #print(f"➡️ Overlap: {len(common)}/{len(total)} = {overlap:.2f}")
     return overlap
+
+
+# normalizar latest_tree: asegurar lista de dicts, eliminar Nones
+
+def sanitize_tree(tree):
+    if not tree:
+        return []
+
+    cleaned = []
+
+    for n in tree:
+
+        if isinstance(n, dict):
+            # Aceptar nodos si tienen ALGO útil
+            if any(n.get(k) for k in [
+                "className", "text", "contentDescription", "desc", "hint"
+            ]):
+                cleaned.append(n)
+            continue
+
+        if isinstance(n, str):
+            try:
+                obj = json.loads(n)
+                if isinstance(obj, dict):
+                    if any(obj.get(k) for k in [
+                        "className", "text", "contentDescription", "desc", "hint"
+                    ]):
+                        cleaned.append(obj)
+
+                elif isinstance(obj, list):
+                    cleaned.extend([
+                        x for x in obj if isinstance(x, dict) and any(
+                            x.get(k) for k in [
+                                "className", "text", "contentDescription", "desc", "hint"
+                            ]
+                        )
+                    ])
+            except:
+                continue
+
+    return cleaned
 
 async def analyze_and_train(event: AccessibilityEvent):
     # -------------------- Normalizar campos --------------------
     norm = _normalize_event_fields(event)
     t_id = str(norm.get("tester_id_norm") or "").strip()
     b_id = str(norm.get("build_id_norm") or "").strip()
-    s_name = normalize_header(event.header_text)
+    s_name = event.header_text 
+    # s_name = normalize_header(event.header_text)
     event_type_ref = normalize_header(event.event_type_name)
     app_name = event.package_name or "default_app"
     tester_id = event.tester_id or "general"
@@ -1139,8 +2240,18 @@ async def analyze_and_train(event: AccessibilityEvent):
     header_text = event.header_text or ""
     global siamese_model
     flow_trees = FLOW_MODELS.get(app_name, {})
+    raw_tree = event.collect_node_tree or event.tree_data or []
+        # -------------------- Obtener snapshot previo ----------------
+    prev_tree = None
+    IGNORED_FIELDS = {"hint", "contentDescription", "value", "progress"}
+   
+
+
     # -------------------- Árbol y firma ------------------------
-    latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
+    #latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
+    #latest_tree = ensure_list(raw_tree)
+    latest_tree = sanitize_tree(ensure_list(raw_tree))
+
     sig = stable_signature(latest_tree)
     root_class_name = latest_tree[0].get("className") if latest_tree else ""
 
@@ -1154,19 +2265,26 @@ async def analyze_and_train(event: AccessibilityEvent):
     num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
     input_vec = np.array(input_features(event.actions or []), dtype=float).flatten()
 
+    
     enriched_vector = np.concatenate([
-        struct_vec,
+        struct_vec,     
         sig_vec,
         np.array([avg_dwell, num_gestos], dtype=float),
         input_vec
     ])
+
+
+    removed_all, added_all, modified_all = [], [], []
+    text_diff = {}
+    diff_result = {}
 
     # Valor por defecto, para evitar errores si hay excepciones antes de asignarlo
     has_changes = False  
 
     # -------------------- Verificación rápida de cambio de header --------------------
     try:
-        curr_header = (s_name or "").strip().lower()
+        curr_header = (s_name or "")
+        # curr_header = (s_name or "").strip().lower()
         prev_header = None
 
         with sqlite3.connect(DB_NAME) as conn:
@@ -1183,22 +2301,19 @@ async def analyze_and_train(event: AccessibilityEvent):
 
             if row:
                 prev_header = (row[0] or "").strip().lower()
-        print(f"curr_header: '{curr_header}' | prev_header: '{prev_header}'")
+        # print(f"curr_header: '{curr_header}' | prev_header: '{prev_header}'")
         if prev_header and prev_header != curr_header:
-            print(f"⚠️ Header cambió (detección temprana): '{prev_header}' → '{curr_header}'")
+            # print(f"⚠️ Header cambió (detección temprana): '{prev_header}' → '{curr_header}'")
             header_changed = {"before": prev_header, "after": curr_header}
             has_changes = True
         else:
             header_changed = None
-            print("✅ Header sin cambios (verificación temprana).")
+            # print("✅ Header sin cambios (verificación temprana).")
 
     except Exception as e:
         header_changed = None
         logger.warning(f"⚠️ Error en verificación temprana de header_text: {e}")
 
-    # -------------------- Obtener snapshot previo ----------------
-    prev_tree = None
-    IGNORED_FIELDS = {"hint", "contentDescription", "value", "progress"}
 
     def normalize_node(node):
         return {k: v for k, v in node.items() if k not in IGNORED_FIELDS}
@@ -1219,31 +2334,7 @@ async def analyze_and_train(event: AccessibilityEvent):
             pass
         return ""
    
-# normalizar latest_tree: asegurar lista de dicts, eliminar Nones
-    def sanitize_tree(tree):
-        if not tree:
-            return []
-        cleaned = []
-        for n in tree:
-            # aceptamos dicts; también aceptamos strings JSON (por si llegan así)
-            if n is None:
-                continue
-            if isinstance(n, str):
-                try:
-                    obj = json.loads(n)
-                    if isinstance(obj, dict):
-                        cleaned.append(obj)
-                    elif isinstance(obj, list):
-                        # si vino un lista serializada, extenderla
-                        cleaned.extend([x for x in obj if isinstance(x, dict)])
-                except Exception:
-                    continue
-            elif isinstance(n, dict):
-                cleaned.append(n)
-            # ignorar otros tipos
-        return cleaned
-
-    latest_tree = sanitize_tree(latest_tree)
+    latest_tree = sanitize_tree(ensure_list(raw_tree))
     if not latest_tree:
         logger.warning("⚠️ latest_tree vacío o todos sus nodos son None/invalid — usando embedding neutro")
         # crear embedding neutro (mismo tamaño que modelo devuelve)
@@ -1279,7 +2370,7 @@ async def analyze_and_train(event: AccessibilityEvent):
 
     # esto es nuevo tocar o eliminar 
         if not prev_rows:
-            logger.info("ℹ️ No hay snapshots previos para comparar.")
+            #print("ℹ️ No hay snapshots previos para comparar.")
             has_changes = True
             prev_tree = None
         else:
@@ -1287,7 +2378,9 @@ async def analyze_and_train(event: AccessibilityEvent):
             best_sim, best_row = 0.0, None
             for row in prev_rows:
                 try:
-                    prev_tree = ensure_list(json.loads(row[0]))
+                    prev_tree = sanitize_tree(ensure_list(json.loads(row[0])))
+
+                    #prev_tree = ensure_list(json.loads(row[0]))
                     with torch.no_grad():
                         emb_prev = siamese_model.encode_tree(prev_tree)
                     emb_prev = emb_prev.cpu().numpy().reshape(1, -1)
@@ -1310,30 +2403,82 @@ async def analyze_and_train(event: AccessibilityEvent):
 
             if best_sim > SIM_THRESHOLD and best_row:
                 logger.info(f"🤝 Coincidencia detectada por modelo siamés (sim={best_sim:.3f})")
-                prev_tree = ensure_list(json.loads(best_row[0]))
+                #prev_tree = ensure_list(json.loads(best_row[0]))
+                prev_tree = sanitize_tree(ensure_list(json.loads(best_row[0])))
             else:
                 logger.warning("⚠️ No se encontró coincidencia fuerte, usar estructura directa.")
                 prev_tree = ensure_list(json.loads(prev_rows[0][0]))    
     
-    removed_all, added_all, modified_all = [], [], []
-    text_diff = {}
-    diff_result = {}
+
     
     # esto es nuevo  tocar o eliminar  
     if prev_tree:
         try:
+            def clean_nodes(tree):
+                IGNORED = {"hint", "contentDescription", "value", "progress"}
+                cleaned = []
+                for n in tree:
+                    if not isinstance(n, dict):
+                        continue
+                    c = {k: v for k, v in n.items() if k not in IGNORED}
+                    # ignorar nodos vacíos o inválidos
+                    if not c.get("className") and not c.get("text"):
+                        continue
+                    cleaned.append(c)
+                return cleaned
+
+            prev_tree_clean = clean_nodes(prev_tree)
+            latest_tree_clean = clean_nodes(latest_tree)
+
+
             diff_result = compare_trees(
-                prev_tree, latest_tree,
+                prev_tree_clean,
+                latest_tree_clean,
                 app_name=app_name,
                 tester_id=tester_id,
                 build_id=build_id,
                 screen_id=event.screens_id or event.header_text or "unknown_screen"
             )
+            # --- (A) Similaridad estructural si no viene del diff ---
+              # ------------------- STRUCTURE SIMILARITY -------------------
+            if "structure_similarity" not in diff_result:
+                try:
+                    diff_result["structure_similarity"] = ui_structure_similarity(prev_tree, latest_tree)
+                except Exception:
+                    diff_result["structure_similarity"] = 1.0
 
+            # ------------------- NUEVO: DIFF DE ORDEN -------------------
+            try:
+                order_info = compare_ui_orders(prev_tree, latest_tree)
+
+                diff_result["order_missing"] = order_info["missing_in_b"]
+                diff_result["order_new"] = order_info["new_in_b"]
+                diff_result["order_reordered"] = order_info["reordered"]
+                diff_result["order_score"] = order_info["same_structure_score"]
+
+            except Exception as e:
+                logger.error(f"Error comparando orden UI: {e}")
+                diff_result["order_score"] = 1.0
+
+
+            # has_changes = bool(
+            #     diff_result.get("removed") or diff_result.get("added") or diff_result.get("modified") or
+            #     diff_result.get("text_diff", {}).get("overlap_ratio", 1.0) < 0.9 or
+            #     diff_result.get("has_changes")
+            # )
+
+            # AHORA SÍ: incluir orden en el análisis final
             has_changes = bool(
-                diff_result.get("removed") or diff_result.get("added") or diff_result.get("modified") or
-                diff_result.get("text_diff", {}).get("overlap_ratio", 1.0) < 0.9 or
-                diff_result.get("has_changes")
+                diff_result.get("removed")
+                or diff_result.get("added")
+                or diff_result.get("modified")
+                or diff_result.get("order_missing")
+                or diff_result.get("order_new")
+                or diff_result.get("order_reordered")
+                or diff_result.get("text_diff", {}).get("overlap_ratio", 1.0) < 0.9
+                or diff_result.get("structure_similarity", 1.0) < 0.9
+                or diff_result.get("order_score", 1.0) < 0.9
+                or diff_result.get("has_changes")
             )
 
         except Exception as e:
@@ -1342,16 +2487,32 @@ async def analyze_and_train(event: AccessibilityEvent):
     else:
         has_changes = True
 
-    # -------------------- 6. Guardar diff + enriquecimiento --------------------
-    with sqlite3.connect(DB_NAME) as conn:
-        emb_json = json.dumps(emb_curr.tolist())
-        conn.execute("""
-            UPDATE accessibility_data
-            SET enriched_vector=?
-            WHERE TRIM(LOWER(header_text)) LIKE '%' || TRIM(LOWER(?)) || '%'
-              AND TRIM(tester_id)=TRIM(?)
-        """, (emb_json, s_name, t_id))
-        conn.commit()
+
+    # 🔹 Recalcular enriched_vector (después de emb_curr y fuera del if)
+    # enriched_vector = np.concatenate([
+    #     struct_vec,
+    #     sig_vec,
+    #     np.array([avg_dwell, num_gestos], dtype=float),
+    #     input_vec,
+    #     emb_curr.flatten()
+    # ])  
+
+    if (
+        enriched_vector is not None 
+        and hasattr(enriched_vector, "size") 
+        and enriched_vector.size > 0
+    ):    
+
+        # -------------------- 6. Guardar diff + enriquecimiento --------------------
+        with sqlite3.connect(DB_NAME) as conn:
+            emb_json = json.dumps(emb_curr.tolist())
+            conn.execute("""
+                UPDATE accessibility_data
+                SET enriched_vector=?
+                WHERE TRIM(LOWER(header_text)) LIKE '%' || TRIM(LOWER(?)) || '%'
+                AND TRIM(tester_id)=TRIM(?)
+            """, (emb_json, s_name, t_id))
+            conn.commit()
 
     # -------------------- 7. Entrenamiento incremental --------------------
     # opcional: puedes volver a entrenar el encoder con nuevos ejemplos
@@ -1360,7 +2521,8 @@ async def analyze_and_train(event: AccessibilityEvent):
         tester_id=tester_id,
         build_id=build_id,
         app_name=app_name,
-        screen_id=event.screens_id or s_name or "unknown_screen",
+        #screen_id=event.screens_id or s_name or "unknown_screen",
+        screen_id=semantic_screen_id_ctx.get(),
         use_general_as_base=True
     ))
 
@@ -1369,94 +2531,156 @@ async def analyze_and_train(event: AccessibilityEvent):
             app_name=app_name,
             batch_size=500,
             min_samples=3,
-             update_general=True
+            update_general=True
         )
 
-    # -------------------- 9. Guardar en screen_diffs --------------------
+# -------------------- 9. Guardar en screen_diffs --------------------
     try:
         if has_changes:
+
             removed_all = diff_result.get("removed", [])
             added_all = diff_result.get("added", [])
             modified_all = diff_result.get("modified", [])
             text_diff = diff_result.get("text_diff", {})
+
+
+
+            # --- mantener lo tuyo ---
             header_changed = text_diff.get("header_changed", None)
 
-            # --- Generar firma hash del diff ---
+            diff_vector = np.array([
+                len(removed_all),
+                len(added_all),
+                len(modified_all),
+                text_diff.get("overlap_ratio", 1.0),
+                diff_result.get("structure_similarity", 1.0)
+            ])
+
+            if "structure_similarity" not in diff_result:
+                try:
+                    diff_result["structure_similarity"] = ui_structure_similarity(prev_tree, latest_tree)
+                except Exception:
+                    diff_result["structure_similarity"] = 1.0  
+
+            # --- Generar firma hash del diff (como tenías) ---
             diff_signature = diff_hash(removed_all, added_all, modified_all, text_diff)
 
             with sqlite3.connect(DB_NAME) as conn:
                 cur = conn.cursor()
 
-                # Buscar si ya existe este diff
+                # Verificar si YA existe este diff_hash
                 cur.execute("""
-                    SELECT s.id, a.approved
-                    FROM screen_diffs AS s
-                    LEFT JOIN diff_approvals AS a ON a.diff_id = s.id
-                    WHERE s.diff_hash = ?
+                    SELECT id FROM screen_diffs WHERE diff_hash = ?
                 """, (diff_signature,))
                 existing = cur.fetchone()
 
-                if existing and existing[1]:
-                    logger.info(f"✅ Diff {diff_signature[:8]} ya aprobado — no se inserta.")
-                elif existing:
-                    logger.info(f"⚠️ Diff {diff_signature[:8]} ya existente sin aprobación.")
+                # if existing:
+                #     logger.info(f"⚠️ Diff {diff_signature[:8]} ya existe — NO insertamos screen_diffs NI diff_items")
+                #     return   # ⬅️ AQUÍ SE CORTA TODO
+                
+                if existing:
+                    logger.info(f"⚠️ Diff {diff_signature[:8]} ya existe — NO insertamos screen_diffs NI diff_items")
+                    # devolver métricas coherentes
+                    added_count = len(added_all) if 'added_all' in locals() else 0
+                    removed_count = len(removed_all) if 'removed_all' in locals() else 0
+                    modified_count = len(modified_all) if 'modified_all' in locals() else 0
+                    return has_changes, added_count, removed_count, modified_count
+
+                # ---- calcular valores ----
+                text_overlap = text_diff.get("overlap_ratio", 1.0)
+                ui_sim = diff_result.get("structure_similarity", 1.0)
+
+                # estado textual
+                if text_overlap >= 0.9 and ui_sim >= 0.9:
+                    screen_status = "identical"
+                elif text_overlap >= 0.6 and ui_sim >= 0.6:
+                    screen_status = "minor_changes"
                 else:
-                    # Enriquecer text_diff si falta overlap_ratio o structure_similarity
-                    if "overlap_ratio" not in text_diff:
-                        text_diff["overlap_ratio"] = diff_result.get("text_diff", {}).get("overlap_ratio", 1.0)
+                    screen_status = "different"
 
-                    if "structure_similarity" not in diff_result:
-                        try:
-                            diff_result["structure_similarity"] = ui_structure_similarity(prev_tree, latest_tree)
-                        except Exception:
-                            diff_result["structure_similarity"] = 1.0
+                
+  
 
-                    text_overlap = text_diff.get("overlap_ratio", 1.0)
-                    overlap_ratio = text_overlap
-                    ui_structure_sim_value = diff_result.get("structure_similarity", 1.0)
+                # serializar
+                removed_j = json.dumps(removed_all, ensure_ascii=False)
+                added_j = json.dumps(added_all, ensure_ascii=False)
+                modified_j = json.dumps(modified_all, ensure_ascii=False)
+                text_diff_j = json.dumps(text_diff, ensure_ascii=False)
 
-                    # Determinar estado textual
-                    if ui_structure_sim_value > 0.9 and overlap_ratio > 0.8:
-                        screen_status = "identical"
-                    elif overlap_ratio > 0.6:
-                        screen_status = "minor_changes"
-                    else:
-                        screen_status = "different"
+            break_insert = False
 
-                    # Serializar
-                    removed_j = json.dumps(removed_all, sort_keys=True, ensure_ascii=False)
-                    added_j = json.dumps(added_all, sort_keys=True, ensure_ascii=False)
-                    modified_j = json.dumps(modified_all, sort_keys=True, ensure_ascii=False)
-                    text_diff_j = json.dumps(text_diff, ensure_ascii=False)
+            if (
+                len(removed_all) == 0
+                and len(added_all) == 0
+                and len(modified_all) == 0
+                and (not text_diff or text_diff.get("overlap_ratio", 1.0) >= 0.99)
 
+            ):                 
+                logger.info("🔍 Diff vacío — NO se inserta en screen_diffs.")
+                break_insert = True
+                has_changes = False  # No hubo cambios
+                added_count = 0
+                removed_count = 0
+                modified_count = 0
 
-                    print("\n--- DEBUG INSERT INTO screen_diffs ---")
-                    print(f"tester_id={t_id}, build_id={b_id}, screen_name={s_name}")
-                    print(f"has_changes={has_changes}, removed={len(removed_all)}, added={len(added_all)}, modified={len(modified_all)}")
-                    print(f"diff_hash={diff_signature[:10]}, text_overlap={text_diff.get('overlap_ratio')}")
-                    print(f"existing={existing}")
-                    print("-------------------------------\n")
+                return has_changes, added_count, removed_count, modified_count
 
 
+                # Insertar diff
+            if not break_insert:
+                cur.execute("""
+                    INSERT INTO screen_diffs (
+                        tester_id, build_id, screen_name, header_text,
+                        removed, added, modified, text_diff, diff_hash,
+                        text_overlap, overlap_ratio, ui_structure_similarity, screen_status
+                    )
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    t_id, b_id, s_name, header_text,
+                    removed_j, added_j, modified_j, text_diff_j,
+                    diff_signature, text_overlap, text_overlap,
+                    ui_sim, screen_status
+                ))
+
+                conn.commit()
+
+                # obtener diff_id real
+                cur.execute("SELECT id FROM screen_diffs WHERE diff_hash = ?", (diff_signature,))
+                diff_id = cur.fetchone()[0]
+
+                # ---- dedupe ----
+                def dedupe_nodes(items):
+                    seen = set()
+                    unique = []
+                    for item in items:
+                        key = item.get("node", {}).get("key", "")
+                        if key not in seen:
+                            seen.add(key)
+                            unique.append(item)
+                    return unique
+
+                added_all = dedupe_nodes(added_all)
+
+                # ---- insertar diff_items ----
+                for item in added_all:
+                    node = item.get("node", {})
                     cur.execute("""
-                        INSERT OR IGNORE INTO screen_diffs (
-                            tester_id, build_id, screen_name, header_text,
-                            removed, added, modified, text_diff, diff_hash,
-                            text_overlap, overlap_ratio, ui_structure_similarity, screen_status
-                        )
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        INSERT INTO diff_items (diff_id, action, node_class, node_key, node_text, raw_json)
+                        VALUES (?,?,?,?,?,?)
                     """, (
-                        t_id, b_id, s_name, header_text,
-                        removed_j, added_j, modified_j, text_diff_j,
-                        diff_signature, text_overlap, overlap_ratio,
-                        ui_structure_sim_value, screen_status
+                        diff_id, "added",
+                        node.get("class"), node.get("key"),
+                        node.get("text"),
+                        json.dumps(item, ensure_ascii=False)
                     ))
 
-                    conn.commit()
-                    logger.info(f"🧩 Guardado cambio ({diff_signature[:8]}) en screen_diffs")
+                conn.commit()
+
+                logger.info(f"🧩 Guardado cambio ({diff_signature[:8]}) en screen_diffs")
 
         else:
             logger.info(f"🧩 Sin cambios detectados para {s_name}")
+
     except Exception as e:
         logger.exception(f"❌ Error guardando diff en screen_diffs: {e}")
 
@@ -1603,9 +2827,18 @@ def _normalize_event_fields(event: AccessibilityEvent) -> dict:
         "build_id_norm":  build_id.strip()  if build_id  else None,
     }          
 
+# def normalize_node(node: Dict) -> Dict:
+#     """Filtra solo las claves estables y convierte None en cadena vacía."""
+#     return {k: (node.get(k) or "") for k in SAFE_KEYS}
+
 def normalize_node(node: Dict) -> Dict:
-    """Filtra solo las claves estables y convierte None en cadena vacía."""
-    return {k: (node.get(k) or "") for k in SAFE_KEYS}
+    """Filtra claves estables sin destruir los tipos."""
+    return {k: node.get(k, None) for k in SAFE_KEYS}    
+
+# def normalize_tree(nodes):
+#     if not isinstance(nodes, list):
+#         return []
+#     return [normalize_node(n) for n in nodes if isinstance(n, dict)]    
 
 def normalize_tree(nodes: List[Dict]) -> List[Dict]:
     """Normaliza y ordena la lista de nodos para que el orden no afecte el hash."""
@@ -1619,117 +2852,567 @@ def stable_signature(nodes: List[Dict]) -> str:
         json.dumps(norm, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
 
+
 @app.post("/collect")
 async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundTasks):
-    logger.debug("Raw request: %s", event.model_dump())
+    # logger.debug("Raw request: %s", event.model_dump())
+
     try:
-        # -------------------- Normalización --------------------
+        # -------------------- 1) Obtener nodos RAW (los originales) --------------------
         raw_nodes = event.collect_node_tree or event.tree_data or []
-        normalized_nodes = normalize_tree(raw_nodes)
-        signature = stable_signature(raw_nodes)
+
+        semantic_screen_id = extract_semantic_screen_id(raw_nodes)
+
+        screen_id_short = extract_short_screen_id(semantic_screen_id)
+
+        screen_id_final = sanitize_screen_id_for_fs(screen_id_short)
+
+        semantic_screen_id_ctx.set(screen_id_final)
+
+        #model_key = extract_model_key(semantic_screen_id)
+
+
+        # 1. Guardar el ID sanitizado
+        semantic_screen_id_fs = sanitize_screen_id_for_fs(semantic_screen_id)
+        semantic_screen_id_ctf.set(semantic_screen_id_fs)
+
+        # 2. Guardar también la versión "short"
+        screen_id_short = extract_short_screen_id(semantic_screen_id)
+        semantic_screen_id_ctf.set(screen_id_short)
+
+        # 3. Recuperar EL VALOR REAL
+        #semantic_screen_id_value = semantic_screen_id_ctf.get()
+
+        # 4. Ahora sí llamar a extract_model_key()
+       # model_key2 = extract_model_key(semantic_screen_id_value)
+
+        # -------------------- 2) Firmas estables (aquí adentro ya se normaliza) -------
+        signatures = stable_signatures(raw_nodes, header_text=event.header_text or "")
+        global_signature = signatures["global_signature"]
+        partial_signature = signatures["partial_signature"]
+
+        # -------------------- 3) Normalizar solo campos del evento --------------------
         norm = _normalize_event_fields(event)
         tester_norm = norm.get("tester_id_norm")
         build_norm = norm.get("build_id_norm")
         screen_name = event.screen_names or ""
         header_text = event.header_text or ""
-        screens_id_val = event.screens_id or norm.get("screensId") or None
+        screens_id_val = semantic_screen_id  
+        #screens_id_val = event.screens_id or norm.get("screensId") or None
 
+        # -------------------- 4) Detectar scroll --------------------
+        scroll_type = detect_scroll_type(raw_nodes)
 
-        # -------------------- 🧠 Generar o recuperar session_key --------------------
+        # -------------------- 5) Session key ------------------------
         base = tester_norm or getattr(event, "tester_id", "anon")
         minute_block = int(time.time() // 60)
         event.session_key = getattr(event, "session_key", None) or f"{base}_{minute_block}"
 
-        # Class raíz
-        if normalized_nodes and isinstance(normalized_nodes, list):
-            root_class_name = normalized_nodes[0].get("className", "") if isinstance(normalized_nodes[0], dict) else ""
+        # -------------------- 6) Detectar class raíz desde RAW -------------------------
+        if raw_nodes:
+            root_class_name = raw_nodes[0].get("className", "") if isinstance(raw_nodes[0], dict) else ""
         else:
             root_class_name = ""
-        if not root_class_name or len(normalized_nodes) <= 2:
+
+        if not root_class_name and screen_name == "" and header_text == "":
             root_class_name = "SplashActivity"
 
-        print(f"[collect] Root className detectado: {root_class_name}")
-        print(f"[collect] tester={tester_norm} build={build_norm} screen={screen_name}")
-
-        # -------------------- Estado inicial --------------------
-        has_changes = False
-        prev_build_name = None
-        is_new_record = True
-
-        # -------------------- Buscar último snapshot --------------------
-        last = last_hash_for_screen(tester_norm, screen_name)
-        logger.debug(f"[collect] last_hash={last} current_hash={screens_id_val}")
-
-        prev_snapshot = None
-        if last:
-            with sqlite3.connect(DB_NAME) as conn:
-                conn.row_factory = sqlite3.Row
-                prev_snapshot = conn.execute("""
-                    SELECT class_name, build_id, collect_node_tree
-                    FROM accessibility_data
-                    WHERE header_text = ? AND class_name = ?
-                    ORDER BY id DESC LIMIT 1
-                """, (header_text, root_class_name)).fetchone()
-
-        if prev_snapshot:
-            prev_build_name = prev_snapshot["build_id"]
-            prev_nodes = json.loads(prev_snapshot["collect_node_tree"] or "[]")
-            is_new_record = build_norm != prev_build_name
-
-            # Ejecutar análisis y obtener cambios
-            has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
-
-            update_metrics(
-                tester_norm,
-                build_norm,
-                has_changes,
-                added_count=added_count,
-                removed_count=removed_count,
-                modified_count=modified_count
-            )
-            #return {"has_changes": has_changes}
-
-
+        # -------------------- 7) Verificar si ya existe --------------------
+        do_insert = True
         with sqlite3.connect(DB_NAME) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
-            existing = cursor.execute("""
+
+            existing = cursor.execute(
+                """
                 SELECT 1 FROM accessibility_data
-                WHERE tester_id=? AND build_id=? AND signature=?
-            """, (tester_norm, build_norm, signature)).fetchone()
+                WHERE tester_id=? AND build_id=? AND global_signature=? AND partial_signature=?
+                """,
+                (tester_norm, build_norm, global_signature, partial_signature),
+            ).fetchone()
 
-        do_insert = (is_new_record or has_changes) and not existing
+            if existing:
+                do_insert = False
 
-        if do_insert:
-            with sqlite3.connect(DB_NAME) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
+            # -------------------- 8) Insertar solo si hay cambios --------------------
+            if do_insert:
+                cursor.execute(
+                    """
                     INSERT INTO accessibility_data (
                         tester_id, build_id, timestamp, event_type, event_type_name,
                         package_name, class_name, text, content_description, screens_id,
-                        screen_names, header_text, collect_node_tree, signature,
-                        additional_info, tree_data, session_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    tester_norm, build_norm, event.timestamp, event.event_type,
-                    event.event_type_name, event.package_name, root_class_name,
-                    event.text, event.content_description, screens_id_val,
-                    event.screen_names, header_text,
-                    json.dumps(normalized_nodes, ensure_ascii=False),
-                    signature,
-                    json.dumps(event.additional_info or {}, ensure_ascii=False),
-                    json.dumps(event.tree_data or [], ensure_ascii=False),
-                    event.session_key
-                ))
-                conn.commit()
-            logger.info("[collect] Insert completado (nuevo build o cambios detectados).")
-            return {"status": "success", "inserted": True, "has_changes": has_changes}
+                        screen_names, header_text, collect_node_tree, global_signature,
+                        partial_signature, scroll_type, additional_info, tree_data,
+                        session_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        tester_norm,
+                        build_norm,
+                        event.timestamp,
+                        event.event_type,
+                        event.event_type_name,
+                        event.package_name,
+                        root_class_name,
+                        event.text,
+                        event.content_description,
+                        screens_id_val,
+                        event.screen_names,
+                        header_text,
+                        # 🔥 GUARDA RAW NODES, NO NORMALIZADOS
+                        json.dumps(raw_nodes, ensure_ascii=False),
 
-        # Si no hay cambios ni nuevo build
-        return {"status": "skipped", "inserted": False, "has_changes": has_changes}
+                        global_signature,
+                        partial_signature,
+                        scroll_type,
+                        json.dumps(event.additional_info or {}, ensure_ascii=False),
+                        json.dumps(event.tree_data or [], ensure_ascii=False),
+                        event.session_key,
+                    ),
+                )
+                conn.commit()
+
+            inserted_id = cursor.lastrowid
+            # logger.info("[collect] Insert completado (nuevo build o cambios detectados).")
+
+        # -------------------- 9) Encolar para análisis --------------------
+        await event_queue.put((event, do_insert, partial_signature))
+
+        # -------------------- 10) Entrenar modelo incremental --------------------
+        has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
+
+        # -------------------- 11) Respuesta --------------------
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "accepted",
+                "inserted": do_insert,
+                "session_key": event.session_key,
+                "scroll_type": scroll_type,
+                "global_signature": global_signature,
+                "partial_signature": partial_signature
+            },
+        )
 
     except Exception as e:
         logger.error(f"Error en /collect: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+# @app.post("/collect")
+# async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundTasks):
+#     logger.debug("Raw request: %s", event.model_dump())
+#     try:
+#         # -------------------- Normalización --------------------
+#         raw_nodes = event.collect_node_tree or event.tree_data or []
+#         normalized_nodes = normalize_tree(raw_nodes)
+#         signature = stable_signature(raw_nodes)
+#         signature = stable_signatures(raw_nodes, header_text=event.header_text or "")
+#         global_signature = signature["global_signature"]
+#         partial_signature = signature["partial_signature"]
+
+#         has_changes = False
+#         prev_build_name = None
+#         is_new_record = True
+
+#         # has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
+        
+#         norm = _normalize_event_fields(event)
+#         tester_norm = norm.get("tester_id_norm")
+#         build_norm = norm.get("build_id_norm")
+#         screen_name = event.screen_names or ""
+#         header_text = event.header_text or ""
+#         screens_id_val = event.screens_id or norm.get("screensId") or None
+
+#         # Detecta el tipo de scroll (vertical/horizontal)
+#         scroll_type = detect_scroll_type(raw_nodes)
+
+#         # -------------------- 🧠 Generar o recuperar session_key --------------------
+#         base = tester_norm or getattr(event, "tester_id", "anon")
+#         minute_block = int(time.time() // 60)
+#         event.session_key = getattr(event, "session_key", None) or f"{base}_{minute_block}"
+
+#         # Class raíz
+#         if normalized_nodes and isinstance(normalized_nodes, list):
+#             root_class_name = normalized_nodes[0].get("className", "") if isinstance(normalized_nodes[0], dict) else ""
+#         else:
+#             root_class_name = ""
+#         if not root_class_name and screen_name == "" and header_text == "":
+#             root_class_name = "SplashActivity"
+
+#         #print(f"[collect] Root className detectado: {root_class_name}")
+#         #print(f"[collect] tester={tester_norm} build={build_norm} screen={screen_name}")
+
+#         # -------------------- Estado inicial --------------------
+
+
+#         # -------------------- Buscar último snapshot --------------------
+#         last = last_hash_for_screen(tester_norm, screen_name)
+#         logger.debug(f"[collect] last_hash={last} current_hash={screens_id_val}")
+
+        
+        
+        
+#         # -------------------- Insert snapshot mínimo --------------------
+#         do_insert = True
+#         with sqlite3.connect(DB_NAME) as conn:
+#             conn.execute("PRAGMA journal_mode=WAL;")
+#             cursor = conn.cursor()
+#             # existing = cursor.execute(
+#             #     "SELECT 1 FROM accessibility_data WHERE tester_id=? AND build_id=? AND signature=?",
+#             #     (tester_norm, build_norm, signature),
+#             # ).fetchone()
+
+#             existing = cursor.execute(
+#                 """
+#                 SELECT 1 FROM accessibility_data
+#                 WHERE tester_id=? AND build_id=? AND global_signature=? AND partial_signature=?
+#                 """,
+#                 (tester_norm, build_norm, global_signature, partial_signature),
+#             ).fetchone()
+#             if existing:
+#                 do_insert = False
+
+#             if do_insert:
+#                 cursor.execute(
+#                     """
+#                     INSERT INTO accessibility_data (
+#                         tester_id, build_id, timestamp, event_type, event_type_name,
+#                         package_name, class_name, text, content_description, screens_id,
+#                         screen_names, header_text, collect_node_tree, global_signature, partial_signature, scroll_type,
+#                         additional_info, tree_data, session_key
+#                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+#                     """,
+#                     (
+#                         tester_norm,
+#                         build_norm,
+#                         event.timestamp,
+#                         event.event_type,
+#                         event.event_type_name,
+#                         event.package_name,
+#                         root_class_name,
+#                         event.text,
+#                         event.content_description,
+#                         screens_id_val,
+#                         event.screen_names,
+#                         header_text,
+#                         json.dumps(normalized_nodes, ensure_ascii=False),
+#                         global_signature,
+#                         partial_signature,
+#                         scroll_type,
+#                         json.dumps(event.additional_info or {}, ensure_ascii=False),
+#                         json.dumps(event.tree_data or [], ensure_ascii=False),
+#                         event.session_key,
+#                     ),
+#                 )
+#                 conn.commit()
+
+                
+
+#             inserted_id = cursor.lastrowid    
+#             logger.info("[collect] Insert completado (nuevo build o cambios detectados).")
+#             # {"status": "success", "inserted": True, "has_changes": has_changes, "event": event, "record_id": inserted_id}
+
+#             # Si no hay cambios ni nuevo build
+#         #return {"status": "skipped", "inserted": False, "has_changes": has_changes, "event": event}    
+
+        
+#         # -------------------- Encolar para análisis eficiente --------------------
+#         await event_queue.put((event, do_insert, partial_signature))  # enviamos si fue insertado + signature
+
+
+#         has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
+        
+#         #return {"status": "skipped", "inserted": False, "has_changes": has_changes, "event": event}
+    
+#         # -------------------- Respuesta inmediata --------------------
+#         return JSONResponse(
+#             status_code=202,
+#             content={
+#                 "status": "accepted",
+#                 "inserted": do_insert,
+#                 "session_key": event.session_key,
+#                 "scroll_type": scroll_type,
+#                 "global_signature": global_signature,
+#                 "partial_signature": partial_signature
+#             },
+#         )
+
+
+    
+    # except Exception as e:
+    #     logger.error(f"Error en /collect: {e}", exc_info=True)
+    #     return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+    #     prev_snapshot = None
+    #     if last:
+    #         with sqlite3.connect(DB_NAME) as conn:
+    #             conn.row_factory = sqlite3.Row
+    #             prev_snapshot = conn.execute("""
+    #                 SELECT class_name, build_id, collect_node_tree
+    #                 FROM accessibility_data
+    #                 WHERE header_text = ? AND class_name = ?
+    #                 ORDER BY id DESC LIMIT 1
+    #             """, (header_text, root_class_name)).fetchone()
+
+    #     if prev_snapshot:
+    #         prev_build_name = prev_snapshot["build_id"]
+    #         prev_nodes = json.loads(prev_snapshot["collect_node_tree"] or "[]")
+    #         is_new_record = build_norm != prev_build_name
+
+    #         # Ejecutar análisis y obtener cambios
+    #         has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
+
+    #         # update_metrics(
+    #         #     tester_norm,
+    #         #     build_norm,
+    #         #     has_changes,
+    #         #     added_count=added_count,
+    #         #     removed_count=removed_count,
+    #         #     modified_count=modified_count
+    #         # )
+    #         #return {"has_changes": has_changes}
+
+
+    #     with sqlite3.connect(DB_NAME) as conn:
+    #         cursor = conn.cursor()
+    #         existing = cursor.execute("""
+    #             SELECT 1 FROM accessibility_data
+    #             WHERE tester_id=? AND build_id=? AND signature=?
+    #         """, (tester_norm, build_norm, signature)).fetchone()
+
+    #     do_insert = (is_new_record or has_changes) and not existing
+
+    #     if do_insert:
+    #         with sqlite3.connect(DB_NAME) as conn:
+    #             cursor = conn.cursor()
+    #             cursor.execute("""
+    #                 INSERT INTO accessibility_data (
+    #                     tester_id, build_id, timestamp, event_type, event_type_name,
+    #                     package_name, class_name, text, content_description, screens_id,
+    #                     screen_names, header_text, collect_node_tree, signature,
+    #                     additional_info, tree_data, session_key
+    #                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    #             """, (
+    #                 tester_norm, build_norm, event.timestamp, event.event_type,
+    #                 event.event_type_name, event.package_name, root_class_name,
+    #                 event.text, event.content_description, screens_id_val,
+    #                 event.screen_names, header_text,
+    #                 json.dumps(normalized_nodes, ensure_ascii=False),
+    #                 signature,
+    #                 json.dumps(event.additional_info or {}, ensure_ascii=False),
+    #                 json.dumps(event.tree_data or [], ensure_ascii=False),
+    #                 event.session_key
+    #             ))
+    #             conn.commit()
+
+    #         inserted_id = cursor.lastrowid    
+    #         logger.info("[collect] Insert completado (nuevo build o cambios detectados).")
+    #         return {"status": "success", "inserted": True, "has_changes": has_changes, "event": event, "record_id": inserted_id}
+
+    #     # Si no hay cambios ni nuevo build
+    #     return {"status": "skipped", "inserted": False, "has_changes": has_changes, "event": event}
+
+    # except Exception as e:
+    #     logger.error(f"Error en /collect: {e}", exc_info=True)
+    #     return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+    
+
+async def worker_process_queue():
+    while True:
+        batch = []
+        try:
+            item = await event_queue.get()
+            batch.append(item)
+
+            # Recolecta más eventos por un corto periodo
+            start = time.time()
+            while len(batch) < BATCH_SIZE and (time.time() - start) < BATCH_INTERVAL:
+                try:
+                    batch.append(event_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0.05)
+
+            for ev, inserted, signature in batch:
+                try:
+                    norm = _normalize_event_fields(ev)
+                    tester_norm = norm.get("tester_id_norm")
+                    build_norm = norm.get("build_id_norm")
+                    screen_name = ev.screen_names
+
+                    # Debounce por pantalla
+                    key = (tester_norm, screen_name)
+                    now = time.time()
+                    last_time = last_processed.get(key, 0)
+                    if now - last_time < DEBOUNCE_TIME:
+                        logger.debug(f"[worker] Skipping debounce: {key}")
+                        continue
+                    last_processed[key] = now
+
+                    # -------------------- Solo analizar si insertó o cambio de snapshot --------------------
+                    if not inserted:
+                        # Revisar si la última versión en DB es idéntica
+                        with sqlite3.connect(DB_NAME) as conn:
+                            existing_sig = conn.execute(
+                                "SELECT signature FROM accessibility_data WHERE tester_id=? AND build_id=? ORDER BY created_at DESC LIMIT 1",
+                                (tester_norm, build_norm)
+                            ).fetchone()
+                            if existing_sig and existing_sig[0] == signature:
+                                logger.debug(f"[worker] No cambios reales detectados para {tester_norm}/{screen_name}")
+                                continue
+
+                    # -------------------- Ejecutar análisis y métricas --------------------
+                    has_changes, added_count, removed_count, modified_count = await analyze_and_train(ev)
+                    if has_changes:
+                        update_metrics(
+                            tester_norm,
+                            build_norm,
+                            has_changes,
+                            added_count=added_count,
+                            removed_count=removed_count,
+                            modified_count=modified_count
+                        )
+                        logger.info(f"[worker] Procesado y métricas actualizadas: {tester_norm}/{screen_name}")
+
+                except Exception as e:
+                    logger.error(f"[worker] Error procesando evento: {e}", exc_info=True)
+
+        except Exception as e:
+            logger.error(f"[worker] Error general en worker: {e}", exc_info=True)
+
+        await asyncio.sleep(0.01)
+
+
+# @app.post("/collect")
+# async def collect_event(event: AccessibilityEvent):
+#     try:
+#         # -------------------- Normalización mínima --------------------
+#         raw_nodes = event.collect_node_tree or event.tree_data or []
+#         normalized_nodes = normalize_tree(raw_nodes)
+
+#         # Detecta el tipo de scroll (vertical/horizontal)
+#         scroll_type = detect_scroll_type(raw_nodes)
+
+
+#         signature = stable_signatures(raw_nodes, header_text=event.header_text or "")
+#         global_signature = signature["global_signature"]
+#         partial_signature = signature["partial_signature"]
+
+
+#         norm = _normalize_event_fields(event)
+#         tester_norm = norm.get("tester_id_norm")
+#         build_norm = norm.get("build_id_norm")
+#         screen_name = event.screen_names or ""
+#         header_text = event.header_text or ""
+#         screens_id_val = event.screens_id or norm.get("screensId") or None
+
+#         # -------------------- Session key --------------------
+#         base = tester_norm or getattr(event, "tester_id", "anon")
+#         minute_block = int(time.time() // 60)
+#         event.session_key = getattr(event, "session_key", None) or f"{base}_{minute_block}"
+
+#         # -------------------- Root class --------------------
+#         root_class_name = (
+#             normalized_nodes[0].get("className", "")
+#             if normalized_nodes and isinstance(normalized_nodes, list) and isinstance(normalized_nodes[0], dict)
+#             else ""
+#         )
+#         if not root_class_name or len(normalized_nodes) <= 2:
+#             root_class_name = "SplashActivity"
+
+#         # -------------------- Insert snapshot mínimo --------------------
+#         do_insert = True
+#         with sqlite3.connect(DB_NAME) as conn:
+#             conn.execute("PRAGMA journal_mode=WAL;")
+#             cursor = conn.cursor()
+#             # existing = cursor.execute(
+#             #     "SELECT 1 FROM accessibility_data WHERE tester_id=? AND build_id=? AND signature=?",
+#             #     (tester_norm, build_norm, signature),
+#             # ).fetchone()
+
+#             existing = cursor.execute(
+#                 """
+#                 SELECT 1 FROM accessibility_data
+#                 WHERE tester_id=? AND build_id=? AND global_signature=? AND partial_signature=?
+#                 """,
+#                 (tester_norm, build_norm, global_signature, partial_signature),
+#             ).fetchone()
+#             if existing:
+#                 do_insert = False
+
+#             if do_insert:
+#                 cursor.execute(
+#                     """
+#                     INSERT INTO accessibility_data (
+#                         tester_id, build_id, timestamp, event_type, event_type_name,
+#                         package_name, class_name, text, content_description, screens_id,
+#                         screen_names, header_text, collect_node_tree, global_signature, partial_signature, scroll_type,
+#                         additional_info, tree_data, session_key
+#                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+#                     """,
+#                     (
+#                         tester_norm,
+#                         build_norm,
+#                         event.timestamp,
+#                         event.event_type,
+#                         event.event_type_name,
+#                         event.package_name,
+#                         root_class_name,
+#                         event.text,
+#                         event.content_description,
+#                         screens_id_val,
+#                         event.screen_names,
+#                         header_text,
+#                         json.dumps(normalized_nodes, ensure_ascii=False),
+#                         global_signature,
+#                         partial_signature,
+#                         scroll_type,
+#                         json.dumps(event.additional_info or {}, ensure_ascii=False),
+#                         json.dumps(event.tree_data or [], ensure_ascii=False),
+#                         event.session_key,
+#                     ),
+#                 )
+#                 conn.commit()
+
+#         # -------------------- Encolar para análisis eficiente --------------------
+#         await event_queue.put((event, do_insert, partial_signature))  # enviamos si fue insertado + signature
+
+#         # -------------------- Respuesta inmediata --------------------
+#         return JSONResponse(
+#             status_code=202,
+#             content={
+#                 "status": "accepted",
+#                 "inserted": do_insert,
+#                 "session_key": event.session_key,
+#                 "scroll_type": scroll_type,
+#                 "global_signature": global_signature,
+#                 "partial_signature": partial_signature
+#             },
+#         )
+
+#     except Exception as e:
+#         logger.error(f"Error en /collect: {e}", exc_info=True)
+#         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+
+# @app.post("/analyze-train")
+# async def analyze_train_endpoint(event: AccessibilityEvent):
+#     try:
+#         has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
+#         return {
+#             "has_changes": has_changes,
+#             "added": added_count,
+#             "removed": removed_count,
+#             "modified": modified_count
+#         }
+#     except Exception as e:
+#         logger.exception("Error en /analyze-train:")
+#         return JSONResponse(
+#             status_code=500,
+#             content={"error": str(e)}
+#         )
 
 
 @app.get("/status")
@@ -1852,13 +3535,16 @@ async def trigger_incremental_train(
             "message": "Se requiere 'enriched_vector' para el entrenamiento incremental."
         }
 
+
+
     # Llamar al entrenamiento incremental híbrido
     await _train_incremental_logic_hybrid(
         enriched_vector=np.array(enriched_vector, dtype=float),
         tester_id=tester_id,
         build_id=build_id,
         app_name=app_name,
-        screen_id=screen_id,
+        #screen_id=screen_id,
+        screen_id=semantic_screen_id_ctx.get(),
         min_samples=min_samples,
         use_general_as_base=use_general_as_base
     )
@@ -1885,9 +3571,10 @@ def extract_numeric_version(v: str) -> str:
 def get_screen_diffs(
     tester_id: Optional[str] = Query(None),
     build_id: Optional[str] = Query(None),
-    screen_name: Optional[str] = Query(None),
+    header_text: Optional[str] = Query(None),
     only_pending: bool = Query(True)
 ):
+
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
@@ -1908,7 +3595,7 @@ def get_screen_diffs(
         query += " AND (s.tester_id = ? OR (s.tester_id IS NULL AND ? = ''))"
         params.extend([tester_id, tester_id])
 
-    if screen_name is not None:
+    if header_text is not None:
         query += """
             AND (
                 LOWER(TRIM(s.header_text)) LIKE LOWER(TRIM(?))
@@ -1916,8 +3603,8 @@ def get_screen_diffs(
                 OR (s.header_text IS NULL AND ? = '')
             )
         """
-        like_pattern = f"%{screen_name.strip()}%"
-        params.extend([like_pattern, screen_name, screen_name])
+        like_pattern = f"%{header_text.strip()}%"
+        params.extend([like_pattern, header_text, header_text])
 
     query += " ORDER BY s.created_at DESC"
 
@@ -2035,6 +3722,8 @@ def get_screen_diffs(
             screen_status = "identical"      # No hay cambios → idéntica
         elif overlap_ratio >= 0.8:
             screen_status = "minor_changes"  # Cambios menores
+        elif overlap_ratio >= 1:
+            screen_status = "no_changes"  # Sin Cambios    
         else:
             screen_status = "different"      # Cambios grandes o sin overlap suficiente
 
@@ -2151,10 +3840,10 @@ def get_screen_diffs(
         ])
 
     # Si quieres un indicador global
-    # has_changes = any(d["has_changes"] for d in diffs)
+    #has_changes = any(d["has_changes"] for d in diffs)
     has_changes = any(diff.get("has_changes", False) for diff in diffs)
 
-    print(f"🧩 has_changes={has_changes} | total_diffs={len(diffs)}")
+    #print(f"🧩 has_changes={has_changes} | total_diffs={len(diffs)}")
 
     return {
         "screen_diffs": diffs,
@@ -2349,40 +4038,40 @@ async def cleanup_approvals_rejections(older_than_days: int = 90):
     
 
 
-@app.on_event("startup")
-@repeat_every(seconds=86400)  # 1 día
-def scheduled_cleanup() -> None:
-    from datetime import datetime, timedelta
-    import sqlite3
+# @app.on_event("startup")
+# @repeat_every(seconds=86400)  # 1 día
+# def scheduled_cleanup() -> None:
+#     from datetime import datetime, timedelta
+#     import sqlite3
 
-    older_than_days = 90
-    cutoff = datetime.utcnow() - timedelta(days=older_than_days)
-    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+#     older_than_days = 90
+#     cutoff = datetime.utcnow() - timedelta(days=older_than_days)
+#     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("""
-        DELETE FROM screen_diffs
-        WHERE id IN (
-            SELECT s.id
-            FROM screen_diffs s
-            JOIN diff_approvals a ON a.diff_id = s.id
-            WHERE s.created_at < ?
-        )
-    """, (cutoff_str,))
-    c.execute("""
-        DELETE FROM screen_diffs
-        WHERE id IN (
-            SELECT s.id
-            FROM screen_diffs s
-            JOIN diff_rejections r ON r.diff_id = s.id
-            WHERE s.created_at < ?
-        )
-    """, (cutoff_str,))
-    c.execute("DELETE FROM diff_approvals WHERE created_at < ?", (cutoff_str,))
-    c.execute("DELETE FROM diff_rejections WHERE created_at < ?", (cutoff_str,))
-    conn.commit()
-    conn.close()
+#     conn = sqlite3.connect(DB_NAME)
+#     c = conn.cursor()
+#     c.execute("""
+#         DELETE FROM screen_diffs
+#         WHERE id IN (
+#             SELECT s.id
+#             FROM screen_diffs s
+#             JOIN diff_approvals a ON a.diff_id = s.id
+#             WHERE s.created_at < ?
+#         )
+#     """, (cutoff_str,))
+#     c.execute("""
+#         DELETE FROM screen_diffs
+#         WHERE id IN (
+#             SELECT s.id
+#             FROM screen_diffs s
+#             JOIN diff_rejections r ON r.diff_id = s.id
+#             WHERE s.created_at < ?
+#         )
+#     """, (cutoff_str,))
+#     c.execute("DELETE FROM diff_approvals WHERE created_at < ?", (cutoff_str,))
+#     c.execute("DELETE FROM diff_rejections WHERE created_at < ?", (cutoff_str,))
+#     conn.commit()
+#     conn.close()
     
     
    
@@ -2475,7 +4164,7 @@ async def websocket_status(websocket: WebSocket):
 
 @router.post("/send-reset-code")
 def send_reset_code(req: ResetRequest):
-    print(f"📩 Petición recibida desde Android: {req.email}")
+    #print(f"📩 Petición recibida desde Android: {req.email}")
     try:
         code = generate_code()
         codes_db[req.email] = {"code": code, "expires": time.time() + 300}  # 5 minutos
@@ -2502,7 +4191,7 @@ def reset_password(req: ResetPasswordRequest):
 
     try:
         # Actualizar la contraseña real en tu DB principal
-        print(f"🔑 Password for {req.email} updated to: {req.new_password}")
+        #print(f"🔑 Password for {req.email} updated to: {req.new_password}")
         # aquí iría tu lógica real de actualización en tu tabla de usuarios
 
         # Solo si la actualización es exitosa, eliminar el código
@@ -2521,9 +4210,84 @@ def reset_password(req: ResetPasswordRequest):
         raise HTTPException(status_code=500, detail=f"Error actualizando contraseña: {e}")
     
 
+# @router.post("/create_code")
+# async def create_code(usuario_id: str, duracion_dias: int = 30, usos_permitidos: int = 1):
+#     # Generar el código (formato similar al de Android)
+#     chars = string.ascii_uppercase + string.digits
+#     prefix_char = random.choice(chars)
+#     device_prefix = ''.join(random.choices("0123456789ABCDEF", k=2))
+#     random_part = str(random.randint(0, 9999)).zfill(4)
+#     codigo = f"{prefix_char}{device_prefix}{random_part}"
+
+#     generado_en = int(time.time())
+#     expira_en = generado_en + duracion_dias * 24 * 3600
+
+#     # Guardar en SQLite
+#     with sqlite3.connect(DB_NAME) as conn:
+#         conn.execute("PRAGMA journal_mode=WAL;")
+#         c = conn.cursor()
+#         c.execute("""
+#             INSERT INTO login_codes     
+#             (codigo, usuario_id, generado_en, expira_en, usos_permitidos, usos_actuales, activo)
+#             VALUES (?, ?, ?, ?, ?, ?, ?)
+#         """,  (codigo, usuario_id, generado_en, expira_en, usos_permitidos, 0, 1))
+#         conn.commit()
+
+#     return {"codigo": codigo, "expira_en": expira_en, "duracion_dias": duracion_dias}
+
+# @router.post("/validate_code")
+# async def validate_code(request: Request):
+#     data = await request.json()
+#     codigo = data.get("codigo", "").strip().upper()
+
+#     if not codigo:
+#         return {"valid": False, "reason": "Código vacío"}
+
+#     now = int(time.time())
+
+#     with sqlite3.connect(DB_NAME) as conn:
+#         conn.execute("PRAGMA journal_mode=WAL;")
+#         conn.row_factory = sqlite3.Row
+#         c = conn.cursor()
+#         row = c.execute("""
+#             SELECT * FROM login_codes
+#             WHERE codigo = ? AND activo = 1
+#         """, (codigo,)).fetchone()
+
+#         if not row:
+#             return {"valid": False, "reason": "Código no encontrado"}
+
+#         # Validar expiración
+#         if now > row["expira_en"]:
+#             return {"valid": False, "reason": "Código expirado"}
+
+#         # Validar usos permitidos
+#         if row["usos_actuales"] >= row["usos_permitidos"]:
+#             return {"valid": False, "reason": "Límite de usos alcanzado"}
+
+#         # Incrementar uso
+#         c.execute("""
+#             UPDATE login_codes
+#             SET usos_actuales = usos_actuales + 1
+#             WHERE codigo = ?
+#         """, (codigo,))
+#         conn.commit()
+
+#         restante = row["expira_en"] - now
+
+#     return {
+#         "valid": True,
+#         "codigo": codigo,
+#         "usuario_id": row["usuario_id"],
+#         "expira_en": row["expira_en"],
+#         "restante_en_segundos": restante,
+#         "usos_restantes": row["usos_permitidos"] - (row["usos_actuales"] + 1)
+#     }
+
 @router.post("/create_code")
 async def create_code(usuario_id: str, duracion_dias: int = 30, usos_permitidos: int = 1):
-    # Generar el código (formato similar al de Android)
+    import random, string, time, sqlite3
+
     chars = string.ascii_uppercase + string.digits
     prefix_char = random.choice(chars)
     device_prefix = ''.join(random.choices("0123456789ABCDEF", k=2))
@@ -2533,20 +4297,70 @@ async def create_code(usuario_id: str, duracion_dias: int = 30, usos_permitidos:
     generado_en = int(time.time())
     expira_en = generado_en + duracion_dias * 24 * 3600
 
-    # Guardar en SQLite
     with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.row_factory = sqlite3.Row
         c = conn.cursor()
+
+        # 1️⃣ Verificar si el usuario tiene plan activo
+        plan = c.execute("""
+            SELECT id, plan_name, price, no_associate, max_tester
+            FROM active_plans
+            WHERE active = 1
+            ORDER BY id ASC LIMIT 1
+        """).fetchone()
+
+        if plan:
+            plan_id = plan["id"]
+            price = plan["price"]
+            max_tester = plan["max_tester"]
+
+            # Verificar si el usuario no ha superado su límite mensual (30 códigos)
+            codigos_mes = c.execute("""
+                SELECT COUNT(*) AS total FROM login_codes
+                WHERE usuario_id = ? AND plan_id = ? AND activo = 1
+            """, (usuario_id, plan_id)).fetchone()["total"]
+
+            if codigos_mes >= 30:
+                return {"success": False, "reason": "Límite de 30 códigos alcanzado este mes."}
+
+            costo = price
+            plan_tipo = plan["plan_name"]
+
+        else:
+            # Usuario sin plan activo
+            plan = c.execute("""
+                SELECT id, no_associate FROM active_plans
+                WHERE plan_name = 'BASIC'
+            """).fetchone()
+            if not plan:
+                return {"success": False, "reason": "No hay plan base configurado."}
+
+            plan_id = plan["id"]
+            costo = plan["no_associate"]
+            plan_tipo = "NO_PLAN"
+
+        # 2️⃣ Guardar el código generado
         c.execute("""
-            INSERT INTO login_codes     
-            (codigo, usuario_id, generado_en, expira_en, usos_permitidos, usos_actuales, activo)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,  (codigo, usuario_id, generado_en, expira_en, usos_permitidos, 0, 1))
+            INSERT INTO login_codes (codigo, usuario_id, plan_id, generado_en, expira_en, usos_permitidos, usos_actuales, activo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (codigo, usuario_id, plan_id, generado_en, expira_en, usos_permitidos, 0, 1))
         conn.commit()
 
-    return {"codigo": codigo, "expira_en": expira_en, "duracion_dias": duracion_dias}
+    return {
+        "success": True,
+        "codigo": codigo,
+        "plan": plan_tipo,
+        "costo_usd": costo,
+        "expira_en": expira_en,
+        "duracion_dias": duracion_dias
+    }
+
 
 @router.post("/validate_code")
 async def validate_code(request: Request):
+    import time, sqlite3
     data = await request.json()
     codigo = data.get("codigo", "").strip().upper()
 
@@ -2556,21 +4370,24 @@ async def validate_code(request: Request):
     now = int(time.time())
 
     with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA journal_mode=WAL;")
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
+
         row = c.execute("""
-            SELECT * FROM login_codes
-            WHERE codigo = ? AND activo = 1
+            SELECT l.*, a.plan_name
+            FROM login_codes l
+            LEFT JOIN active_plans a ON a.id = l.plan_id
+            WHERE l.codigo = ? AND l.activo = 1 AND l.is_paid = 1
         """, (codigo,)).fetchone()
 
         if not row:
             return {"valid": False, "reason": "Código no encontrado"}
 
-        # Validar expiración
         if now > row["expira_en"]:
             return {"valid": False, "reason": "Código expirado"}
 
-        # Validar usos permitidos
         if row["usos_actuales"] >= row["usos_permitidos"]:
             return {"valid": False, "reason": "Límite de usos alcanzado"}
 
@@ -2588,42 +4405,79 @@ async def validate_code(request: Request):
         "valid": True,
         "codigo": codigo,
         "usuario_id": row["usuario_id"],
+        "plan": row["plan_name"],
         "expira_en": row["expira_en"],
         "restante_en_segundos": restante,
         "usos_restantes": row["usos_permitidos"] - (row["usos_actuales"] + 1)
     }
 
+def verificar_pago_externo(payment_token: str) -> bool:
+    """
+    Mock temporal para simular la validación con un proveedor de pagos.
+    - Si el token contiene 'OK', se aprueba el pago.
+    - Si contiene 'FAIL', se rechaza.
+    - En otros casos, se aprueba aleatoriamente (80% éxito).
+    """
+    if not payment_token:
+        return False
+    if "OK" in payment_token.upper():
+        return True
+    if "FAIL" in payment_token.upper():
+        return False
+    # Modo aleatorio de prueba
+    return random.random() < 0.8
+
 @router.post("/confirm_payment")
 async def confirm_payment(request: Request):
-    data = await request.json()
-    codigo = data.get("codigo")
-    payment_token = data.get("payment_token")  # del proveedor
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body vacío o JSON inválido")
 
-    # 1️⃣ Validar que el código existe y no está activo
+    codigo = data.get("codigo")
+    payment_token = data.get("payment_token")
+    usuario_id = data.get("usuario_id")  # 👈 agregado
+
+    if not codigo or not payment_token or not usuario_id:
+        raise HTTPException(status_code=400, detail="Faltan parámetros requeridos")
+
+    # 1️⃣ Verificar que el código existe y pertenece al usuario
     with sqlite3.connect(DB_NAME) as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        row = c.execute("SELECT * FROM login_codes WHERE codigo = ?", (codigo,)).fetchone()
+        row = c.execute("""
+            SELECT * FROM login_codes 
+            WHERE codigo = ? AND usuario_id = ?
+        """, (codigo, usuario_id)).fetchone()
+
         if not row:
-            return {"success": False, "reason": "Código no encontrado"}
+            raise HTTPException(status_code=404, detail="Código no encontrado o no pertenece al usuario")
         if row["activo"] == 1:
-            return {"success": False, "reason": "Código ya pagado"}
+            raise HTTPException(status_code=400, detail="Código ya está activo o pagado")
 
-    # 2️⃣ Verificar pago con proveedor externo (Stripe, PayPal, etc.)
-    pago_exitoso = verificar_pago_externo(payment_token)  # función que implementas según el proveedor
+    # 2️⃣ Verificar pago (mock temporal)
+    pago_exitoso = verificar_pago_externo(payment_token)
 
-    if pago_exitoso:
-        # 3️⃣ Activar el código
-        with sqlite3.connect(DB_NAME) as conn:
-            c = conn.cursor()
-            c.execute("UPDATE login_codes SET activo = 1 WHERE codigo = ?", (codigo,))
-            conn.commit()
-        return {"success": True, "codigo": codigo}
-    else:
-        return {"success": False, "reason": "Pago no validado"}
+    if not pago_exitoso:
+        return {"success": False, "reason": "Pago rechazado por el proveedor (mock)"}
 
+    # 3️⃣ Activar el código solo si pertenece al usuario correcto
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("""
+            UPDATE login_codes
+            SET activo = 1
+            WHERE codigo = ? AND usuario_id = ?
+        """, (codigo, usuario_id))
+        conn.commit()
 
-    
+    return {
+        "success": True,
+        "codigo": codigo,
+        "usuario_id": usuario_id,
+        "message": "✅ Pago confirmado y código activado correctamente"
+    }
+
 
 @router.get("/qa_summary/{build_id}")
 def qa_summary(build_id: str, db: sqlite3.Connection = Depends(get_db)):
@@ -2916,6 +4770,214 @@ def qa_dashboard_advanced(tester_id: str, builds: Optional[int] = 5):
 
     return HTMLResponse(content=html_content)
 
+@app.get("/qa_report/{tester_id}", response_class=HTMLResponse)
+def qa_report(tester_id: str, builds: Optional[int] = 5):
+
+    import json
+    import sqlite3
+    from collections import defaultdict
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    # 🔍 Tomar los últimos builds y todas sus pantallas
+    c.execute("""
+        SELECT build_id, header_text, removed, added, modified, anomaly_score, cluster_id
+        FROM screen_diffs
+        WHERE tester_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (tester_id, builds * 50))
+
+    rows = c.fetchall()
+    conn.close()
+
+    # Estructuras
+    builds_dict = defaultdict(list)
+    cluster_map = defaultdict(list)
+
+    for build_id, screen, removed_raw, added_raw, modified_raw, anomaly_score, cluster_id in rows:
+
+        removed = json.loads(removed_raw) if removed_raw else []
+        added = json.loads(added_raw) if added_raw else []
+        modified = json.loads(modified_raw) if modified_raw else []
+
+        entry = {
+            "screen": screen,
+            "removed": removed,
+            "added": added,
+            "modified": modified,
+            "anomaly_score": anomaly_score or 0,
+            "cluster_id": cluster_id or "-"
+        }
+
+        builds_dict[build_id].append(entry)
+        cluster_map[entry["cluster_id"]].append(entry)
+
+    builds_sorted = sorted(builds_dict.keys())
+
+    # ======== HTML =========
+    html = """
+    <html>
+    <head>
+        <title>QA Report Avanzado</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+        <style>
+            body { font-family: Arial; padding:20px; }
+
+            .section-title {
+                margin-top: 40px;
+                font-size: 24px;
+                border-bottom: 2px solid #ccc;
+                padding-bottom: 5px;
+            }
+
+            table { width:100%; border-collapse:collapse; margin-bottom:20px; }
+            th, td { border:1px solid #ddd; padding:6px; }
+
+            .removed-row { background:#fdd; }
+            .added-row { background:#dfd; }
+            .modified-row { background:#ffd; }
+
+            .change-box {
+                margin:4px; padding:6px; border-radius:4px;
+                background:#fafafa; border:1px solid #ccc;
+            }
+
+            .similarity-low { color:red; font-weight:bold; }
+            .similarity-mid { color:orange; font-weight:bold; }
+            .similarity-high { color:green; font-weight:bold; }
+
+            details { margin-bottom:5px; }
+        </style>
+    </head>
+    <body>
+    """
+
+    html += f"<h1>Reporte Avanzado QA — Tester <b>{tester_id}</b></h1>"
+
+    # ============================
+    #   📊 SECCIÓN 1 — GRAFICO GENERAL
+    # ============================
+
+    removed_series = [sum(len(s["removed"]) for s in builds_dict[b]) for b in builds_sorted]
+    added_series   = [sum(len(s["added"]) for s in builds_dict[b]) for b in builds_sorted]
+    modified_series= [sum(len(s["modified"]) for s in builds_dict[b]) for b in builds_sorted]
+    anomaly_avg    = [
+        sum(s["anomaly_score"] for s in builds_dict[b]) / max(1, len(builds_dict[b]))
+        for b in builds_sorted
+    ]
+
+    html += """
+    <div class="section-title">📈 Tendencias Generales</div>
+    <canvas id="chart1" height="120"></canvas>
+    <script>
+        new Chart(document.getElementById('chart1'), {
+            type: 'line',
+            data: {
+                labels: """ + json.dumps(builds_sorted) + """,
+                datasets: [
+                    {label:'Removed', data:""" + json.dumps(removed_series) + """, borderColor:'red'},
+                    {label:'Added', data:""" + json.dumps(added_series) + """, borderColor:'green'},
+                    {label:'Modified', data:""" + json.dumps(modified_series) + """, borderColor:'orange'},
+                    {label:'Anomaly Avg', data:""" + json.dumps(anomaly_avg) + """, borderColor:'blue'}
+                ]
+            }
+        });
+    </script>
+    """
+
+    # ============================
+    #   🧬 SECCIÓN 2 — CLUSTERS
+    # ============================
+
+    html += """
+    <div class='section-title'>🧬 Clusters Detectados</div>
+    """
+
+    for cluster_id, screens in cluster_map.items():
+        color = f"hsl({hash(cluster_id) % 360}, 60%, 70%)"
+        html += f"<h3 style='color:{color}'>Cluster {cluster_id} ({len(screens)} pantallas)</h3>"
+
+        html += "<ul>"
+        for s in screens:
+            html += f"<li>{s['screen']}</li>"
+        html += "</ul>"
+
+    # ============================
+    #   📄 SECCIÓN 3 — DETALLE POR BUILD
+    # ============================
+
+    html += """
+    <div class="section-title">📄 Cambios por Build</div>
+    """
+
+    for build_id in builds_sorted:
+
+        html += f"<h2>Build {build_id}</h2>"
+        html += """
+        <table>
+        <tr><th>Pantalla</th><th>Removed</th><th>Added</th><th>Modified</th><th>Detalle</th></tr>
+        """
+
+        for s in builds_dict[build_id]:
+
+            html += f"""
+            <tr>
+                <td>{s['screen']}</td>
+                <td>{len(s['removed'])}</td>
+                <td>{len(s['added'])}</td>
+                <td>{len(s['modified'])}</td>
+                <td>
+                    <details>
+                        <summary>Ver detalles</summary>
+                        <div class='change-box'>
+            """
+
+            # REMOVED
+            if s["removed"]:
+                html += "<h4>Removed</h4>"
+                for item in s["removed"]:
+                    html += f"<div>- {item['node']['key']}</div>"
+
+            # ADDED
+            if s["added"]:
+                html += "<h4>Added</h4>"
+                for item in s["added"]:
+                    html += f"<div>+ {item['node']['key']}</div>"
+
+            # MODIFIED
+            if s["modified"]:
+                html += "<h4>Modified</h4>"
+                for item in s["modified"]:
+                    ch = item["changes"]
+
+                    sim = float(ch.get("similarity", 0))
+                    if sim < 0.4:
+                        cls = "similarity-low"
+                    elif sim < 0.7:
+                        cls = "similarity-mid"
+                    else:
+                        cls = "similarity-high"
+
+                    html += f"""
+                        <div class='change-box'>
+                            <b>{item['node']['class']}</b><br>
+                            <span class='{cls}'>Similarity: {sim:.2f}</span>
+                            <br>Old: {ch['text']['old']}
+                            <br>New: {ch['text']['new']}
+                        </div>
+                    """
+
+            html += "</div></details></td></tr>"
+
+        html += "</table>"
+
+    html += "</body></html>"
+
+    return HTMLResponse(content=html)
+
 
 app.include_router(diff_router)
 app.include_router(router, prefix="/api")
@@ -2942,3 +5004,212 @@ async def get_change_metrics(tester_id: str = None):
         return {"metrics": [dict(r) for r in rows]}
 
 
+@app.post("/update_rates")
+async def update_rates(usd_to_cop: float, usd_to_eur: float):
+    # Validaciones básicas
+    if usd_to_cop <= 0 or usd_to_eur <= 0:
+        raise HTTPException(status_code=400, detail="Las tasas deben ser mayores que cero.")
+
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            conn.execute("PRAGMA foreign_keys = ON;")
+            c = conn.cursor()
+            c.execute("""
+                UPDATE active_plans
+                SET rate_cop = ?, rate_eur = ?, updated_at = CURRENT_TIMESTAMP
+            """, (usd_to_cop, usd_to_eur))
+            conn.commit()
+
+        return {
+            "success": True,
+            "message": "Tasas actualizadas correctamente.",
+            "usd_to_cop": usd_to_cop,
+            "usd_to_eur": usd_to_eur
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al actualizar tasas: {str(e)}")
+    
+    
+@app.post("/train/sync-mode")
+async def sync_train_mode(payload: TrainModeRequest):
+    """
+    Endpoint intermedio que se llama desde Android.
+    Si train_general=True -> ejecuta entrenamiento general.
+    Si train_general=False -> ejecuta entrenamiento incremental.
+    """
+
+    if payload.train_general:
+        # 🔹 Modo general activado
+        await _train_general_logic_hybrid(
+            app_name=payload.app_name,
+            batch_size=1000,
+            min_samples=1,
+            update_general=True
+        )
+        return {
+            "status": "success",
+            "mode": "general",
+            "message": f"Entrenamiento general iniciado para {payload.app_name}"
+        }
+
+    else:
+        # 🔹 Modo incremental
+        if (
+            not payload.tester_id
+            or not payload.build_id
+            or not payload.screen_id
+            or not payload.enriched_vector
+        ):
+            return {
+                "status": "error",
+                "message": "Faltan parámetros para entrenamiento incremental"
+            }
+
+        await _train_incremental_logic_hybrid(
+            enriched_vector=np.array(payload.enriched_vector, dtype=float),
+            tester_id=payload.tester_id,
+            build_id=payload.build_id,
+            app_name=payload.app_name,
+            # screen_id=payload.screen_id,
+            screen_id=semantic_screen_id_ctx.get(),
+            min_samples=2,
+            use_general_as_base=True
+        )
+
+        return {
+            "status": "success",
+            "mode": "incremental",
+            "message": f"Entrenamiento incremental ejecutado para {payload.app_name}/{payload.screen_id}"
+        }
+
+
+def calculate_all_metrics():
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        # Limpia el resumen viejo
+        cur.execute("DELETE FROM metrics_summary")
+
+        # ----------------------------
+        #   A) MÉTRICAS POR PANTALLA
+        # ----------------------------
+
+        # % de cambio total
+        q1 = """
+            SELECT screen_signature,
+                   SUM(total_added + total_removed + total_modified) AS total_changes,
+                   COUNT(*) AS appearances,
+                   ROUND(100.0 * SUM(total_added + total_removed + total_modified) / COUNT(*), 2) AS change_rate
+            FROM changes
+            GROUP BY screen_signature
+        """
+        for r in cur.execute(q1).fetchall():
+            cur.execute("""
+                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                VALUES (?, ?, ?)
+            """, ("screen", f"change_rate_{r['screen_signature']}", r['change_rate']))
+
+        # Severidad
+        q2 = """
+            SELECT screen_signature,
+                   ROUND(AVG(total_modified),2) AS severity
+            FROM changes GROUP BY screen_signature
+        """
+        for r in cur.execute(q2).fetchall():
+            cur.execute("""
+                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                VALUES (?, ?, ?)
+            """, ("screen", f"severity_{r['screen_signature']}", r['severity']))
+
+        # Frecuencia aparición de pantalla
+        q3 = """
+            SELECT screen_signature, COUNT(*) AS freq
+            FROM collect GROUP BY screen_signature
+        """
+        for r in cur.execute(q3).fetchall():
+            cur.execute("""
+                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                VALUES (?, ?, ?)
+            """, ("screen", f"frequency_{r['screen_signature']}", r['freq']))
+
+        # -------------------------
+        #   B) MÉTRICAS POR BUILD
+        # -------------------------
+
+        # Build con más cambios
+        q4 = """
+            SELECT build_id, SUM(total_changes) AS changes
+            FROM metrics_changes
+            GROUP BY build_id
+            ORDER BY changes DESC LIMIT 1
+        """
+        r = cur.execute(q4).fetchone()
+        if r:
+            cur.execute("""
+                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                VALUES ('build', 'most_changes_build', ?)
+            """, (f"{r['build_id']} ({r['changes']} cambios)",))
+
+        # Build más inestable (tasa de cambios)
+        q5 = """
+            SELECT build_id,
+                   ROUND(100.0 * SUM(total_changes) / SUM(total_events), 2) AS instability
+            FROM metrics_changes
+            GROUP BY build_id ORDER BY instability DESC LIMIT 1
+        """
+        r = cur.execute(q5).fetchone()
+        if r:
+            cur.execute("""
+                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                VALUES ('build', 'most_unstable_build', ?)
+            """, (f"{r['build_id']} ({r['instability']}%)",))
+
+        # Ratio cambios/pantalla
+        q6 = """
+            SELECT build_id,
+                   ROUND(SUM(total_changes) * 1.0 / COUNT(DISTINCT screen_signature), 2) AS ratio
+            FROM changes GROUP BY build_id
+        """
+        for r in cur.execute(q6).fetchall():
+            cur.execute("""
+                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                VALUES ('build', ?, ?)
+            """, (f"change_screen_ratio_{r['build_id']}", r['ratio']))
+
+        # ------------------------------
+        #   C) MÉTRICAS GLOBAL QA LEAD
+        # ------------------------------
+
+        # Ranking pantallas más inestables (top 5)
+        q7 = """
+            SELECT screen_signature,
+                   ROUND(AVG(total_added + total_removed + total_modified),2) AS avg_changes
+            FROM changes GROUP BY screen_signature
+            ORDER BY avg_changes DESC LIMIT 5
+        """
+        rank = ", ".join([f"{row['screen_signature']}({row['avg_changes']})"
+                          for row in cur.execute(q7).fetchall()])
+        cur.execute("""
+            INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+            VALUES ('global', 'top_instable_screens', ?)
+        """, (rank,))
+
+        # Guardar fecha actualización
+        cur.execute("""
+            INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+            VALUES ('global', 'last_run', ?)
+        """, (datetime.now().isoformat(),))
+
+        conn.commit()
+
+    return {"status": "ok", "msg": "all metrics calculated"}
+
+
+@app.get("/metrics/all")
+async def metrics_all():
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM metrics_summary").fetchall()
+        return {"metrics": [dict(r) for r in rows]}       
