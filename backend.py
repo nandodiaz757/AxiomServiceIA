@@ -46,6 +46,7 @@ from stable_signature import normalize_node
 # =========================================================
 # CONFIGURACIÓN
 # =========================================================
+
 app = FastAPI()
 router = APIRouter() 
 siamese_model = None
@@ -244,315 +245,6 @@ class SiameseEncoder(nn.Module):
         model.load_state_dict(torch.load(path, map_location="cpu"))
         return model
     
- 
-
-# ==========================================
-# FUNCIONES AUXILIARES
-# ==========================================
-# async def worker_process_queue():
-#     while True:
-#         # Aquí procesas eventos de tu cola
-#         await asyncio.sleep(1)  # evita bloqueo total
-
-
-
-
-# # --- mapeos multilenguaje / canonical labels ---
-# CANONICAL = {
-#     # home / inicio
-#     "home": {"home", "inicio", "inicio.", "home_page"},
-#     # account / cuenta / profile
-#     "account": {"account", "cuenta", "perfil", "profile", "account_settings"},
-#     # favorites
-#     "favorites": {"favorites", "favoritos", "mis_favoritos", "mis favoritos", "favorito"},
-#     # offers
-#     "offers": {"offers", "ofertas", "promociones"},
-#     # search
-#     "search": {"search", "buscar", "busqueda", "buscar productos"},
-#     # cart / checkout
-#     "cart": {"cart", "carrito", "checkout", "pagar", "pago"},
-#     # orders / pedidos
-#     "orders": {"orders", "pedidos", "mis pedidos"},
-#     # login
-#     "login": {"login", "iniciar_sesion", "iniciar sesión", "sign_in"},
-#     # settings
-#     "settings": {"settings", "ajustes", "configuracion", "configuración"},
-#     # social
-#     "social": {"social", "sociales"},
-#     # help
-#     "help": {"help", "ayuda", "soporte"},
-# }
-
-# # invertir para lookup rápido
-# _CANON_LOOKUP = {}
-# for k, s in CANONICAL.items():
-#     for v in s:
-#         _CANON_LOOKUP[v] = k
-
-# # palabras/ruido a ignorar en headers (multilenguaje)
-# NOISE_PREFIXES = {"¡", "!", "(", "["}
-# DYNAMIC_PATTERNS = [
-#     r"https?://",  # urls
-#     r"\d{2,}",     # números largos (ids, timestamps)
-#     r"%",          # porcentajes
-# ]
-
-# # features template (mantener estructura)
-# DEFAULT_FEATURES = {
-#     # Android clásico
-#     "Button": 0, "MaterialButton": 0, "ImageButton": 0, "EditText": 0, "TextView": 0,
-#     "ImageView": 0, "CheckBox": 0, "RadioButton": 0, "Switch": 0, "Spinner": 0,
-#     "SeekBar": 0, "ProgressBar": 0, "RecyclerView": 0, "ListView": 0, "ScrollView": 0,
-#     "LinearLayout": 0, "RelativeLayout": 0, "ConstraintLayout": 0, "FrameLayout": 0,
-#     "CardView": 0,
-#     # Compose
-#     "ComposeView": 0, "Text": 0, "ButtonComposable": 0,
-#     # Híbridas / RN / Flutter / Ionic
-#     "RCTView": 0, "RCTText": 0, "RCTImageView": 0, "FlutterView": 0,
-#     "WebView": 0, "IonContent": 0, "IonButton": 0, "IonInput": 0,
-# }
-
-# # util: slugify / normalize (quita acentos y no-alfanum)
-# def slugify(text):
-#     if not text:
-#         return ""
-#     text = unicodedata.normalize("NFKD", text)
-#     text = "".join(ch for ch in text if not unicodedata.combining(ch))
-#     text = text.lower()
-#     text = re.sub(r"[^a-z0-9\s/_-]", "", text)
-#     text = re.sub(r"\s+", "_", text).strip("_")
-#     return text or ""
-
-# def looks_dynamic(txt):
-#     if not txt:
-#         return False
-#     t = txt.lower()
-#     if any(t.startswith(p) for p in NOISE_PREFIXES):
-#         return True
-#     for pat in DYNAMIC_PATTERNS:
-#         if re.search(pat, t):
-#             return True
-#     return False
-
-# def canonical_map(text):
-#     """Devuelve la etiqueta canonical si coincide con un conjunto de sinónimos."""
-#     if not text:
-#         return None
-#     t = slugify(text).replace("_", "")
-#     # buscar coincidencia por subcadena con los lookup keys
-#     for k in _CANON_LOOKUP:
-#         if k in t:
-#             return _CANON_LOOKUP[k]
-#     return None
-
-# # ========================
-# # Función principal
-# # ========================
-# def extract_semantic_screen_id(raw_nodes, *, return_components=False):
-#     """
-#     Genera un screen_id semántico y estable a partir de raw_nodes.
-#     - raw_nodes: lista de dicts tal como la tuya.
-#     - return_components: si True devuelve (screen_id, components_dict)
-#     """
-#     if not raw_nodes:
-#         return ("unknown_screen", {}) if return_components else "unknown_screen"
-
-#     # copia features
-#     features = dict(DEFAULT_FEATURES)
-
-#     texts = []          # textos detectados (tuplas (index, text, className, desc, selected_flag))
-#     nav_candidates = [] # (index, text)
-#     indices_map = []    # para posición
-
-#     # flags framework / ui
-#     frameworks = {"compose": False, "flutter": False, "reactnative": False, "webview": False, "ionic": False, "native": False}
-#     ui = {"bottomnav": False, "tabs": False, "modal": False, "scroll": False, "list": False, "form": False}
-
-#     for idx, node in enumerate(raw_nodes):
-#         cls = (node.get("className") or "").strip()
-#         cls_low = cls.lower()
-#         txt = (node.get("text") or "") or (node.get("desc") or "")
-#         txt = txt.strip() if txt else ""
-#         selected = node.get("selected") or node.get("checked") or False
-#         xpath = node.get("xpath") or ""
-#         signature = (node.get("signature") or "").lower()
-
-#         # recolectar textos "útiles"
-#         if txt and not looks_dynamic(txt) and len(txt) > 1:
-#             texts.append((idx, txt, cls, node.get("desc")))
-
-#         # detectar labels de navegación (multilenguaje)
-#         candidate = slugify(txt).replace("_", "")
-#         if candidate in _CANON_LOOKUP:
-#             nav_candidates.append((idx, txt))
-
-#         # framework detection
-#         if "compose" in cls_low or "composeview" in cls_low:
-#             frameworks["compose"] = True
-#         if "flutter" in cls_low or "flutterview" in cls_low or "flutter" in signature:
-#             frameworks["flutter"] = True
-#         if cls_low.startswith("rct") or "reactnative" in cls_low or "rct" in signature:
-#             frameworks["reactnative"] = True
-#         if "webview" in cls_low or "html" in cls_low or "web" in signature:
-#             frameworks["webview"] = True
-#         if "ion" in cls_low or "ionic" in signature:
-#             frameworks["ionic"] = True
-
-#         # simple fallback: si ninguno detectado, será native
-#         # (lo seteamos al final si todos son False)
-#         # ui pattern heuristics
-#         if "scroll" in cls_low or "recycler" in cls_low or "listview" in cls_low or "recyclerview" in cls_low or "lazycolumn" in cls_low:
-#             ui["scroll"] = True
-#         if "recycler" in cls_low or "listview" in cls_low or "recyclerview" in cls_low or "collection" in signature:
-#             ui["list"] = True
-#         if "edittext" in cls_low or "input" in cls_low or "textbox" in cls_low:
-#             ui["form"] = True
-#         if "dialog" in cls_low or "popup" in cls_low or "alert" in cls_low:
-#             ui["modal"] = True
-#         if "tab" in cls_low or "tablayout" in cls_low or "viewpager" in cls_low:
-#             ui["tabs"] = True
-
-#         # features counting (si clase contiene key)
-#         for f in list(features.keys()):
-#             if f.lower() in cls_low:
-#                 features[f] = features.get(f, 0) + 1
-
-#     # if no specific framework flagged, assume native
-#     if not any(frameworks.values()):
-#         frameworks["native"] = True
-
-#     # --- Bottom nav detection robusta ---
-#     # heurística:
-#     #  - si hay >=3 nav candidates -> bottomnav True
-#     #  - si alguno de esos nav candidates aparece con selected=True -> pick it
-#     #  - si nav candidates aparecen en indices cercanos al final del tree -> bottomnav True
-#     bottom_tab = None
-#     if len(nav_candidates) >= 3:
-#         ui["bottomnav"] = True
-#         # elegir el candidato "activo": el que tenga selected o el más cercano al final
-#         selected_candidates = []
-#         for idx, txt in nav_candidates:
-#             node = raw_nodes[idx]
-#             if node.get("selected") or node.get("checked"):
-#                 selected_candidates.append((idx, txt))
-#         if selected_candidates:
-#             bottom_tab = selected_candidates[0][1]
-#         else:
-#             # tomar el de mayor indice (más abajo en el árbol)
-#             idx_sorted = sorted(nav_candidates, key=lambda x: x[0], reverse=True)
-#             bottom_tab = idx_sorted[0][1]
-
-#     else:
-#         # fallback: si header coincide con a canonical nav label, treat as bottom (ej: "Cuenta")
-#         # o si vemos varios labels del conjunto en el entire texts (aunque <3), assum bottom
-#         all_texts_lower = [slugify(t[1]).replace("_", "") for t in texts]
-#         found_navs = [t for t in all_texts_lower if t in _CANON_LOOKUP]
-#         if len(found_navs) >= 2:
-#             ui["bottomnav"] = True
-#             # pick last occurrence in texts
-#             for idx, txt, *_ in reversed(texts):
-#                 s = slugify(txt).replace("_", "")
-#                 if s in _CANON_LOOKUP:
-#                     bottom_tab = txt
-#                     break
-
-#     # --- Elección del text semántico (header) ---
-#     semantic_name = None
-#     # 1) Prefer text nodes that look like headers: TextView, large texts, not nav labels
-#     header_candidates = []
-#     for idx, txt, cls, desc in texts:
-#         cls_low = (cls or "").lower()
-#         # penalizar si parece nav label
-#         key = slugify(txt).replace("_", "")
-#         is_nav_label = key in _CANON_LOOKUP
-#         score = 0
-#         # prefer TextView / Title-like classes
-#         if "textview" in cls_low or "text" in cls_low:
-#             score += 3
-#         # prefer nodes that appear early (headers typically near top)
-#         score += max(0, 10 - idx // 20)
-#         # length bonus (titles no muy largas, pero más representativo)
-#         score += min(5, len(txt) // 10)
-#         if is_nav_label:
-#             score -= 5
-#         if not looks_dynamic(txt):
-#             header_candidates.append((score, idx, txt))
-
-#     if header_candidates:
-#         header_candidates.sort(reverse=True)  # highest score first
-#         # top candidate
-#         semantic_name = header_candidates[0][2]
-
-#     # 2) fallback: if none, use bottom_tab if exists
-#     if not semantic_name and bottom_tab:
-#         semantic_name = bottom_tab
-
-#     # 3) fallback: longest text
-#     if not semantic_name:
-#         all_text_raw = [t[1] for t in texts]
-#         if all_text_raw:
-#             semantic_name = max(all_text_raw, key=len)
-#         else:
-#             semantic_name = "screen"
-
-#     # normalize semantic_name
-#     sem_slug = slugify(semantic_name)
-#     # try canonical mapping to group synonyms across languages
-#     canonical = canonical_map(semantic_name)
-#     if canonical:
-#         sem_key = canonical
-#     else:
-#         sem_key = sem_slug or "screen"
-
-#     # --- construir jerarquía:
-#     # si bottomnav detected, base path = canonical(bottom_tab) or slug(bottom_tab)
-#     path_parts = []
-#     if ui["bottomnav"] and bottom_tab:
-#         bcanon = canonical_map(bottom_tab) or slugify(bottom_tab)
-#         path_parts.append(str(bcanon))
-#         # sub-level: semantic (if semantic different from bottom)
-#         if sem_key and sem_key != bcanon:
-#             path_parts.append(sem_key)
-#     else:
-#         # cuando no hay bottomnav, se puede usar sem_key and possible parent inference
-#         path_parts.append(sem_key)
-
-#     # tratar de inferir tercer nivel (lista vs detail)
-#     if ui["list"]:
-#         # si pantalla muestra lista, suffix 'list' o 'items'
-#         path_parts.append("list")
-#     elif ui["form"]:
-#         path_parts.append("form")
-#     # else no third level
-
-#     hierarchical = "/".join(path_parts)
-
-#     # --- construir flags string (orden estable)
-#     ui_flags = "|".join(f"{k}={str(ui[k]).lower()}" for k in ["bottomnav", "tabs", "modal", "scroll", "list", "form"])
-#     fw_flags = "|".join(f"{k}={str(frameworks[k]).lower()}" for k in ["compose", "flutter", "reactnative", "webview", "ionic", "native"])
-
-#     # --- short hash para evitar colisiones (8 hex)
-#     canonical_signature = f"{hierarchical}|{ui_flags}|{fw_flags}"
-#     short_hash = hashlib.sha1(canonical_signature.encode("utf-8")).hexdigest()[:8]
-
-#     # --- Final screen_id (jerárquico + flags + short hash)
-#     screen_id = f"{hierarchical}|{ui_flags}|{fw_flags}|h={short_hash}"
-
-#     # components for debugging / storage
-#     components = {
-#         "hierarchical": hierarchical,
-#         "semantic_name": semantic_name,
-#         "semantic_key": sem_key,
-#         "bottom_tab": bottom_tab,
-#         "ui": ui,
-#         "frameworks": frameworks,
-#         "features": features,
-#         "short_hash": short_hash,
-#         "canonical_signature": canonical_signature,
-#     }
-
-#     return (screen_id, components) if return_components else screen_id
-
 def extract_model_key(semantic_screen_id: str) -> str:
     """
     Devuelve una key corta y safe para usar como nombre de carpeta.
@@ -622,38 +314,6 @@ def extract_model_key(semantic_screen_id: str) -> str:
 
     return model_key
 
-
-
-# def extract_short_screen_id(semantic_screen_id: str) -> str:
-#     """
-#     Genera un ID corto, estable y seguro para carpetas.
-#     Formato: <short_name>_<8char_hash>
-
-#     Ejemplo:
-#         semantic="account_explore_bottomnav=true_scroll=false_h=3df11a86"
-#         → "account_3df11a86"
-#     """
-
-#     if not semantic_screen_id:
-#         return "unknown_" + hashlib.md5("empty".encode()).hexdigest()[:8]
-
-#     # --- 1. Tomar la primera parte semántica antes de flags (/|= etc) ---
-#     # Split por '_' pero algunos nombres pueden tener muchos _
-#     # Ejemplo: "account_favorites_bottomnav=true"
-#     base = semantic_screen_id.split("_")[0]
-
-#     # --- 2. Hacer folder-safe (solo letras y números) ---
-#     # Evita nombres vacíos o ilegales en Windows
-#     base = re.sub(r'[^a-zA-Z0-9]+', '', base)
-
-#     if not base:
-#         base = "screen"
-
-#     # --- 3. Hash estable del semantic_screen_id completo ---
-#     h = hashlib.md5(semantic_screen_id.encode()).hexdigest()[:8]
-
-#     # --- 4. Construir el ID final ---
-#     return f"{base}_{h}"
 
 def extract_short_screen_id(semantic_screen_id: str, max_base_len: int = 20) -> str:
     """
@@ -690,8 +350,6 @@ def is_baseline_build(app_name, tester_id, build_id):
     conn.close()
     return row is not None
 
-
-
 def sanitize_screen_id_for_fs(screen_id: str) -> str:
     """Sanitiza el screen_id para usarlo en paths del file system."""
     import re, hashlib
@@ -706,35 +364,6 @@ def sanitize_screen_id_for_fs(screen_id: str) -> str:
 
     return screen_id
 
-# def sanitize_screen_id_for_fs(screen_id: str) -> str:
-#     """Sanitiza el screen_id para usarlo en paths del file system."""
-#     import re
-        
-#     # Remover caracteres ilegales en Windows
-#     screen_id = re.sub(r'[<>:"/\\|?*]', '_', screen_id)
-
-#     # Limitar longitud (Windows falla > 240 chars)
-#     if len(screen_id) > 120:  # seguro para paths largos
-#         import hashlib
-#         h = hashlib.sha1(screen_id.encode()).hexdigest()[:8]
-#         screen_id = screen_id[:110] + "_h" + h
-
-#     return screen_id   
-
-# def sanitize_screen_id_for_fs(screen_id: str) -> str:
-#     """Sanitiza el screen_id para usarlo en paths del file system."""
-#     import re
-        
-#     # Reemplazar caracteres ilegales en Windows
-#     screen_id = re.sub(r'[<>:"/\\|?*]', '_', screen_id)
-
-#     # Limitar longitud
-#     if len(screen_id) > 120:
-#         import hashlib
-#         h = hashlib.sha1(screen_id.encode()).hexdigest()[:8]
-#         screen_id = screen_id[:110] + "_h" + h
-
-#     return screen_id
 
 # =====================================================
 # Sanitizador para filesystem (nuevo en versión 3.0)
@@ -757,6 +386,7 @@ def sanitize_for_fs(name: str) -> str:
 # =====================================================
 # Funciones auxiliares previas: slugify / dynamic / canonical
 # =====================================================
+
 NOISE_PREFIXES = {"¡", "!", "(", "["}
 DYNAMIC_PATTERNS = [
     r"https?://",
@@ -831,9 +461,6 @@ DEFAULT_FEATURES = {
     "IonContent": 0, "IonButton": 0, "IonInput": 0,
 }
 
-
-
-
 def looks_dynamic(text: str) -> bool:
     if not text:
         return False
@@ -860,7 +487,6 @@ def canonical_map(text: str):
 def sanitize_for_fs(text: str) -> str:
     bad = '<>:"/\\|?*'
     return "".join("_" if c in bad else c for c in text)
-
 
 # =====================================================
 # SCREEN-ID GENERATOR v4.0 (estable y compacto)
@@ -998,151 +624,6 @@ def build_screen_id(raw_nodes, *, return_components=False):
         }
     )
 
-
-# # =====================================================
-# # EXTRACTOR SEMÁNTICO v3.0
-# # =====================================================
-# def extract_semantic_screen_id(raw_nodes, *, return_components=False):
-#     if not raw_nodes:
-#         sid = "unknown_screen"
-#         return (sid, sanitize_for_fs(sid), {}) if return_components else sid
-
-#     # ---- (1) Recopilar info
-#     features = dict(DEFAULT_FEATURES)
-#     texts = []
-#     nav_candidates = []
-#     frameworks = {"compose": False, "flutter": False, "reactnative": False, "webview": False, "ionic": False, "native": False}
-#     ui = {"bottomnav": False, "tabs": False, "modal": False, "scroll": False, "list": False, "form": False}
-
-#     bottom_tab = None
-
-#     # Loop principal
-#     for idx, node in enumerate(raw_nodes):
-#         cls = (node.get("className") or "").strip()
-#         cls_low = cls.lower()
-#         signature = (node.get("signature") or "").lower()
-#         txt = (node.get("text") or "") or (node.get("desc") or "")
-#         txt = txt.strip()
-
-#         # recolectar textos útiles
-#         if txt and not looks_dynamic(txt):
-#             texts.append((idx, txt, cls))
-
-#         # detectar nav labels
-#         slug = slugify(txt).replace("_", "")
-#         if slug in _CANON_LOOKUP:
-#             nav_candidates.append((idx, txt))
-
-#         # detectar framework
-#         if "compose" in cls_low:
-#             frameworks["compose"] = True
-#         if "flutter" in cls_low or "flutter" in signature:
-#             frameworks["flutter"] = True
-#         if "rct" in cls_low or "reactnative" in signature:
-#             frameworks["reactnative"] = True
-#         if "webview" in cls_low:
-#             frameworks["webview"] = True
-#         if "ion" in cls_low:
-#             frameworks["ionic"] = True
-
-#         # UI patterns
-#         if "scroll" in cls_low or "recycler" in cls_low or "lazycolumn" in cls_low:
-#             ui["scroll"] = True
-#         if "recycler" in cls_low or "listview" in cls_low:
-#             ui["list"] = True
-#         if "edittext" in cls_low or "input" in cls_low:
-#             ui["form"] = True
-#         if "dialog" in cls_low or "alert" in cls_low:
-#             ui["modal"] = True
-#         if "tab" in cls_low:
-#             ui["tabs"] = True
-
-#         # features counting
-#         for f in features:
-#             if f.lower() in cls_low:
-#                 features[f] += 1
-
-#     # fallback -> native
-#     if not any(frameworks.values()):
-#         frameworks["native"] = True
-
-#     # ---- (2) Detectar bottom nav
-#     if len(nav_candidates) >= 3:
-#         ui["bottomnav"] = True
-#         bottom_tab = nav_candidates[-1][1]
-
-#     # ---- (3) Elegir semantic header
-#     semantic_name = None
-
-#     header_candidates = []
-#     for idx, txt, cls in texts:
-#         score = 0
-#         cl = cls.lower()
-#         if "text" in cl:
-#             score += 3
-#         score += max(0, 10 - idx // 20)
-#         score += min(5, len(txt) // 10)
-#         header_candidates.append((score, idx, txt))
-
-#     if header_candidates:
-#         header_candidates.sort(reverse=True)
-#         semantic_name = header_candidates[0][2]
-
-#     if not semantic_name:
-#         semantic_name = bottom_tab or "screen"
-
-#     sem_slug = slugify(semantic_name)
-#     sem_key = canonical_map(semantic_name) or sem_slug or "screen"
-
-#     # ---- (4) Jerarquía
-#     path_parts = []
-#     if ui["bottomnav"] and bottom_tab:
-#         bcanon = canonical_map(bottom_tab) or slugify(bottom_tab)
-#         path_parts.append(bcanon)
-#         if sem_key != bcanon:
-#             path_parts.append(sem_key)
-#     else:
-#         path_parts.append(sem_key)
-
-#     if ui["list"]:
-#         path_parts.append("list")
-#     elif ui["form"]:
-#         path_parts.append("form")
-
-#     hierarchical = "/".join(path_parts)
-
-#     # ---- (5) Flags
-#     ui_flags = "|".join(f"{k}={str(ui[k]).lower()}" for k in ui)
-#     fw_flags = "|".join(f"{k}={str(frameworks[k]).lower()}" for k in frameworks)
-
-#     # ---- (6) Hash corto
-#     canonical_signature = f"{hierarchical}|{ui_flags}|{fw_flags}"
-#     short_hash = hashlib.sha1(canonical_signature.encode()).hexdigest()[:8]
-
-#     # ---- (7) screen_id final
-#     screen_id = f"{hierarchical}|{ui_flags}|{fw_flags}|h={short_hash}"
-
-#     # ---- (8) screen_id seguro para filesystem
-#     screen_id_fs = sanitize_for_fs(screen_id)
-
-#     components = {
-#         "hierarchical": hierarchical,
-#         "semantic_name": semantic_name,
-#         "semantic_key": sem_key,
-#         "bottom_tab": bottom_tab,
-#         "ui": ui,
-#         "frameworks": frameworks,
-#         "features": features,
-#         "short_hash": short_hash,
-#         "canonical_signature": canonical_signature,
-#         "screen_id": screen_id,
-#         "screen_id_fs": screen_id_fs,
-#     }
-
-#     return (screen_id, screen_id_fs, components) if return_components else screen_id
-
-
-
 def clean_old_diff_records(days: int = 90):
     cutoff = datetime.utcnow() - timedelta(days=days)
     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
@@ -1219,25 +700,6 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Iniciando FastAPI y cargando modelo siamés...")
     load_siamese_model()
 
-    # Inicia tareas en background
-    # periodic_retrain()
-    # daily_cleanup()
-
-    # Inicia tareas en background correctamente
-
-
-    #no borrar aun
-    # asyncio.create_task(periodic_retrain())
-    # asyncio.create_task(daily_cleanup())
-
-
-
-
-    
-
-    # Si tuvieras un worker asíncrono:
-    # worker_task = asyncio.create_task(worker_process_queue())
-
     yield  # Aquí la app ya está corriendo
 
     # --- Shutdown ---
@@ -1250,66 +712,6 @@ async def lifespan(app: FastAPI):
 # ==============================
 
 app = FastAPI(lifespan=lifespan)
-
-
-# @app.on_event("startup")
-# async def startup_tasks():
-#     # 1️⃣ Iniciar worker
-#     logger.info("Iniciando worker profesional de eventos...")
-#     asyncio.create_task(worker_process_queue())
-
-#     # 2️⃣ Cargar modelo siamés
-#     global siamese_model
-#     from SiameseEncoder import SiameseEncoder
-#     siamese_model = SiameseEncoder.load("ui_encoder.pt")
-#     siamese_model.eval()
-#     print("✅ Modelo siamés cargado en memoria.")
-
-#     # 3️⃣ Lanzar reentrenamiento periódico
-#     from fastapi_utils.tasks import repeat_every
-#     @repeat_every(seconds=3600)
-#     def retrain_model() -> None:
-#         from diff_model.train_diff_model import train_and_save
-#         print("🧠 Iniciando reentrenamiento del modelo siamés...")
-#         train_and_save()    
-    
-# @app.on_event("startup")
-# async def startup_event():
-#     """Carga inicial del modelo al arrancar el servidor."""
-#     global siamese_model
-#     from SiameseEncoder import SiameseEncoder
-
-#     siamese_model = SiameseEncoder.load("ui_encoder.pt")
-#     siamese_model.eval()
-#     print("✅ Modelo siamés cargado en memoria.")   
-
-# === Reentrenamiento automático del modelo diff ===
-
-
-# @app.on_event("startup")
-# @repeat_every(seconds=3600)  # cada hora, ajusta el intervalo a lo que necesites
-# def retrain_model() -> None:
-#     """
-#     Reentrena el modelo diff con las últimas aprobaciones/rechazos
-#     sin necesidad de parar el servidor.
-#     """
-#     """Carga inicial del modelo al arrancar el servidor."""
-
-#     global siamese_model
-#     from diff_model.train_diff_model import train_and_save
-#     print("🧠 Iniciando reentrenamiento del modelo siamés...")
-
-#     # Entrena y guarda nuevo modelo
-#     train_and_save()
-
-#     #from SiameseEncoder import SiameseEncoder
-
-#     siamese_model = SiameseEncoder.load("ui_encoder.pt")
-#     siamese_model.eval()
-#     print("✅ Reentrenamiento completado y modelo actualizado en memoria.")
-
-
-
 
 def _get_lock(key: str) -> asyncio.Lock:
     if key not in _model_locks:
@@ -1711,6 +1113,7 @@ init_db()
 # =========================================================
 # MODELOS DE ENTRADA
 # =========================================================
+
 class ActionEvent(BaseModel):
     type: str
     timestamp: float
@@ -1740,12 +1143,6 @@ class AccessibilityEvent(BaseModel):
     version: Optional[str] = Field(None, alias="versions")
     actions: Optional[List[ActionEvent]] = []
     
-    # Árbol de nodos capturado (puede ser dict o lista de nodos)
-    # collect_node_tree: Optional[Union[Dict, List]] = Field(None, alias="collectNodeTree")
-    # collect_node_tree: Optional[Union[Dict[str, Any], List[Any]]] = Field(
-    #     None, alias="collectNodeTree"
-    # )
-
     collect_node_tree: Optional[List[Dict[str, Any]]] = Field(
     None, alias="collectNodeTree"
     )
@@ -1759,6 +1156,7 @@ class AccessibilityEvent(BaseModel):
         populate_by_name=True,
         extra="allow"
     )
+
 # =========================================================
 # UTILIDADES PARA ÁRBOLES Y HASH ESTABLE
 # =========================================================
@@ -1904,19 +1302,6 @@ def compare_ui_orders(tree_a, tree_b):
     return result
 
 
-# def normalize_node(node: Dict) -> Dict:
-#     return {k: (node.get(k) or "") for k in SAFE_KEYS}
-
-# def normalize_tree(nodes: List[Dict]) -> List[Dict]:
-#     return sorted([normalize_node(n) for n in nodes if isinstance(n, dict)],
-#                   key=lambda n: (n["className"], n["text"]))
-
-# def stable_signature(nodes: List[Dict]) -> str:
-#     return hashlib.sha256(
-#         json.dumps(normalize_tree(nodes), sort_keys=True, ensure_ascii=False).encode("utf-8")
-#     ).hexdigest()
-
-
 def detect_scroll_type(nodes: List[Dict]) -> str:
     for n in nodes:
         cls = n.get("className", "")
@@ -1954,31 +1339,7 @@ def stable_signatures(nodes: List[Dict], header_text: str = "") -> Dict[str, str
         "global_signature": global_signature,
         "partial_signature": partial_signature
     }
-
-# def stable_signatures(nodes: List[Dict]) -> Dict[str, str]:
-#     """Genera firmas global y parcial para distinguir scrolls."""
-#     if not nodes:
-#         return {"global_signature": "none", "partial_signature": "none"}
-
-#     norm = normalize_tree(nodes)
-#     root = norm[0] if isinstance(norm[0], dict) else {}
-
-#     # --- Global signature (identifica pantalla base) ---
-#     root_class = root.get("className", "")
-#     main_id = root.get("resourceId", "")
-#     global_data = f"{root_class}|{main_id}"
-#     global_signature = hashlib.sha256(global_data.encode("utf-8")).hexdigest()
-
-#     # --- Partial signature (lo visible actualmente) ---
-#     visible_nodes = [n for n in norm if n.get("visibleToUser")]
-#     partial_signature = hashlib.sha256(
-#         json.dumps(visible_nodes, sort_keys=True, ensure_ascii=False).encode("utf-8")
-#     ).hexdigest()
-
-#     return {
-#         "global_signature": global_signature,
-#         "partial_signature": partial_signature
-#     }    
+   
 
 def generate_code():
     """Genera un código de 6 dígitos"""
@@ -2110,8 +1471,6 @@ def preprocess_tree(tree):
 # VECTORIZACIÓN Y FEATURES
 # =========================================================
 
-
-
 def features_from_rows(rows) -> np.ndarray:
     vecs = [vector_from_tree(r[0]) for r in rows if r and r[0]]
     return np.vstack(vecs) if vecs else np.empty((0,3))
@@ -2159,14 +1518,6 @@ def vector_from_tree(tree_str: str) -> np.ndarray:
 def features_from_rows(rows) -> np.ndarray:
     vectors = [vector_from_tree(r[0]) for r in rows if r and r[0]]
     return np.vstack(vectors) if vectors else np.empty((0, 11))    
-
-# =========================================================
-# ENTRENAMIENTO HÍBRIDO (KMeans + HMM)
-# =========================================================
-            
-# =========================================================
-# ENTRENAMIENTO HÍBRIDO (KMeans + HMM)  – versión mejorada
-# =========================================================
 
 
 def normalize_header(text: str) -> str:
@@ -2290,94 +1641,6 @@ async def ensure_model_dimensions(
         )
         return False
 
-# async def ensure_model_dimensions(
-#     kmeans,
-#     X,
-#     tester_id,
-#     build_id,
-#     app_name="default_app",
-#     screen_id="unknown_screen",
-#     desc=""
-# ):
-#     try:
-#         expected_features = kmeans.cluster_centers_.shape[1]
-#         current_features = X.shape[1]
-
-#         if current_features != expected_features:
-#             logger.warning(
-#                 f"[{desc}] Dimensión inconsistente: modelo={expected_features}, nuevo={current_features}. Reentrenando..."
-#             )
-
-#             # 🔒 Lock global por app (evita tormenta de reentrenamientos)
-#             lock_key = f"{app_name}:diff_model"
-#             lock = _get_lock(lock_key)
-
-#             if lock.locked():
-#                 logger.warning(
-#                     f"[{desc}] Skip: reentrenamiento ya en proceso para {lock_key}"
-#                 )
-#                 return False
-
-#             # 🧠 Reentrenamiento híbrido incremental
-#             asyncio.create_task(
-#                 _safe_training_wrapper(
-#                     X=X,
-#                     tester_id=tester_id,
-#                     build_id=build_id,
-#                     app_name=app_name,
-#                     screen_id=screen_id,
-#                     desc=f"retrain {desc}",
-#                     lock=lock,
-#                     train_fn=_train_incremental_logic_hybrid  # 👈 AQUÍ SE USA TU MÉTODO FINAL
-#                 )
-#             )
-
-#             return False
-
-#         return True
-
-#     except Exception as e:
-#         logger.warning(
-#             f"[{desc}] Error validando dimensiones ({app_name}/{tester_id}/{build_id}): {e}"
-#         )
-#         return False
-    
-
-
-# def ensure_model_dimensions(kmeans, X, tester_id, build_id, app_name="default_app", desc=""):
-#     try:
-#         expected_features = kmeans.cluster_centers_.shape[1]
-#         current_features = X.shape[1]
-
-#         if current_features != expected_features:
-#             logger.warning(
-#                 f"[{desc}] Dimensión inconsistente: modelo={expected_features}, nuevo={current_features}. Reentrenando..."
-#             )
-
-#             # ⚙️ Forzar reentrenamiento asincrónico
-#             lock_key = f"{app_name}:{tester_id}:{build_id}"
-#             lock = _get_lock(lock_key)
-
-#             asyncio.create_task(
-#                 _train_incremental_logic_hybrid(
-#                     X,
-#                     tester_id=tester_id,
-#                     build_id=build_id,
-#                     app_name=app_name,
-#                     lock=lock,
-#                     desc=f"retrain {desc}"
-#                 )
-#             )
-
-#             return False
-
-#         return True
-
-#     except Exception as e:
-#         logger.warning(f"[{desc}] No se pudo validar dimensiones del modelo ({app_name}/{tester_id}/{build_id}): {e}")
-#         return False
-    
-    
 def structure_signature_features(tree):
     """
     Extrae características estructurales de una jerarquía de nodos de UI,
@@ -2499,10 +1762,6 @@ def format_screen_diff(diffs):
             lines.append(f"    • {attr}: {old} → {new}")
     return "\n".join(lines)
 
-# def diff_hash(removed, added, modified):
-#     """Genera una firma única basada en el contenido del diff."""
-#     concat = json.dumps([removed, added, modified], sort_keys=True)
-#     return hashlib.sha1(concat.encode("utf-8")).hexdigest()
 
 def diff_hash(removed, added, modified, text_diff=None):
     """Genera una firma única basada en los cambios detectados (estructura + texto)."""
@@ -2631,11 +1890,7 @@ async def analyze_and_train(event: AccessibilityEvent):
     prev_tree = None
     IGNORED_FIELDS = {"hint", "contentDescription", "value", "progress"}
    
-
-
     # -------------------- Árbol y firma ------------------------
-    #latest_tree = ensure_list(event.collect_node_tree or event.tree_data or [])
-    #latest_tree = ensure_list(raw_tree)
     latest_tree = sanitize_tree(ensure_list(raw_tree))
 
     sig = stable_signature(latest_tree)
@@ -2651,21 +1906,12 @@ async def analyze_and_train(event: AccessibilityEvent):
     num_gestos = sum(1 for e in event.actions or [] if e.type in ["tap", "scroll"])
     input_vec = np.array(input_features(event.actions or []), dtype=float).flatten()
 
-    
-    # enriched_vector = np.concatenate([
-    #     struct_vec,     
-    #     sig_vec,
-    #     np.array([avg_dwell, num_gestos], dtype=float),
-    #     input_vec
-    # ])
-
     enriched_vector = np.concatenate([
         struct_vec,     
         sig_vec,
         np.array([avg_dwell, num_gestos]),
         input_vec
     ])
-
 
     removed_all, added_all, modified_all = [], [], []
     text_diff = {}
@@ -2736,7 +1982,6 @@ async def analyze_and_train(event: AccessibilityEvent):
             pass
         return ""
    
-    #latest_tree = sanitize_tree(ensure_list(raw_tree))
     if not latest_tree:
         logger.warning("⚠️ latest_tree vacío o todos sus nodos son None/invalid — usando embedding neutro")
         # crear embedding neutro (mismo tamaño que modelo devuelve)
@@ -2744,12 +1989,8 @@ async def analyze_and_train(event: AccessibilityEvent):
             emb_dim = siamese_model.embedding_dim  # define esto en la clase SiameseEncoder
             emb_curr = np.zeros((1, emb_dim), dtype=float)
 
-            #emb_curr = ensure_model_dimensions(emb_curr)
-            #emb_curr = ensure_model_dimensions(kmeans_model, emb_curr, tester_id, build_id)
-
         except Exception:
             emb_curr = np.zeros((1, 64), dtype=float)  # fallback si no conoces dim
-
 
     else:
         try:
@@ -2783,10 +2024,7 @@ async def analyze_and_train(event: AccessibilityEvent):
             desc="embedding_validation"
         )    
 
-        # emb_curr = ensure_model_dimensions(emb_curr)
-        #emb_curr = ensure_model_dimensions(kmeans_model, emb_curr, tester_id, build_id)
-
-        # -------------------- (Opcional) Guardar embedding --------------------
+    # -------------------- (Opcional) Guardar embedding --------------------
     with sqlite3.connect(DB_NAME) as conn:
         conn.execute("""
             UPDATE accessibility_data
@@ -2794,16 +2032,6 @@ async def analyze_and_train(event: AccessibilityEvent):
             WHERE id=?
         """, (json.dumps(emb_curr.tolist()), prev_id))
         conn.commit()
-
-
-        # except Exception as e:
-        #     # log detallado y fallback neutro pero no abortar proceso
-        #     logger.exception(f"Error generando embedding: {e} -- fallback embedding neutro usado")
-        #     try:
-        #         emb_dim = getattr(siamese_model, "embedding_dim", 64)
-        #         emb_curr = np.zeros((1, emb_dim), dtype=float)
-        #     except Exception:
-        #         emb_curr = np.zeros((1, 64), dtype=float)
 
     with sqlite3.connect(DB_NAME) as conn:
         prev_rows = conn.execute("""
@@ -2840,9 +2068,7 @@ async def analyze_and_train(event: AccessibilityEvent):
                     print("Similitud (torch):", sim_torch.mean().item())
 
                     sim = float(cosine_similarity(emb_curr, emb_prev)[0][0])
-                    # sim = torch.nn.functional.cosine_similarity(emb1, emb2, dim=0)
-                    # print("Similitud:", sim.item())
-                    # sim = float(cosine_similarity(emb_curr, emb_prev)[0][0])
+
                     if sim > best_sim:
                         best_sim, best_row = sim, row
                 except Exception:
@@ -2857,7 +2083,6 @@ async def analyze_and_train(event: AccessibilityEvent):
                 prev_tree = ensure_list(json.loads(prev_rows[0][0]))    
     
 
-    
     # esto es nuevo  tocar o eliminar  
     if prev_tree:
         try:
@@ -2962,17 +2187,6 @@ async def analyze_and_train(event: AccessibilityEvent):
             conn.commit()
 
     # -------------------- 7. Entrenamiento incremental --------------------
-    # opcional: puedes volver a entrenar el encoder con nuevos ejemplos
-    # asyncio.create_task(_train_incremental_logic_hybrid(
-    #     enriched_vector=emb_curr.flatten(),
-    #     tester_id=tester_id,
-    #     build_id=build_id,
-    #     app_name=app_name,
-    #     #screen_id=event.screens_id or s_name or "unknown_screen",
-    #     screen_id=semantic_screen_id_ctx.get(),
-    #     use_general_as_base=True
-    # ))
-
     asyncio.create_task(_train_incremental_logic_hybrid(
         enriched_vector=enriched_vector,
         tester_id=tester_id,
@@ -3076,9 +2290,7 @@ async def analyze_and_train(event: AccessibilityEvent):
                 else:
                     screen_status = "different"
 
-                
-  
-
+            
                 # serializar
                 removed_j = json.dumps(removed_all, ensure_ascii=False)
                 added_j = json.dumps(added_all, ensure_ascii=False)
@@ -3305,18 +2517,9 @@ def _normalize_event_fields(event: AccessibilityEvent) -> dict:
         "build_id_norm":  build_id.strip()  if build_id  else None,
     }          
 
-# def normalize_node(node: Dict) -> Dict:
-#     """Filtra solo las claves estables y convierte None en cadena vacía."""
-#     return {k: (node.get(k) or "") for k in SAFE_KEYS}
-
 def normalize_node(node: Dict) -> Dict:
     """Filtra claves estables sin destruir los tipos."""
-    return {k: node.get(k, None) for k in SAFE_KEYS}    
-
-# def normalize_tree(nodes):
-#     if not isinstance(nodes, list):
-#         return []
-#     return [normalize_node(n) for n in nodes if isinstance(n, dict)]    
+    return {k: node.get(k, None) for k in SAFE_KEYS}     
 
 def normalize_tree(nodes: List[Dict]) -> List[Dict]:
     """Normaliza y ordena la lista de nodos para que el orden no afecte el hash."""
@@ -3482,227 +2685,7 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
     except Exception as e:
         logger.error(f"Error en /collect: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-# @app.post("/collect")
-# async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundTasks):
-#     logger.debug("Raw request: %s", event.model_dump())
-#     try:
-#         # -------------------- Normalización --------------------
-#         raw_nodes = event.collect_node_tree or event.tree_data or []
-#         normalized_nodes = normalize_tree(raw_nodes)
-#         signature = stable_signature(raw_nodes)
-#         signature = stable_signatures(raw_nodes, header_text=event.header_text or "")
-#         global_signature = signature["global_signature"]
-#         partial_signature = signature["partial_signature"]
-
-#         has_changes = False
-#         prev_build_name = None
-#         is_new_record = True
-
-#         # has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
-        
-#         norm = _normalize_event_fields(event)
-#         tester_norm = norm.get("tester_id_norm")
-#         build_norm = norm.get("build_id_norm")
-#         screen_name = event.screen_names or ""
-#         header_text = event.header_text or ""
-#         screens_id_val = event.screens_id or norm.get("screensId") or None
-
-#         # Detecta el tipo de scroll (vertical/horizontal)
-#         scroll_type = detect_scroll_type(raw_nodes)
-
-#         # -------------------- 🧠 Generar o recuperar session_key --------------------
-#         base = tester_norm or getattr(event, "tester_id", "anon")
-#         minute_block = int(time.time() // 60)
-#         event.session_key = getattr(event, "session_key", None) or f"{base}_{minute_block}"
-
-#         # Class raíz
-#         if normalized_nodes and isinstance(normalized_nodes, list):
-#             root_class_name = normalized_nodes[0].get("className", "") if isinstance(normalized_nodes[0], dict) else ""
-#         else:
-#             root_class_name = ""
-#         if not root_class_name and screen_name == "" and header_text == "":
-#             root_class_name = "SplashActivity"
-
-#         #print(f"[collect] Root className detectado: {root_class_name}")
-#         #print(f"[collect] tester={tester_norm} build={build_norm} screen={screen_name}")
-
-#         # -------------------- Estado inicial --------------------
-
-
-#         # -------------------- Buscar último snapshot --------------------
-#         last = last_hash_for_screen(tester_norm, screen_name)
-#         logger.debug(f"[collect] last_hash={last} current_hash={screens_id_val}")
-
-        
-        
-        
-#         # -------------------- Insert snapshot mínimo --------------------
-#         do_insert = True
-#         with sqlite3.connect(DB_NAME) as conn:
-#             conn.execute("PRAGMA journal_mode=WAL;")
-#             cursor = conn.cursor()
-#             # existing = cursor.execute(
-#             #     "SELECT 1 FROM accessibility_data WHERE tester_id=? AND build_id=? AND signature=?",
-#             #     (tester_norm, build_norm, signature),
-#             # ).fetchone()
-
-#             existing = cursor.execute(
-#                 """
-#                 SELECT 1 FROM accessibility_data
-#                 WHERE tester_id=? AND build_id=? AND global_signature=? AND partial_signature=?
-#                 """,
-#                 (tester_norm, build_norm, global_signature, partial_signature),
-#             ).fetchone()
-#             if existing:
-#                 do_insert = False
-
-#             if do_insert:
-#                 cursor.execute(
-#                     """
-#                     INSERT INTO accessibility_data (
-#                         tester_id, build_id, timestamp, event_type, event_type_name,
-#                         package_name, class_name, text, content_description, screens_id,
-#                         screen_names, header_text, collect_node_tree, global_signature, partial_signature, scroll_type,
-#                         additional_info, tree_data, session_key
-#                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-#                     """,
-#                     (
-#                         tester_norm,
-#                         build_norm,
-#                         event.timestamp,
-#                         event.event_type,
-#                         event.event_type_name,
-#                         event.package_name,
-#                         root_class_name,
-#                         event.text,
-#                         event.content_description,
-#                         screens_id_val,
-#                         event.screen_names,
-#                         header_text,
-#                         json.dumps(normalized_nodes, ensure_ascii=False),
-#                         global_signature,
-#                         partial_signature,
-#                         scroll_type,
-#                         json.dumps(event.additional_info or {}, ensure_ascii=False),
-#                         json.dumps(event.tree_data or [], ensure_ascii=False),
-#                         event.session_key,
-#                     ),
-#                 )
-#                 conn.commit()
-
-                
-
-#             inserted_id = cursor.lastrowid    
-#             logger.info("[collect] Insert completado (nuevo build o cambios detectados).")
-#             # {"status": "success", "inserted": True, "has_changes": has_changes, "event": event, "record_id": inserted_id}
-
-#             # Si no hay cambios ni nuevo build
-#         #return {"status": "skipped", "inserted": False, "has_changes": has_changes, "event": event}    
-
-        
-#         # -------------------- Encolar para análisis eficiente --------------------
-#         await event_queue.put((event, do_insert, partial_signature))  # enviamos si fue insertado + signature
-
-
-#         has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
-        
-#         #return {"status": "skipped", "inserted": False, "has_changes": has_changes, "event": event}
-    
-#         # -------------------- Respuesta inmediata --------------------
-#         return JSONResponse(
-#             status_code=202,
-#             content={
-#                 "status": "accepted",
-#                 "inserted": do_insert,
-#                 "session_key": event.session_key,
-#                 "scroll_type": scroll_type,
-#                 "global_signature": global_signature,
-#                 "partial_signature": partial_signature
-#             },
-#         )
-
-
-    
-    # except Exception as e:
-    #     logger.error(f"Error en /collect: {e}", exc_info=True)
-    #     return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-    #     prev_snapshot = None
-    #     if last:
-    #         with sqlite3.connect(DB_NAME) as conn:
-    #             conn.row_factory = sqlite3.Row
-    #             prev_snapshot = conn.execute("""
-    #                 SELECT class_name, build_id, collect_node_tree
-    #                 FROM accessibility_data
-    #                 WHERE header_text = ? AND class_name = ?
-    #                 ORDER BY id DESC LIMIT 1
-    #             """, (header_text, root_class_name)).fetchone()
-
-    #     if prev_snapshot:
-    #         prev_build_name = prev_snapshot["build_id"]
-    #         prev_nodes = json.loads(prev_snapshot["collect_node_tree"] or "[]")
-    #         is_new_record = build_norm != prev_build_name
-
-    #         # Ejecutar análisis y obtener cambios
-    #         has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
-
-    #         # update_metrics(
-    #         #     tester_norm,
-    #         #     build_norm,
-    #         #     has_changes,
-    #         #     added_count=added_count,
-    #         #     removed_count=removed_count,
-    #         #     modified_count=modified_count
-    #         # )
-    #         #return {"has_changes": has_changes}
-
-
-    #     with sqlite3.connect(DB_NAME) as conn:
-    #         cursor = conn.cursor()
-    #         existing = cursor.execute("""
-    #             SELECT 1 FROM accessibility_data
-    #             WHERE tester_id=? AND build_id=? AND signature=?
-    #         """, (tester_norm, build_norm, signature)).fetchone()
-
-    #     do_insert = (is_new_record or has_changes) and not existing
-
-    #     if do_insert:
-    #         with sqlite3.connect(DB_NAME) as conn:
-    #             cursor = conn.cursor()
-    #             cursor.execute("""
-    #                 INSERT INTO accessibility_data (
-    #                     tester_id, build_id, timestamp, event_type, event_type_name,
-    #                     package_name, class_name, text, content_description, screens_id,
-    #                     screen_names, header_text, collect_node_tree, signature,
-    #                     additional_info, tree_data, session_key
-    #                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    #             """, (
-    #                 tester_norm, build_norm, event.timestamp, event.event_type,
-    #                 event.event_type_name, event.package_name, root_class_name,
-    #                 event.text, event.content_description, screens_id_val,
-    #                 event.screen_names, header_text,
-    #                 json.dumps(normalized_nodes, ensure_ascii=False),
-    #                 signature,
-    #                 json.dumps(event.additional_info or {}, ensure_ascii=False),
-    #                 json.dumps(event.tree_data or [], ensure_ascii=False),
-    #                 event.session_key
-    #             ))
-    #             conn.commit()
-
-    #         inserted_id = cursor.lastrowid    
-    #         logger.info("[collect] Insert completado (nuevo build o cambios detectados).")
-    #         return {"status": "success", "inserted": True, "has_changes": has_changes, "event": event, "record_id": inserted_id}
-
-    #     # Si no hay cambios ni nuevo build
-    #     return {"status": "skipped", "inserted": False, "has_changes": has_changes, "event": event}
-
-    # except Exception as e:
-    #     logger.error(f"Error en /collect: {e}", exc_info=True)
-    #     return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-    
+ 
 
 async def worker_process_queue():
     while True:
@@ -3767,138 +2750,6 @@ async def worker_process_queue():
             logger.error(f"[worker] Error general en worker: {e}", exc_info=True)
 
         await asyncio.sleep(0.01)
-
-
-# @app.post("/collect")
-# async def collect_event(event: AccessibilityEvent):
-#     try:
-#         # -------------------- Normalización mínima --------------------
-#         raw_nodes = event.collect_node_tree or event.tree_data or []
-#         normalized_nodes = normalize_tree(raw_nodes)
-
-#         # Detecta el tipo de scroll (vertical/horizontal)
-#         scroll_type = detect_scroll_type(raw_nodes)
-
-
-#         signature = stable_signatures(raw_nodes, header_text=event.header_text or "")
-#         global_signature = signature["global_signature"]
-#         partial_signature = signature["partial_signature"]
-
-
-#         norm = _normalize_event_fields(event)
-#         tester_norm = norm.get("tester_id_norm")
-#         build_norm = norm.get("build_id_norm")
-#         screen_name = event.screen_names or ""
-#         header_text = event.header_text or ""
-#         screens_id_val = event.screens_id or norm.get("screensId") or None
-
-#         # -------------------- Session key --------------------
-#         base = tester_norm or getattr(event, "tester_id", "anon")
-#         minute_block = int(time.time() // 60)
-#         event.session_key = getattr(event, "session_key", None) or f"{base}_{minute_block}"
-
-#         # -------------------- Root class --------------------
-#         root_class_name = (
-#             normalized_nodes[0].get("className", "")
-#             if normalized_nodes and isinstance(normalized_nodes, list) and isinstance(normalized_nodes[0], dict)
-#             else ""
-#         )
-#         if not root_class_name or len(normalized_nodes) <= 2:
-#             root_class_name = "SplashActivity"
-
-#         # -------------------- Insert snapshot mínimo --------------------
-#         do_insert = True
-#         with sqlite3.connect(DB_NAME) as conn:
-#             conn.execute("PRAGMA journal_mode=WAL;")
-#             cursor = conn.cursor()
-#             # existing = cursor.execute(
-#             #     "SELECT 1 FROM accessibility_data WHERE tester_id=? AND build_id=? AND signature=?",
-#             #     (tester_norm, build_norm, signature),
-#             # ).fetchone()
-
-#             existing = cursor.execute(
-#                 """
-#                 SELECT 1 FROM accessibility_data
-#                 WHERE tester_id=? AND build_id=? AND global_signature=? AND partial_signature=?
-#                 """,
-#                 (tester_norm, build_norm, global_signature, partial_signature),
-#             ).fetchone()
-#             if existing:
-#                 do_insert = False
-
-#             if do_insert:
-#                 cursor.execute(
-#                     """
-#                     INSERT INTO accessibility_data (
-#                         tester_id, build_id, timestamp, event_type, event_type_name,
-#                         package_name, class_name, text, content_description, screens_id,
-#                         screen_names, header_text, collect_node_tree, global_signature, partial_signature, scroll_type,
-#                         additional_info, tree_data, session_key
-#                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-#                     """,
-#                     (
-#                         tester_norm,
-#                         build_norm,
-#                         event.timestamp,
-#                         event.event_type,
-#                         event.event_type_name,
-#                         event.package_name,
-#                         root_class_name,
-#                         event.text,
-#                         event.content_description,
-#                         screens_id_val,
-#                         event.screen_names,
-#                         header_text,
-#                         json.dumps(normalized_nodes, ensure_ascii=False),
-#                         global_signature,
-#                         partial_signature,
-#                         scroll_type,
-#                         json.dumps(event.additional_info or {}, ensure_ascii=False),
-#                         json.dumps(event.tree_data or [], ensure_ascii=False),
-#                         event.session_key,
-#                     ),
-#                 )
-#                 conn.commit()
-
-#         # -------------------- Encolar para análisis eficiente --------------------
-#         await event_queue.put((event, do_insert, partial_signature))  # enviamos si fue insertado + signature
-
-#         # -------------------- Respuesta inmediata --------------------
-#         return JSONResponse(
-#             status_code=202,
-#             content={
-#                 "status": "accepted",
-#                 "inserted": do_insert,
-#                 "session_key": event.session_key,
-#                 "scroll_type": scroll_type,
-#                 "global_signature": global_signature,
-#                 "partial_signature": partial_signature
-#             },
-#         )
-
-#     except Exception as e:
-#         logger.error(f"Error en /collect: {e}", exc_info=True)
-#         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-
-# @app.post("/analyze-train")
-# async def analyze_train_endpoint(event: AccessibilityEvent):
-#     try:
-#         has_changes, added_count, removed_count, modified_count = await analyze_and_train(event)
-#         return {
-#             "has_changes": has_changes,
-#             "added": added_count,
-#             "removed": removed_count,
-#             "modified": modified_count
-#         }
-#     except Exception as e:
-#         logger.exception("Error en /analyze-train:")
-#         return JSONResponse(
-#             status_code=500,
-#             content={"error": str(e)}
-#         )
-
 
 @app.get("/status")
 async def get_status(
@@ -4521,44 +3372,6 @@ async def cleanup_approvals_rejections(older_than_days: int = 90):
     conn.close()
     return {"status": "success", "message": f"Approvals y rejections anteriores a {cutoff_str} eliminados."}
     
-
-
-# @app.on_event("startup")
-# @repeat_every(seconds=86400)  # 1 día
-# def scheduled_cleanup() -> None:
-#     from datetime import datetime, timedelta
-#     import sqlite3
-
-#     older_than_days = 90
-#     cutoff = datetime.utcnow() - timedelta(days=older_than_days)
-#     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-
-#     conn = sqlite3.connect(DB_NAME)
-#     c = conn.cursor()
-#     c.execute("""
-#         DELETE FROM screen_diffs
-#         WHERE id IN (
-#             SELECT s.id
-#             FROM screen_diffs s
-#             JOIN diff_approvals a ON a.diff_id = s.id
-#             WHERE s.created_at < ?
-#         )
-#     """, (cutoff_str,))
-#     c.execute("""
-#         DELETE FROM screen_diffs
-#         WHERE id IN (
-#             SELECT s.id
-#             FROM screen_diffs s
-#             JOIN diff_rejections r ON r.diff_id = s.id
-#             WHERE s.created_at < ?
-#         )
-#     """, (cutoff_str,))
-#     c.execute("DELETE FROM diff_approvals WHERE created_at < ?", (cutoff_str,))
-#     c.execute("DELETE FROM diff_rejections WHERE created_at < ?", (cutoff_str,))
-#     conn.commit()
-#     conn.close()
-    
-    
    
 @router.get("/reports/screen-changes")
 def screen_changes(build_id: str, db=Depends(get_db)):
@@ -4694,80 +3507,6 @@ def reset_password(req: ResetPasswordRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error actualizando contraseña: {e}")
     
-
-# @router.post("/create_code")
-# async def create_code(usuario_id: str, duracion_dias: int = 30, usos_permitidos: int = 1):
-#     # Generar el código (formato similar al de Android)
-#     chars = string.ascii_uppercase + string.digits
-#     prefix_char = random.choice(chars)
-#     device_prefix = ''.join(random.choices("0123456789ABCDEF", k=2))
-#     random_part = str(random.randint(0, 9999)).zfill(4)
-#     codigo = f"{prefix_char}{device_prefix}{random_part}"
-
-#     generado_en = int(time.time())
-#     expira_en = generado_en + duracion_dias * 24 * 3600
-
-#     # Guardar en SQLite
-#     with sqlite3.connect(DB_NAME) as conn:
-#         conn.execute("PRAGMA journal_mode=WAL;")
-#         c = conn.cursor()
-#         c.execute("""
-#             INSERT INTO login_codes     
-#             (codigo, usuario_id, generado_en, expira_en, usos_permitidos, usos_actuales, activo)
-#             VALUES (?, ?, ?, ?, ?, ?, ?)
-#         """,  (codigo, usuario_id, generado_en, expira_en, usos_permitidos, 0, 1))
-#         conn.commit()
-
-#     return {"codigo": codigo, "expira_en": expira_en, "duracion_dias": duracion_dias}
-
-# @router.post("/validate_code")
-# async def validate_code(request: Request):
-#     data = await request.json()
-#     codigo = data.get("codigo", "").strip().upper()
-
-#     if not codigo:
-#         return {"valid": False, "reason": "Código vacío"}
-
-#     now = int(time.time())
-
-#     with sqlite3.connect(DB_NAME) as conn:
-#         conn.execute("PRAGMA journal_mode=WAL;")
-#         conn.row_factory = sqlite3.Row
-#         c = conn.cursor()
-#         row = c.execute("""
-#             SELECT * FROM login_codes
-#             WHERE codigo = ? AND activo = 1
-#         """, (codigo,)).fetchone()
-
-#         if not row:
-#             return {"valid": False, "reason": "Código no encontrado"}
-
-#         # Validar expiración
-#         if now > row["expira_en"]:
-#             return {"valid": False, "reason": "Código expirado"}
-
-#         # Validar usos permitidos
-#         if row["usos_actuales"] >= row["usos_permitidos"]:
-#             return {"valid": False, "reason": "Límite de usos alcanzado"}
-
-#         # Incrementar uso
-#         c.execute("""
-#             UPDATE login_codes
-#             SET usos_actuales = usos_actuales + 1
-#             WHERE codigo = ?
-#         """, (codigo,))
-#         conn.commit()
-
-#         restante = row["expira_en"] - now
-
-#     return {
-#         "valid": True,
-#         "codigo": codigo,
-#         "usuario_id": row["usuario_id"],
-#         "expira_en": row["expira_en"],
-#         "restante_en_segundos": restante,
-#         "usos_restantes": row["usos_permitidos"] - (row["usos_actuales"] + 1)
-#     }
 
 @router.post("/create_code")
 async def create_code(usuario_id: str, duracion_dias: int = 30, usos_permitidos: int = 1):
