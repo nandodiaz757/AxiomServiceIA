@@ -37,6 +37,8 @@ MODEL_BASE = "models"  # estructura confirmada:
 TRAIN_GENERAL_ON_COLLECT = True
 encoder = SiameseEncoder()  
 
+
+
 # ----------------------------
 # Helpers de I/O de modelos
 # ----------------------------
@@ -47,6 +49,10 @@ def model_dir_general(app_name: str, screen_id: str) -> str:
     return os.path.join(MODEL_BASE, app_name or "default_app", "general", str(screen_id))
 
 def save_model(obj, path: str):
+    # print("🔥 SAVE PATH:", path)
+    # print("🔥 DIRECTORY EXISTS?:", os.path.exists(os.path.dirname(path)))
+    # print("🔥 FILE EXISTS BEFORE?:", os.path.exists(path))
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
     joblib.dump(obj, path)
     logger.info(f"✅ Modelo guardado en: {path}")
@@ -1276,7 +1282,9 @@ async def _train_general_logic_hybrid(
         clf.fit(Xs, y)
 
         model_obj = {"kmeans": kmeans, "scaler": scaler, "clf": clf}
-        model_path = os.path.join(model_dir_general(app_name, screen_id), "hybrid_general.joblib")
+        safe_id = screen_id.replace("|", "_").replace("=", "-")
+        model_path = os.path.join(model_dir_general(app_name, safe_id), "hybrid_general.joblib")
+        # model_path = os.path.join(model_dir_general(app_name, screen_id), "hybrid_general.joblib")
         save_model(model_obj, model_path)
         logger.info("💾 Saved general hybrid model: %s", model_path)
 
