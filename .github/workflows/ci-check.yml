@@ -1,0 +1,100 @@
+name: CI UI Check
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  ui-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Run UI snapshot step (placeholder)
+        run: |
+          echo "--- Placeholder step ---"
+          echo "Replace this step with your instrumentation/emulator to generate snapshot.json"
+          # Example: run instrumentation then save snapshot to snapshot.json
+          echo '{"example":"snapshot"}' > snapshot.json
+
+      - name: Call AxiomQA CI check
+        env:
+          AXIOM_API_URL: ${{ secrets.AXIOM_API_URL }}
+          AXIOM_API_KEY: ${{ secrets.AXIOM_API_KEY }}
+          BUILD_ID: ${{ github.sha }}
+          TESTER_ID: ${{ secrets.AXIOM_TESTER_ID }}
+        run: |
+          set -e
+          THRESHOLD=0.7
+          MAX_RESULTS=10
+
+          echo "Calling CI check endpoint..."
+          resp=$(curl -s -X POST "${AXIOM_API_URL}/api/ci/check-diff" \
+            -H "Authorization: Bearer ${AXIOM_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"tester_id":"'"${TESTER_ID}"'", "build_id":"'"${BUILD_ID}"'", "threshold":'"${THRESHOLD}"', "max_results":'"${MAX_RESULTS}"'}')
+
+          echo "Response: $resp"
+
+          status=$(echo "$resp" | jq -r .status)
+          severity=$(echo "$resp" | jq -r .severity)
+
+          echo "CI check status=$status severity=$severity"
+
+          # Fail the job if severity >= threshold and status is fail
+          if [ "$status" = "fail" ]; then
+            awk "BEGIN{exit !( $severity >= $THRESHOLD ) }"
+            if [ $? -eq 0 ]; then
+              echo "UI regression severity $severity >= $THRESHOLD — failing CI"
+              exit 1
+            else
+              echo "UI regression detected but severity below threshold — allowing CI to continue"
+            fi
+          fi
+
+          echo "UI check passed or below threshold."
+name: CI UI Check
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  ui-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run UI snapshot step (placeholder)
+        run: |
+          echo "This step should run your instrumentation/emulator and produce snapshot.json"
+          echo "Add your emulator or instrumentation here"
+
+      - name: Call AxiomQA CI check
+        env:
+          AXIOM_API_URL: ${{ secrets.AXIOM_API_URL }}
+          AXIOM_API_KEY: ${{ secrets.AXIOM_API_KEY }}
+          BUILD_ID: ${{ github.sha }}
+          TESTER_ID: ${{ secrets.AXIOM_TESTER_ID }}
+        run: |
+          set -e
+          THRESHOLD=0.7
+          MAX_RESULTS=10
+
+          echo "Calling CI check endpoint..."
+          resp=$(curl -s -X POST "${AXIOM_API_URL}/api/ci/check-diff" \
+            -H "Authorization: Bearer ${AXIOM_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"tester_id":"'

@@ -1,0 +1,153 @@
+# =====================================================
+# Configuración de Notificaciones - AxiomServiceIA (EJEMPLO)
+# =====================================================
+# 📋 INSTRUCCIONES:
+# 1. Copiar este archivo a config.yaml
+# 2. Completar los webhooks y credenciales
+# 3. Configurar las variables de entorno (o usar URLs directas)
+# 4. Reiniciar o hacer POST a /api/config/reload
+
+# --- WEBHOOKS DE NOTIFICACIONES ---
+notifications:
+  # Slack Configuration
+  slack:
+    enabled: true
+    # Opción A: Usar variable de entorno
+    webhook_url: "${SLACK_WEBHOOK_URL}"
+    # Opción B: URL directa (NO recomendado en producción)
+    # webhook_url: "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+    timeout: 5
+    retry_count: 2
+    # Canales específicos para diferentes tipos de alertas (opcional)
+    channels:
+      ci_failures: "#ci-alerts"
+      model_updates: "#ml-updates"
+      errors: "#error-logs"
+
+  # Microsoft Teams Configuration
+  teams:
+    enabled: true
+    # Opción A: Usar variable de entorno
+    webhook_url: "${TEAMS_WEBHOOK_URL}"
+    # Opción B: URL directa (NO recomendado en producción)
+    # webhook_url: "https://outlook.webhook.office.com/webhookb2/YOUR/WEBHOOK/URL"
+    timeout: 5
+    retry_count: 2
+
+  # Jira Configuration
+  jira:
+    enabled: true
+    # Opción A: Usar variables de entorno
+    base_url: "${JIRA_BASE_URL}"
+    api_token: "${JIRA_API_TOKEN}"
+    # Opción B: URLs y tokens directos (NO recomendado en producción)
+    # base_url: "https://your-domain.atlassian.net"
+    # api_token: "your-api-token"
+    project_key: "QA"
+    issue_type: "Task"
+    timeout: 10
+    retry_count: 2
+
+# --- CONFIGURACIÓN DE CI/CD ---
+ci:
+  # Umbral de similitud para considerar un cambio como "significativo"
+  # Rango: 0.0 a 1.0 (1.0 = idéntico)
+  similarity_threshold: 0.7
+  
+  # Reportar automáticamente fallos en CI
+  auto_report_failures: true
+  
+  # Máximo número de resultados a devolver en check-diff
+  max_results: 20
+
+# --- CONFIGURACIÓN DE MODELOS ML ---
+ml:
+  # Entrenar modelo general automáticamente durante collect
+  train_general_on_collect: true
+  
+  # Mínimo de muestras para entrenar
+  min_samples_for_training: 3
+  
+  # Tamaño máximo de batch para entrenamiento
+  batch_size: 500
+  
+  # Usar modelo general como base para entrenamientos incrementales
+  use_general_as_base: true
+
+# --- CONFIGURACIÓN DE BASE DE DATOS ---
+database:
+  # Ruta del archivo SQLite
+  path: "./axiom.db"
+  
+  # Auto-limpiar registros antiguos (días)
+  cleanup_old_records_days: 90
+
+# --- CONFIGURACIÓN DE LOGGING ---
+logging:
+  # Nivel de logging: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+  
+  # Formato de logs
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  # Archivo de logs
+  file: "./logs/axiom.log"
+  
+  # Tamaño máximo de archivo (10MB)
+  max_file_size: 10485760
+  
+  # Número de backups de logs
+  backup_count: 5
+
+# --- CONFIGURACIÓN DE SERVIDOR ---
+server:
+  # Host (0.0.0.0 = accesible desde cualquier interfaz)
+  host: "0.0.0.0"
+  
+  # Puerto
+  port: 8000
+  
+  # Modo reload para desarrollo
+  reload: false
+  
+  # Número de workers
+  workers: 4
+
+# --- CARACTERÍSTICAS EXPERIMENTALES ---
+features:
+  # Validación de flujos de navegación
+  flow_validation_enabled: true
+  
+  # Sistema de retroalimentación incremental
+  feedback_system_enabled: true
+  
+  # Deduplicación de diffs
+  diff_deduplication_enabled: true
+
+# =====================================================
+# NOTAS DE CONFIGURACIÓN
+# =====================================================
+# 
+# 1. VARIABLES DE ENTORNO
+#    - Usar ${VARIABLE_NAME} para variables de entorno
+#    - Ejemplo: webhook_url: "${SLACK_WEBHOOK_URL}"
+#    - Se resuelven automáticamente en tiempo de carga
+#
+# 2. SEGURIDAD
+#    - ⚠️ NUNCA commitear webhooks/tokens reales en git
+#    - Usar siempre variables de entorno en producción
+#    - El archivo config.yaml debe estar en .gitignore
+#
+# 3. RECARGAR CONFIGURACIÓN
+#    - Hacer POST a http://localhost:8000/api/config/reload
+#    - No requiere reiniciar el servidor
+#
+# 4. VERIFICAR CONFIGURACIÓN
+#    - GET http://localhost:8000/api/config/health
+#    - GET http://localhost:8000/api/config/notifications
+#
+# 5. TESTEAR NOTIFICACIONES
+#    - POST http://localhost:8000/api/config/test-slack
+#    - POST http://localhost:8000/api/config/test-teams
+#
+# =====================================================

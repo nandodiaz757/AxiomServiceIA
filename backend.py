@@ -39,9 +39,36 @@ import numpy as np
 from SiameseEncoder import SiameseEncoder
 from contextvars import ContextVar
 from slugify import slugify
+import logging
 
 
 from stable_signature import normalize_node
+
+logger = logging.getLogger("backend")
+logging.basicConfig(level=logging.INFO)
+
+
+
+# 🔹 NUEVA IMPORTACIÓN: ConfigManager para gestión centralizada
+from config_manager import get_config, init_config
+
+# 🔹 NUEVA IMPORTACIÓN: Sistema de retroalimentación incremental
+try:
+    from incremental_feedback_system import (
+        IncrementalFeedbackSystem,
+        check_approved_diff_pattern,
+        record_diff_decision
+    )
+except ImportError as e:
+    logger.warning(f"⚠️  No se pudo importar incremental_feedback_system: {e}")
+
+# 🔹 NUEVA IMPORTACIÓN: Motor de análisis de flujos
+try:
+    from FlowAnalyticsEngine import FlowAnalyticsEngine
+    logger.info("✅ FlowAnalyticsEngine importado correctamente")
+except ImportError as e:
+    logger.warning(f"⚠️  No se pudo importar FlowAnalyticsEngine: {e}")
+    FlowAnalyticsEngine = None
 
 # =========================================================
 # CONFIGURACIÓN
@@ -414,7 +441,7 @@ def looks_dynamic(txt):
         if re.search(pat, t):
             return True
     return False
-
+        # ...existing code...
 # =====================================================
 # Canonical mapping
 # =====================================================
@@ -694,11 +721,23 @@ async def daily_cleanup():
 # ==========================================
 # LIFESPAN HANDLER (startup + shutdown)
 # ==========================================
+# 🔹 Variable global para feedback system
+feedback_system = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- Startup ---
+    global feedback_system
     logger.info("🚀 Iniciando FastAPI y cargando modelo siamés...")
     load_siamese_model()
+    
+    # 🔹 Inicializar sistema de retroalimentación
+    try:
+        feedback_system = IncrementalFeedbackSystem(db_name="feedback_model.db")
+        logger.info("✅ Sistema de retroalimentación incremental inicializado")
+    except Exception as e:
+        logger.warning(f"⚠️  No se pudo inicializar feedback_system: {e}")
+        feedback_system = None
 
     yield  # Aquí la app ya está corriendo
 
@@ -712,6 +751,218 @@ async def lifespan(app: FastAPI):
 # ==============================
 
 app = FastAPI(lifespan=lifespan)
+
+# 🔹 INICIALIZAR CONFIG MANAGER AL STARTUP
+config = init_config()
+
+
+def send_slack_alert(webhook_url: Optional[str] = None, title: str = "", payload: dict = None):
+    """
+    Envía una alerta formateada a Slack usando incoming webhook.
+    Si webhook_url no se proporciona, intenta obtenerlo de la configuración.
+    Incluye retry automático basado en config.
+    """
+    if payload is None:
+        payload = {}
+    
+    # Obtener webhook de config si no se proporciona
+    if not webhook_url:
+        webhook_url = config.get_webhook_url("slack")
+    
+    # Verificar si Slack está habilitado
+    if not config.is_notification_enabled("slack") or not webhook_url:
+        logger.info("⚠️ Slack notifications disabled or webhook URL not configured")
+        return False
+    
+    try:
+        msg = {
+            "text": f"*{title}*\nTester: {payload.get('tester_id')}  Build: {payload.get('build_id')}  Severity: {payload.get('severity', 0):.2f}",
+            "attachments": [
+                {
+                    "fields": [
+                        {"title": "Severity", "value": f"{payload.get('severity', 0):.2f}", "short": True},
+                        {"title": "Diffs", "value": str(payload.get('diff_count', 0)), "short": True},
+                        {"title": "Timestamp", "value": str(datetime.now().isoformat()), "short": True}
+                    ],
+                    "color": "danger" if payload.get('severity', 0) > 0.7 else "warning"
+                }
+            ]
+        }
+
+        import requests
+        headers = {"Content-Type": "application/json"}
+        timeout = config.get("notifications.slack.timeout", 5)
+        retry_count = config.get("notifications.slack.retry_count", 2)
+        
+        for attempt in range(retry_count):
+            try:
+                response = requests.post(
+                    webhook_url,
+                    headers=headers,
+                    data=json.dumps(msg),
+                    timeout=timeout
+                )
+                if response.status_code == 200:
+                    logger.info(f"✅ Slack alert sent successfully")
+                    return True
+                else:
+                    logger.warning(f"⚠️ Slack alert failed: {response.status_code}")
+            except Exception as e:
+                if attempt < retry_count - 1:
+                    logger.info(f"🔄 Retrying Slack alert ({attempt + 1}/{retry_count})...")
+                    time.sleep(1)
+                else:
+                    raise
+        
+        return False
+        
+    except Exception as e:
+        logger.exception(f"❌ Error sending Slack alert: {e}")
+        return False
+
+
+def send_teams_alert(webhook_url: Optional[str] = None, title: str = "", payload: dict = None):
+    """
+    Envía una Adaptive Card a Microsoft Teams usando incoming webhook.
+    Si webhook_url no se proporciona, intenta obtenerlo de la configuración.
+    Incluye retry automático basado en config.
+    """
+    if payload is None:
+        payload = {}
+    
+    # Obtener webhook de config si no se proporciona
+    if not webhook_url:
+        webhook_url = config.get_webhook_url("teams")
+    
+    # Verificar si Teams está habilitado
+    if not config.is_notification_enabled("teams") or not webhook_url:
+        logger.info("⚠️ Teams notifications disabled or webhook URL not configured")
+        return False
+    
+    try:
+        severity = payload.get('severity', 0)
+        theme_color = "E81123" if severity > 0.7 else "FFB900"  # Rojo o Ámbar
+        
+        card = {
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "summary": title,
+            "themeColor": theme_color,
+            "sections": [
+                {
+                    "activityTitle": title,
+                    "activitySubtitle": f"Timestamp: {datetime.now().isoformat()}",
+                    "facts": [
+                        {"name": "Tester", "value": str(payload.get('tester_id', 'N/A'))},
+                        {"name": "Build", "value": str(payload.get('build_id', 'N/A'))},
+                        {"name": "Severity", "value": f"{severity:.2f}"},
+                        {"name": "Diffs", "value": str(payload.get('diff_count', 0))}
+                    ]
+                }
+            ]
+        }
+
+        import requests
+        headers = {"Content-Type": "application/json"}
+        timeout = config.get("notifications.teams.timeout", 5)
+        retry_count = config.get("notifications.teams.retry_count", 2)
+        
+        for attempt in range(retry_count):
+            try:
+                response = requests.post(
+                    webhook_url,
+                    headers=headers,
+                    data=json.dumps(card),
+                    timeout=timeout
+                )
+                if response.status_code == 200:
+                    logger.info(f"✅ Teams alert sent successfully")
+                    return True
+                else:
+                    logger.warning(f"⚠️ Teams alert failed: {response.status_code}")
+            except Exception as e:
+                if attempt < retry_count - 1:
+                    logger.info(f"🔄 Retrying Teams alert ({attempt + 1}/{retry_count})...")
+                    time.sleep(1)
+                else:
+                    raise
+        
+        return False
+        
+    except Exception as e:
+        logger.exception(f"❌ Error sending Teams alert: {e}")
+        return False
+
+
+def send_jira_issue(
+    project_key: Optional[str] = None,
+    summary: str = "",
+    description: str = "",
+    issue_type: Optional[str] = None
+):
+    """
+    Crea un issue en Jira usando REST API.
+    Obtiene credenciales de la configuración o variables de entorno.
+    Incluye retry automático basado en config.
+    """
+    # Obtener configuración
+    jira_base_url = config.get("notifications.jira.base_url") or os.environ.get('JIRA_BASE_URL')
+    jira_token = config.get("notifications.jira.api_token") or os.environ.get('JIRA_API_TOKEN')
+    project_key = project_key or config.get("notifications.jira.project_key", "QA")
+    issue_type = issue_type or config.get("notifications.jira.issue_type", "Task")
+    
+    # Verificar si Jira está habilitado
+    if not config.is_notification_enabled("jira") or not jira_base_url or not jira_token:
+        logger.info("⚠️ Jira notifications disabled or credentials not configured")
+        return None
+
+    try:
+        api_endpoint = jira_base_url.rstrip('/') + '/rest/api/3/issue'
+        auth = ('token', jira_token) if jira_token else None
+
+        payload = {
+            "fields": {
+                "project": {"key": project_key},
+                "summary": summary,
+                "description": description,
+                "issuetype": {"name": issue_type}
+            }
+        }
+
+        import requests
+        headers = {"Content-Type": "application/json"}
+        timeout = config.get("notifications.jira.timeout", 10)
+        retry_count = config.get("notifications.jira.retry_count", 2)
+        
+        for attempt in range(retry_count):
+            try:
+                response = requests.post(
+                    api_endpoint,
+                    auth=auth,
+                    headers=headers,
+                    data=json.dumps(payload),
+                    timeout=timeout
+                )
+                if response.status_code in (200, 201):
+                    data = response.json()
+                    issue_key = data.get('key')
+                    logger.info(f"✅ Created Jira issue {issue_key}")
+                    return issue_key
+                else:
+                    logger.warning(f"⚠️ Jira API error: {response.status_code}")
+            except Exception as e:
+                if attempt < retry_count - 1:
+                    logger.info(f"🔄 Retrying Jira issue creation ({attempt + 1}/{retry_count})...")
+                    time.sleep(1)
+                else:
+                    raise
+        
+        return None
+        
+    except Exception as e:
+        logger.exception(f"❌ Error creating Jira issue: {e}")
+        return None
+
 
 def _get_lock(key: str) -> asyncio.Lock:
     if key not in _model_locks:
@@ -784,9 +1035,17 @@ def update_metrics(tester_id: str, build_id: str, has_changes: bool,
             INSERT INTO metrics_changes (
                 tester_id, build_id, total_events, total_changes,
                 total_added, total_removed, total_modified
-            )
-            VALUES (?, ?, 1, ?, ?, ?, ?)
-            ON CONFLICT(tester_id, build_id)
+    
+        # 🔹 Asegurar columnas nuevas para retroalimentación incremental (retrocompatible)
+        try:
+            c.execute("ALTER TABLE screen_diffs ADD COLUMN IF NOT EXISTS diff_priority TEXT DEFAULT 'high'")
+            c.execute("ALTER TABLE screen_diffs ADD COLUMN IF NOT EXISTS similarity_to_approved REAL DEFAULT 0.0")
+            c.execute("ALTER TABLE screen_diffs ADD COLUMN IF NOT EXISTS approved_before INTEGER DEFAULT 0")
+        except Exception as e:
+            logger.warning(f"⚠️  No se pudieron agregar columnas (puede que ya existan): {e}")
+
+        conn.commit()
+        conn.close()
             DO UPDATE SET
                 total_events = total_events + 1,
                 total_changes = total_changes + EXCLUDED.total_changes,
@@ -871,12 +1130,17 @@ def init_db():
             cluster_info TEXT,
             anomaly_score REAL DEFAULT 0,
             diff_hash TEXT UNIQUE NOT NULL,
+            diff_priority TEXT DEFAULT 'high',
             text_diff TEXT,  
             text_overlap REAL DEFAULT 0,
             overlap_ratio REAL DEFAULT 0,
             ui_structure_similarity REAL DEFAULT 0,      
             cluster_id INTEGER DEFAULT -1,  
             screen_status TEXT DEFAULT 'unknown',  
+            similarity_to_approved REAL DEFAULT 0.0,
+            approved_before INTEGER DEFAULT 0,
+            approval_status TEXT,   
+            rejection_reason TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -1066,6 +1330,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS diff_rejections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             diff_id INTEGER,
+            rejection_reason TEXT, 
             rejected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -2060,6 +2325,11 @@ async def analyze_and_train(event: AccessibilityEvent):
                         emb_prev = siamese_model.encode_tree(prev_tree)
                     emb_prev = emb_prev.cpu().numpy().reshape(1, -1)
 
+                    # Validar ambas dimensiones están alineadas
+                    if emb_curr.shape[1] != emb_prev.shape[1]:
+                        logger.warning(f"Dimensiones incompatibles: emb_curr={emb_curr.shape[1]}, emb_prev={emb_prev.shape[1]}")
+                        continue
+
                     sim_torch = torch.nn.functional.cosine_similarity(
                         torch.tensor(emb_curr, dtype=torch.float32),
                         torch.tensor(emb_prev, dtype=torch.float32),
@@ -2152,12 +2422,39 @@ async def analyze_and_train(event: AccessibilityEvent):
                 or diff_result.get("order_score", 1.0) < 0.9
                 or diff_result.get("has_changes")
             )
+            
+            # 🔹 NUEVA SECCIÓN: Retroalimentación Incremental
+            mark_as_low_priority = False
+            similarity_to_approved = 0.0
+            
+            if has_changes and feedback_system is not None:
+                try:
+                    approval_info = check_approved_diff_pattern(
+                        diff_signature=diff_signature,
+                        app_name=app_name,
+                        tester_id=t_id,
+                        feedback_system=feedback_system
+                    )
+                    logger.info(f"📊 Análisis de retroalimentación: {approval_info['reason']}")
+                    
+                    # Guardar el estado para usar al insertar
+                    mark_as_low_priority = not approval_info['should_show']
+                    similarity_to_approved = approval_info['similarity_score']
+                except Exception as e:
+                    logger.warning(f"⚠️  Error en check_approved_diff_pattern: {e}")
+                    mark_as_low_priority = False
+                    similarity_to_approved = 0.0
 
         except Exception as e:
             logger.error(f"Error comparando árboles: {e}")
             has_changes = True
+            mark_as_low_priority = False  # 🔹 NUEVA LÍNEA
+            similarity_to_approved = 0.0   # 🔹 NUEVA LÍNEA
+
     else:
         has_changes = True
+        mark_as_low_priority = False  # 🔹 NUEVA LÍNEA
+        similarity_to_approved = 0.0   # 🔹 NUEVA LÍNEA
 
 
     # 🔹 Recalcular enriched_vector (después de emb_curr y fuera del if)
@@ -2318,18 +2615,23 @@ async def analyze_and_train(event: AccessibilityEvent):
 
                 # Insertar diff
             if not break_insert:
+                # Determinar prioridad basada en retroalimentación
+                diff_priority = 'low' if mark_as_low_priority else 'high'
+
                 cur.execute("""
                     INSERT INTO screen_diffs (
                         tester_id, build_id, screen_name, header_text,
                         removed, added, modified, text_diff, diff_hash,
-                        text_overlap, overlap_ratio, ui_structure_similarity, screen_status
+                        text_overlap, overlap_ratio, ui_structure_similarity, screen_status,
+                        diff_priority, similarity_to_approved
                     )
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     t_id, b_id, s_name, header_text,
                     removed_j, added_j, modified_j, text_diff_j,
                     diff_signature, text_overlap, text_overlap,
-                    ui_sim, screen_status
+                    ui_sim, screen_status,
+                    diff_priority, similarity_to_approved
                 ))
 
                 conn.commit()
@@ -2337,6 +2639,22 @@ async def analyze_and_train(event: AccessibilityEvent):
                 # obtener diff_id real
                 cur.execute("SELECT id FROM screen_diffs WHERE diff_hash = ?", (diff_signature,))
                 diff_id = cur.fetchone()[0]
+
+                # 🔹 Registrar decisión inicial en el feedback system (si está disponible)
+                try:
+                    if feedback_system is not None:
+                        record_diff_decision(
+                            diff_hash=diff_signature,
+                            diff_signature=diff_signature,
+                            app_name=app_name,
+                            tester_id=t_id,
+                            build_version=b_id,
+                            decision='show' if diff_priority == 'high' else 'low_priority',
+                            user_approved=True,
+                            feedback_system=feedback_system
+                        )
+                except Exception as e:
+                    logger.warning(f"⚠️  No se pudo registrar decision inicial en feedback_system: {e}")
 
                 # ---- dedupe ----
                 def dedupe_nodes(items):
@@ -2903,46 +3221,180 @@ def extract_numeric_version(v: str) -> str:
     return match.group(1) if match else None
 
 
+class CIRequest(BaseModel):
+    tester_id: str
+    build_id: str
+    baseline_build_id: Optional[str] = None
+    screens: Optional[List[str]] = None
+    threshold: float = 0.7
+    max_results: int = 20
+
+
+@app.post("/api/ci/check-diff")
+def ci_check_diff(req: CIRequest):
+    """Quick CI gating endpoint.
+
+    Returns pass/fail and a severity score (0.0-1.0). Uses most recent diffs for the
+    given tester/build. If severity >= threshold the result is "fail".
+    """
+    try:
+        # lightweight local imports to avoid top-level dependency churn
+        from typing import Optional, List
+        import sqlite3
+
+        # Verify subscription for the tester (blocks unpaid users)
+        if not is_subscription_active(req.tester_id):
+            return JSONResponse(status_code=403, content={
+                "status": "forbidden",
+                "message": "Subscription inactive or not found."
+            })
+
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+
+        params = [req.tester_id, req.build_id]
+        query = """
+            SELECT id, screen_name, overlap_ratio, ui_structure_similarity, diff_priority, created_at
+            FROM screen_diffs
+            WHERE tester_id=? AND build_id=?
+        """
+
+        if req.screens:
+            placeholders = ",".join("?" for _ in req.screens)
+            query += f" AND screen_name IN ({placeholders})"
+            params.extend(req.screens)
+
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(req.max_results)
+
+        rows = cur.execute(query, params).fetchall()
+        conn.close()
+
+        if not rows:
+            return {"status": "pass", "severity": 0.0, "message": "No diffs detected", "diffs": []}
+
+        severities = []
+        diffs = []
+        for r in rows:
+            diff_id, screen_name, overlap_ratio, ui_sim, diff_priority, created_at = r
+            overlap = overlap_ratio if overlap_ratio is not None else 1.0
+            try:
+                sev = 1.0 - float(overlap)
+            except Exception:
+                sev = 0.0
+            severities.append(sev)
+            diffs.append({
+                "id": diff_id,
+                "screen_name": screen_name,
+                "overlap_ratio": overlap,
+                "severity": sev,
+                "diff_priority": diff_priority
+            })
+
+        max_sev = max(severities)
+        status = "fail" if max_sev >= float(req.threshold) else "pass"
+
+        result = {"status": status, "severity": max_sev, "diffs": diffs}
+
+        # Send notifications on failure (non-blocking)
+        try:
+            if status == "fail":
+                message = f"UI regression detected for tester={req.tester_id} build={req.build_id} severity={max_sev:.2f}"
+                # Use environment-configured webhooks if available
+                slack_url = globals().get('SLACK_WEBHOOK_URL') or os.environ.get('SLACK_WEBHOOK_URL')
+                teams_url = globals().get('TEAMS_WEBHOOK_URL') or os.environ.get('TEAMS_WEBHOOK_URL')
+
+                payload = {
+                    "tester_id": req.tester_id,
+                    "build_id": req.build_id,
+                    "severity": max_sev,
+                    "diff_count": len(diffs),
+                    "diffs": diffs[:5]
+                }
+
+                # fire-and-forget style: send but don't block the response
+                if slack_url:
+                    try:
+                        send_slack_alert(slack_url, message, payload)
+                    except Exception:
+                        logger.exception("Failed sending Slack alert")
+
+                if teams_url:
+                    try:
+                        send_teams_alert(teams_url, message, payload)
+                    except Exception:
+                        logger.exception("Failed sending Teams alert")
+        except Exception:
+            logger.exception("Error sending CI notifications")
+
+        return result
+
+    except Exception as e:
+        logger.exception(f"Error in /api/ci/check-diff: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
 @app.get("/screen/diffs")
 def get_screen_diffs(
     tester_id: Optional[str] = Query(None),
     build_id: Optional[str] = Query(None),
     header_text: Optional[str] = Query(None),
-    only_pending: bool = Query(True)
+    only_pending: bool = Query(True),
+    only_approved: bool = Query(False),
+    only_rejected: bool = Query(False)
 ):
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
+    # 🔹 QUERY MEJORADA: incluye JOIN a diff_rejections
     query = """
-        SELECT s.id, s.tester_id, s.build_id, s.screen_name, s.header_text,
-               s.removed, s.added, s.modified, s.text_diff, s.created_at, s.cluster_info
+        SELECT 
+            s.id, 
+            s.tester_id, 
+            s.build_id, 
+            s.screen_name, 
+            s.header_text,
+            s.removed, 
+            s.added, 
+            s.modified, 
+            s.text_diff, 
+            s.created_at, 
+            s.cluster_info,
+            CASE 
+                WHEN a.id IS NOT NULL THEN 'approved'
+                WHEN r.id IS NOT NULL THEN 'rejected'
+                ELSE 'pending'
+            END AS approval_status,
+            a.created_at AS approved_at,
+            r.created_at AS rejected_at,
+            r.rejection_reason
         FROM screen_diffs AS s
-        LEFT JOIN diff_approvals AS a
-               ON a.diff_id = s.id
+        LEFT JOIN diff_approvals AS a ON a.diff_id = s.id
+        LEFT JOIN diff_rejections AS r ON r.diff_id = s.id
         WHERE 1=1
     """
     params = []
 
+    # 🔹 FILTRO DE ESTADO MEJORADO
     if only_pending:
-        query += " AND a.id IS NULL"
+        query += " AND a.id IS NULL AND r.id IS NULL"
+    elif only_approved:
+        query += " AND a.id IS NOT NULL"
+    elif only_rejected:
+        query += " AND r.id IS NOT NULL"
 
-    if tester_id is not None:
-        query += " AND (s.tester_id = ? OR (s.tester_id IS NULL AND ? = ''))"
-        params.extend([tester_id, tester_id])
+    # 🔹 FILTRO TESTER_ID SIMPLIFICADO
+    if tester_id is not None and tester_id != "":
+        query += " AND s.tester_id = ?"
+        params.append(tester_id)
 
-    if header_text is not None:
-        query += """
-            AND (
-                LOWER(TRIM(s.header_text)) LIKE LOWER(TRIM(?))
-                OR (TRIM(s.header_text) = '' AND ? = '')
-                OR (s.header_text IS NULL AND ? = '')
-            )
-        """
-        like_pattern = f"%{header_text.strip()}%"
-        params.extend([like_pattern, header_text, header_text])
+    # 🔹 FILTRO HEADER_TEXT MEJORADO
+    if header_text is not None and header_text != "":
+        query += " AND LOWER(TRIM(s.header_text)) LIKE LOWER(TRIM(?))"
+        params.append(f"%{header_text.strip()}%")
 
-    query += " ORDER BY s.created_at DESC"
+    query += " ORDER BY s.created_at DESC LIMIT 1000"
 
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
@@ -3034,8 +3486,11 @@ def get_screen_diffs(
         return "\n".join(lines)
 
 
+
+
     # --- Construir lista de diffs ---
     diffs = []
+    traces_to_batch = []
 
     for row in rows:
         removed = safe_json_load(row[5])
@@ -3111,7 +3566,7 @@ def get_screen_diffs(
         for node in removed:
             add_node_change("removed", node)
 
-
+        # Construir changes_list para trace
         for node in removed:
             changes_list.append(f"Removed: {node.get('class','unknown')} ({node.get('text','')})")
 
@@ -3130,18 +3585,20 @@ def get_screen_diffs(
                 else:
                     old = new = vals
                 changes_list.append(f"Modified: {node.get('class','unknown')} {attr}: {old} → {new}")
-    
 
-        update_diff_trace(
-            tester_id=tester_id,
-            build_id=build_id,
-            screen=row[3],  # screen_name
-            changes=changes_list
-        )
-    
+        # Guardar trace para batch después del loop
+        traces_to_batch.append({
+            "tester_id": tester_id,
+            "build_id": build_id,
+            "screen": row[3],
+            "changes": changes_list
+        })
 
-        # 🆕 Generar resumen elegante para cada diff
-        summary_text = capture_pretty_summary(removed, added, modified, text_diff)
+        # Determinar estado de aprobación
+        approval_status = row[11] if len(row) > 11 else "pending"  # De la query CASE statement
+        approved_at = row[12] if len(row) > 12 else None
+        rejected_at = row[13] if len(row) > 13 else None
+        rejection_reason = row[14] if len(row) > 14 else None
 
         diffs.append({
             "id": row[0],
@@ -3161,12 +3618,35 @@ def get_screen_diffs(
             "detailed_changes": detailed_changes,
             "created_at": row[9],
             "cluster_info": json.loads(row[10]) if row[10] else {},
-            "detailed_summary": summary_text  # 🆕 Nuevo campo
+            "approval": {
+                "status": approval_status,
+                "approved_at": approved_at,
+                "rejected_at": rejected_at,
+                "rejection_reason": rejection_reason,
+                "is_pending": approval_status == "pending"
+            }
         })
 
+    # ✅ Calcular metadata de aprobaciones
+    approval_counts = {
+        "pending": sum(1 for d in diffs if d["approval"]["status"] == "pending"),
+        "approved": sum(1 for d in diffs if d["approval"]["status"] == "approved"),
+        "rejected": sum(1 for d in diffs if d["approval"]["status"] == "rejected")
+    }
+
+    # ✅ Batch update de traces (fuera del loop)
+    for trace in traces_to_batch:
+        try:
+            update_diff_trace(
+                tester_id=trace["tester_id"],
+                build_id=trace["build_id"],
+                screen=trace["screen"],
+                changes=trace["changes"]
+            )
+        except Exception as e:
+            print(f"Error updating trace: {e}")
+
     # ✅ Cálculo robusto de has_changes
-    #print("DEBUG diffs:", diffs)
-    # Tomamos has_changes directo de compare_trees
     for d in diffs:
         d["has_changes"] = any([
             len(d.get("removed", [])) > 0,
@@ -3175,15 +3655,25 @@ def get_screen_diffs(
             bool(d.get("text_diff", {}))
         ])
 
-    # Si quieres un indicador global
-    #has_changes = any(d["has_changes"] for d in diffs)
     has_changes = any(diff.get("has_changes", False) for diff in diffs)
-
-    #print(f"🧩 has_changes={has_changes} | total_diffs={len(diffs)}")
 
     return {
         "screen_diffs": diffs,
-        "has_changes": has_changes
+        "metadata": {
+            "pending": approval_counts["pending"],
+            "approved": approval_counts["approved"],
+            "rejected": approval_counts["rejected"],
+            "total_diffs": len(diffs),
+            "total_changes": sum(d["detailed_changes"].__len__() for d in diffs),
+            "has_changes": has_changes
+        },
+        "request_filters": {
+            "only_pending": only_pending,
+            "only_approved": only_approved,
+            "only_rejected": only_rejected,
+            "tester_id": tester_id,
+            "build_id": build_id
+        }
     }
 
 
@@ -3300,6 +3790,7 @@ async def reject_diff(request: Request):
             CREATE TABLE IF NOT EXISTS diff_rejections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 diff_id INTEGER,
+                rejection_reason TEXT,       
                 rejected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -3720,7 +4211,285 @@ def qa_summary(build_id: str, db: sqlite3.Connection = Depends(get_db)):
     return JSONResponse(content=summary)
 
 
+# =====================================================
+# ENDPOINTS DE CONFIGURACIÓN
+# =====================================================
+
+@app.get("/api/config")
+def get_current_config():
+    """
+    Retorna la configuración actual (con valores sensibles enmascarados).
+    Útil para debugging y auditoría.
+    """
+    try:
+        config_dict = config.to_dict()
+        return JSONResponse(
+            content={
+                "status": "ok",
+                "config": config_dict,
+                "file_path": str(config.config_path)
+            }
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e)}
+        )
+
+
+@app.get("/api/config/notifications")
+def get_notifications_config():
+    """
+    Retorna solo la configuración de notificaciones.
+    """
+    try:
+        notifications_config = config.get_section("notifications")
+        # Enmascarar valores sensibles
+        safe_config = config._mask_sensitive_values(notifications_config.copy())
+        
+        return JSONResponse(
+            content={
+                "status": "ok",
+                "slack": {
+                    "enabled": config.is_notification_enabled("slack"),
+                    "has_webhook": bool(config.get_webhook_url("slack"))
+                },
+                "teams": {
+                    "enabled": config.is_notification_enabled("teams"),
+                    "has_webhook": bool(config.get_webhook_url("teams"))
+                },
+                "jira": {
+                    "enabled": config.is_notification_enabled("jira"),
+                    "has_credentials": bool(config.get("notifications.jira.api_token"))
+                }
+            }
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e)}
+        )
+
+
+@app.post("/api/config/test-slack")
+def test_slack_notification():
+    """
+    Envía un mensaje de prueba a Slack para verificar la configuración.
+    """
+    try:
+        if not config.is_notification_enabled("slack"):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Slack notifications are disabled"}
+            )
+        
+        webhook_url = config.get_webhook_url("slack")
+        if not webhook_url:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Slack webhook URL not configured"}
+            )
+        
+        test_payload = {
+            "tester_id": "test-user",
+            "build_id": "test-build-v1.0",
+            "severity": 0.5,
+            "diff_count": 3
+        }
+        
+        success = send_slack_alert(
+            webhook_url=webhook_url,
+            title="🧪 Test Alert from AxiomServiceIA",
+            payload=test_payload
+        )
+        
+        if success:
+            return JSONResponse(
+                content={"status": "ok", "message": "Test message sent to Slack"}
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Failed to send test message to Slack"}
+            )
+            
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.post("/api/config/test-teams")
+def test_teams_notification():
+    """
+    Envía un mensaje de prueba a Teams para verificar la configuración.
+    """
+    try:
+        if not config.is_notification_enabled("teams"):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Teams notifications are disabled"}
+            )
+        
+        webhook_url = config.get_webhook_url("teams")
+        if not webhook_url:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Teams webhook URL not configured"}
+            )
+        
+        test_payload = {
+            "tester_id": "test-user",
+            "build_id": "test-build-v1.0",
+            "severity": 0.5,
+            "diff_count": 3
+        }
+        
+        success = send_teams_alert(
+            webhook_url=webhook_url,
+            title="🧪 Test Alert from AxiomServiceIA",
+            payload=test_payload
+        )
+        
+        if success:
+            return JSONResponse(
+                content={"status": "ok", "message": "Test message sent to Teams"}
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Failed to send test message to Teams"}
+            )
+            
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.post("/api/config/reload")
+def reload_config():
+    """
+    Recarga la configuración desde el archivo config.yaml.
+    Útil para aplicar cambios sin reiniciar el servidor.
+    """
+    try:
+        config.reload()
+        return JSONResponse(
+            content={
+                "status": "ok",
+                "message": "Configuration reloaded successfully"
+            }
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to reload config: {str(e)}"}
+        )
+
+
+@app.get("/api/config/ci")
+def get_ci_config():
+    """
+    Retorna solo la configuración de CI.
+    """
+    try:
+        ci_config = config.get_section("ci")
+        return JSONResponse(
+            content={
+                "status": "ok",
+                "ci": ci_config
+            }
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e)}
+        )
+
+
+@app.get("/api/config/ml")
+def get_ml_config():
+    """
+    Retorna solo la configuración de modelos ML.
+    """
+    try:
+        ml_config = config.get_section("ml")
+        return JSONResponse(
+            content={
+                "status": "ok",
+                "ml": ml_config
+            }
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e)}
+        )
+
+
+@app.get("/api/config/health")
+def config_health_check():
+    """
+    Realiza un health check de la configuración.
+    Verifica que todos los servicios necesarios estén correctamente configurados.
+    """
+    try:
+        health_status = {
+            "status": "ok",
+            "checks": {
+                "slack": {
+                    "enabled": config.is_notification_enabled("slack"),
+                    "configured": bool(config.get_webhook_url("slack")),
+                    "ready": config.is_notification_enabled("slack") and bool(config.get_webhook_url("slack"))
+                },
+                "teams": {
+                    "enabled": config.is_notification_enabled("teams"),
+                    "configured": bool(config.get_webhook_url("teams")),
+                    "ready": config.is_notification_enabled("teams") and bool(config.get_webhook_url("teams"))
+                },
+                "jira": {
+                    "enabled": config.is_notification_enabled("jira"),
+                    "configured": bool(config.get("notifications.jira.api_token")),
+                    "ready": config.is_notification_enabled("jira") and bool(config.get("notifications.jira.api_token"))
+                },
+                "database": {
+                    "path": config.get("database.path", "unknown"),
+                    "exists": os.path.exists(config.get("database.path", ""))
+                }
+            }
+        }
+        
+        # Determinar estado general
+        notification_services = [
+            health_status["checks"]["slack"]["ready"],
+            health_status["checks"]["teams"]["ready"],
+            health_status["checks"]["jira"]["ready"]
+        ]
+        
+        if any(notification_services):
+            health_status["overall"] = "healthy"
+        else:
+            health_status["overall"] = "degraded"
+            health_status["warning"] = "At least one notification service should be configured"
+        
+        return JSONResponse(content=health_status)
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "overall": "unhealthy",
+                "error": str(e)
+            }
+        )
+
+
 @app.get("/qa_summary/{build_id}")
+
 def qa_summary(build_id: str, tester_id: Optional[str] = None):
     """
     Devuelve resumen de cambios por pantalla para QA.
@@ -4471,3 +5240,349 @@ async def metrics_all():
         rows = conn.execute("SELECT * FROM metrics_summary").fetchall()
         return {"metrics": [dict(r) for r in rows]}       
     
+
+# ============================================================
+# 🔹 NUEVOS ENDPOINTS: SISTEMA DE RETROALIMENTACIÓN
+# ============================================================
+
+@app.post("/diff/{diff_id}/approve")
+async def approve_diff(diff_id: int):
+    """
+    Registra aprobación de un diff.
+    El modelo aprenderá a no mostrar similares en el futuro.
+    """
+    global feedback_system
+    if feedback_system is None:
+        return {"error": "Feedback system not initialized", "status": 503}
+    
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
+            
+            # Obtener detalles del diff
+            c.execute("""
+                SELECT diff_hash, tester_id, app_name, build_id, screen_name
+                FROM screen_diffs WHERE id = ? LIMIT 1
+            """, (diff_id,))
+            
+            diff_row = c.fetchone()
+            if not diff_row:
+                return {"error": "Diff not found", "status": 404}
+            
+            diff_hash, tester, app, build, screen = diff_row
+            
+            # Registrar aprobación en feedback system
+            record_diff_decision(
+                diff_hash=diff_hash,
+                diff_signature=diff_hash,
+                app_name=app,
+                tester_id=tester,
+                build_version=build,
+                decision='approved',
+                user_approved=True,
+                feedback_system=feedback_system
+            )
+            
+            # Actualizar BD
+            c.execute("""
+                UPDATE screen_diffs 
+                SET diff_priority = 'low', approved_before = 1
+                WHERE id = ?
+            """, (diff_id,))
+            
+            conn.commit()
+        
+        logger.info(f"✅ Diff {diff_id} aprobado por tester {tester}")
+        return {
+            "success": True,
+            "message": f"Diff approved - modelo mejorado",
+            "diff_id": diff_id
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error aprobando diff: {e}")
+        return {"error": str(e), "status": 500}
+
+
+@app.post("/diff/{diff_id}/reject")
+async def reject_diff(diff_id: int):
+    """
+    Registra rechazo de un diff (falso positivo).
+    El modelo aprenderá a no mostrar similares.
+    """
+    global feedback_system
+    if feedback_system is None:
+        return {"error": "Feedback system not initialized", "status": 503}
+    
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
+            
+            c.execute("""
+                SELECT diff_hash, tester_id, app_name, build_id
+                FROM screen_diffs WHERE id = ? LIMIT 1
+            """, (diff_id,))
+            
+            diff_row = c.fetchone()
+            if not diff_row:
+                return {"error": "Diff not found", "status": 404}
+            
+            diff_hash, tester, app, build = diff_row
+            
+            # Registrar rechazo
+            record_diff_decision(
+                diff_hash=diff_hash,
+                diff_signature=diff_hash,
+                app_name=app,
+                tester_id=tester,
+                build_version=build,
+                decision='rejected',
+                user_approved=False,
+                feedback_system=feedback_system
+            )
+            
+            # Marcar como baja prioridad (falso positivo)
+            c.execute("""
+                UPDATE screen_diffs 
+                SET diff_priority = 'low'
+                WHERE id = ?
+            """, (diff_id,))
+            
+            conn.commit()
+        
+        logger.info(f"❌ Diff {diff_id} rechazado por tester {tester} - falso positivo")
+        return {
+            "success": True,
+            "message": "Diff marcado como falso positivo",
+            "diff_id": diff_id
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error rechazando diff: {e}")
+        return {"error": str(e), "status": 500}
+
+
+@app.get("/learning-insights/{app_name}/{tester_id}")
+async def get_learning_insights(app_name: str, tester_id: str):
+    """
+    Retorna métricas de aprendizaje del modelo para un tester.
+    Muestra cómo está mejorando la precisión.
+    """
+    global feedback_system
+    if feedback_system is None:
+        return {"error": "Feedback system not initialized", "status": 503}
+    
+    try:
+        insights = feedback_system.get_learning_insights(app_name, tester_id)
+        return {
+            "app_name": app_name,
+            "tester_id": tester_id,
+            "insights": insights,
+            "status": "ok"
+        }
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo insights: {e}")
+        return {"error": str(e), "status": 500}
+
+
+# ============================================================
+# 🔹 ENDPOINTS: FLOW ANALYTICS ENGINE
+# ============================================================
+
+# Instancia global del motor de análisis de flujos
+flow_analytics_engine = None
+
+@app.on_event("startup")
+async def init_flow_analytics():
+    """Inicializar FlowAnalyticsEngine al arrancar la app."""
+    global flow_analytics_engine
+    try:
+        from FlowAnalyticsEngine import FlowAnalyticsEngine
+        flow_analytics_engine = FlowAnalyticsEngine(app_name="default_app")
+        logger.info("✅ FlowAnalyticsEngine inicializado correctamente")
+    except Exception as e:
+        logger.warning(f"⚠️  No se pudo inicializar FlowAnalyticsEngine: {e}")
+        flow_analytics_engine = None
+
+
+@app.post("/flow-analyze/{app_name}/{tester_id}")
+async def analyze_tester_flows(app_name: str, tester_id: str, request: Request):
+    """
+    Analiza los flujos de un tester y genera reporte con calidad, anomalías y sugerencias.
+    
+    Body esperado (opcional):
+    {
+        "session_key": "tester_123_minute_block_xyz",
+        "flow_sequence": ["home", "profile", "settings"]
+    }
+    
+    Retorna:
+    {
+        "tester_id": "...",
+        "app_name": "...",
+        "quality_score": 85.5,
+        "anomaly_rate": 0.12,
+        "total_flows_analyzed": 42,
+        "suggestions": [...],
+        "report": "Texto del reporte"
+    }
+    """
+    global flow_analytics_engine
+    
+    if flow_analytics_engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "FlowAnalyticsEngine not initialized"}
+        )
+    
+    try:
+        payload = await request.json()
+    except:
+        payload = {}
+    
+    try:
+        # Generar reporte de flujos para el tester
+        report = flow_analytics_engine.generate_tester_flow_report(
+            app_name=app_name,
+            tester_id=tester_id
+        )
+        
+        logger.info(f"📊 Reporte de flujos generado para {tester_id} en {app_name}")
+        
+        return {
+            "success": True,
+            "app_name": app_name,
+            "tester_id": tester_id,
+            "report": report,
+            "status": "ok"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error analizando flujos: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.get("/flow-dashboard/{app_name}")
+async def get_flow_analytics_dashboard(app_name: str):
+    """
+    Dashboard global de análisis de flujos:
+    - Distribución de pantallas por frecuencia
+    - Puntos de interrupción (donde los flujos se desvían)
+    - Anomalías totales detectadas
+    - Recomendaciones generales
+    
+    Retorna:
+    {
+        "app_name": "...",
+        "dashboard": {
+            "total_flows": 500,
+            "unique_screens": 25,
+            "interruption_hotspots": [...],
+            "anomalies_summary": {...},
+            "recommendations": [...]
+        }
+    }
+    """
+    global flow_analytics_engine
+    
+    if flow_analytics_engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "FlowAnalyticsEngine not initialized"}
+        )
+    
+    try:
+        dashboard = flow_analytics_engine.get_flow_analytics_dashboard(app_name)
+        
+        logger.info(f"📈 Dashboard de flujos recuperado para {app_name}")
+        
+        return {
+            "success": True,
+            "app_name": app_name,
+            "dashboard": dashboard,
+            "status": "ok"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error generando dashboard: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+# ============================================================
+# 🤖 QA AI DASHBOARD - ANÁLISIS INTELIGENTE DE CAMBIOS
+# ============================================================
+
+from qa_ai_dashboard import qa_ai_router
+app.include_router(qa_ai_router)
+
+
+@app.get("/flow-anomalies/{tester_id}")
+async def get_flow_anomalies(
+    tester_id: str,
+    limit: int = Query(50, ge=1, le=500),
+    severity: Optional[str] = Query(None, regex="^(low|medium|high)$")
+):
+    """
+    Recupera historial de anomalías detectadas para un tester.
+    
+    Query params:
+    - tester_id: ID del tester (requerido)
+    - limit: Máximo número de registros (1-500, default=50)
+    - severity: Filtrar por severidad (low|medium|high, opcional)
+    
+    Retorna:
+    {
+        "tester_id": "...",
+        "anomalies": [
+            {
+                "id": 1,
+                "app_name": "com.example.app",
+                "flow_sequence": ["home", "profile", "error"],
+                "deviation_point": "profile",
+                "deviation_reason": "Botón inactivo detectado",
+                "severity": "high",
+                "timestamp": "2024-01-15T10:30:00"
+            },
+            ...
+        ],
+        "total": 15
+    }
+    """
+    global flow_analytics_engine
+    
+    if flow_analytics_engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "FlowAnalyticsEngine not initialized"}
+        )
+    
+    try:
+        # Recuperar anomalías del motor
+        anomalies = flow_analytics_engine.get_anomaly_history(
+            tester_id=tester_id,
+            limit=limit,
+            severity_filter=severity
+        )
+        
+        logger.info(f"📋 {len(anomalies)} anomalías recuperadas para {tester_id}")
+        
+        return {
+            "success": True,
+            "tester_id": tester_id,
+            "anomalies": anomalies,
+            "total": len(anomalies),
+            "status": "ok"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error recuperando anomalías: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )

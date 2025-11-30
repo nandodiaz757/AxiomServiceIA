@@ -1,0 +1,86 @@
+# =====================================================
+# Configuración de Notificaciones - AxiomServiceIA
+# =====================================================
+
+# --- WEBHOOKS DE NOTIFICACIONES ---
+notifications:
+  # Slack Configuration
+  slack:
+    enabled: true
+    webhook_url: "${SLACK_WEBHOOK_URL}"  # Variable de entorno o URL directa
+    timeout: 5
+    retry_count: 2
+    # Canales específicos para diferentes tipos de alertas (opcional)
+    channels:
+      ci_failures: "#ci-alerts"
+      model_updates: "#ml-updates"
+      errors: "#error-logs"
+
+  # Microsoft Teams Configuration
+  teams:
+    enabled: true
+    webhook_url: "${TEAMS_WEBHOOK_URL}"  # Variable de entorno o URL directa
+    timeout: 5
+    retry_count: 2
+
+  # Jira Configuration
+  jira:
+    enabled: true
+    base_url: "${JIRA_BASE_URL}"
+    api_token: "${JIRA_API_TOKEN}"
+    project_key: "QA"
+    issue_type: "Task"
+    timeout: 10
+    retry_count: 2
+
+# --- CONFIGURACIÓN DE CI/CD ---
+ci:
+  # Umbral de similitud para considerar un cambio como "significativo"
+  similarity_threshold: 0.7
+  
+  # Reportar automáticamente fallos en CI
+  auto_report_failures: true
+  
+  # Máximo número de resultados a devolver en check-diff
+  max_results: 20
+
+# --- CONFIGURACIÓN DE MODELOS ML ---
+ml:
+  # Entrenar modelo general automáticamente durante collect
+  train_general_on_collect: true
+  
+  # Mínimo de muestras para entrenar
+  min_samples_for_training: 3
+  
+  # Tamaño máximo de batch para entrenamiento
+  batch_size: 500
+  
+  # Usar modelo general como base para entrenamientos incrementales
+  use_general_as_base: true
+
+# --- CONFIGURACIÓN DE BASE DE DATOS ---
+database:
+  path: "./axiom.db"
+  # Auto-limpiar registros antiguos (días)
+  cleanup_old_records_days: 90
+
+# --- CONFIGURACIÓN DE LOGGING ---
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "./logs/axiom.log"
+  max_file_size: 10485760  # 10MB
+  backup_count: 5
+
+# --- CONFIGURACIÓN DE SERVIDOR ---
+server:
+  host: "0.0.0.0"
+  port: 8000
+  reload: false
+  workers: 4
+
+# --- CARACTERÍSTICAS EXPERIMENTALES ---
+features:
+  flow_validation_enabled: true
+  feedback_system_enabled: true
+  diff_deduplication_enabled: true
