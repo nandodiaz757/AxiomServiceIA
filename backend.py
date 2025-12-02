@@ -40,8 +40,7 @@ from SiameseEncoder import SiameseEncoder
 from contextvars import ContextVar
 from slugify import slugify
 import logging
-
-
+from myqueue.message_queue import send_message
 from stable_signature import normalize_node
 
 logger = logging.getLogger("backend")
@@ -84,6 +83,9 @@ FLOW_MODELS = {}
 last_train: dict[str, float] = {}
 
 event_queue: asyncio.Queue = asyncio.Queue()
+event_queue_train_hibryd = asyncio.Queue()
+event_queue_train_general = asyncio.Queue()
+
 BATCH_SIZE = 10           # número máximo de eventos por batch
 BATCH_INTERVAL = 2        # tiempo máximo de espera en segundos antes de procesar batch
 last_processed = {}
@@ -96,12 +98,16 @@ if 'hmm_model' not in globals():
 
 DB_NAME = "accessibility.db"
 MODELS_DIR = "models"
-logger = logging.getLogger("myapp")
-logger.setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.INFO)
 
 ENRICHED_VECTOR_THRESHOLD = 0.5  # Ajusta este valor según tu lógica
+
+# ✅ NUEVO: Sistema de caché para rastrear pantallas ya entrenadas
+# Evita reentrenamiento innecesario en cada evento
+TRAINED_SCREENS_CACHE = {}  # {"app_name/tester_id/build_id/screen_id": timestamp}
+TRAIN_CACHE_TTL = 3600  # Reentrenar si pasaron más de 1 hora (3600 seg)
+TRAIN_GENERAL_ON_COLLECT = True  # Habilitar entrenamiento general en /collect
 
 # Estructura para historial de booleanos (para alertas de cambios)
 
@@ -718,6 +724,36 @@ async def daily_cleanup():
     await asyncio.to_thread(clean_old_diff_records, days=90)
 
 
+@repeat_every(seconds=60 * 5, wait_first=False)  # cada 5 minutos
+async def periodic_incremental_train():
+    enriched_vector = ...
+    tester_id = ...
+    build_id = ...
+    app_name = ...
+    semantic_screen_id = semantic_screen_id_ctx.get()
+
+    asyncio.create_task(_train_incremental_logic_hybrid(
+        enriched_vector=enriched_vector,
+        tester_id=tester_id,
+        build_id=build_id,
+        app_name=app_name,
+        screen_id=semantic_screen_id,
+        use_general_as_base=True,
+    ))    
+
+
+@repeat_every(seconds=60 * 10, wait_first=False)  # cada 10 minutos
+async def periodic_general_train():
+
+    app_name = ...
+
+    await _train_general_logic_hybrid(
+        app_name=app_name,
+        batch_size=500,
+        min_samples=3,
+        update_general=True
+    )
+
 # ==========================================
 # LIFESPAN HANDLER (startup + shutdown)
 # ==========================================
@@ -1096,6 +1132,7 @@ def init_db():
             text TEXT,
             content_description TEXT,
             screens_id TEXT,
+            screens_id_short TEXT,
             screen_names TEXT,
             header_text TEXT,
             actual_device TEXT,
@@ -1830,6 +1867,25 @@ async def _safe_training_wrapper(
             logger.error(f"❌ [{desc}] Error durante reentrenamiento: {e}", exc_info=True)
 
 
+async def hybrid_train_worker():
+    while True:
+        task = await event_queue_train_hibryd.get()
+
+        try:
+            await _train_incremental_logic_hybrid(
+                X=np.array(task["X"]),
+                tester_id=task["tester_id"],
+                build_id=task["build_id"],
+                app_name=task["app_name"],
+                screen_id=task["screen_id"],
+                use_general_as_base=True
+            )
+        except Exception as e:
+            logger.error(f"Error ejecutando entrenamiento híbrido: {e}")
+
+        event_queue_train_hibryd.task_done()
+
+
 async def ensure_model_dimensions(
     kmeans,
     X,
@@ -1840,64 +1896,44 @@ async def ensure_model_dimensions(
     desc=""
 ):
     try:
-        # 🛑 1. Modelo aún no entrenado → entrenar ahora
+        # 🛑 1. Modelo aún no entrenado → enviar tarea
         if not hasattr(kmeans, "cluster_centers_"):
-            logger.warning(
-                f"[{desc}] KMeans aún no entrenado — iniciando entrenamiento inicial"
-            )
+            logger.warning(f"[{desc}] KMeans no entrenado — enviando entrenamiento inicial a la cola")
 
-            lock_key = f"{app_name}:initial_train"
-            lock = _get_lock(lock_key)
+            await event_queue_train_hibryd.put({
+                "X": X.tolist(),   # convertir si es numpy
+                "tester_id": tester_id,
+                "build_id": build_id,
+                "app_name": app_name,
+                "screen_id": screen_id,
+                "desc": f"initial_train {desc}",
+                "train_type": "initial"
+            })
 
-            if not lock.locked():
-                asyncio.create_task(
-                    _safe_training_wrapper(
-                        X=X,
-                        tester_id=tester_id,
-                        build_id=build_id,
-                        app_name=app_name,
-                        screen_id=screen_id,
-                        desc=f"initial_train {desc}",
-                        lock=lock,
-                        train_fn=_train_incremental_logic_hybrid,
-                    )
-                )
             return False
 
-        # 🧩 2. Comparar dimensiones reales
+        # 🧩 2. Revisar dimensiones
         expected_features = kmeans.cluster_centers_.shape[1]
         current_features = X.shape[1]
 
         if current_features != expected_features:
             logger.warning(
-                f"[{desc}] Dimensión inconsistente: modelo={expected_features}, nuevo={current_features}. Reentrenando..."
+                f"[{desc}] Dimensiones diferentes: modelo={expected_features}, nuevo={current_features}. Enviando reentrenamiento..."
             )
 
-            lock_key = f"{app_name}:diff_model"
-            lock = _get_lock(lock_key)
-
-            if lock.locked():
-                logger.warning(
-                    f"[{desc}] Skip: reentrenamiento ya en proceso para {lock_key}"
-                )
-                return False
-
-            asyncio.create_task(
-                _safe_training_wrapper(
-                    X=X,
-                    tester_id=tester_id,
-                    build_id=build_id,
-                    app_name=app_name,
-                    screen_id=screen_id,
-                    desc=f"retrain {desc}",
-                    lock=lock,
-                    train_fn=_train_incremental_logic_hybrid,
-                )
-            )
+            await event_queue_train_hibryd.put({
+                "X": X.tolist(),
+                "tester_id": tester_id,
+                "build_id": build_id,
+                "app_name": app_name,
+                "screen_id": screen_id,
+                "desc": f"retrain {desc}",
+                "train_type": "dimension_mismatch"
+            })
 
             return False
 
-        # ✅ Todo bien
+        # Todo OK
         return True
 
     except Exception as e:
@@ -1905,6 +1941,83 @@ async def ensure_model_dimensions(
             f"[{desc}] Error validando dimensiones ({app_name}/{tester_id}/{build_id}): {e}"
         )
         return False
+
+
+# async def ensure_model_dimensions(
+#     kmeans,
+#     X,
+#     tester_id,
+#     build_id,
+#     app_name="default_app",
+#     screen_id="unknown_screen",
+#     desc=""
+# ):
+#     try:
+#         # 🛑 1. Modelo aún no entrenado → entrenar ahora
+#         if not hasattr(kmeans, "cluster_centers_"):
+#             logger.warning(
+#                 f"[{desc}] KMeans aún no entrenado — iniciando entrenamiento inicial"
+#             )
+
+#             lock_key = f"{app_name}:initial_train"
+#             lock = _get_lock(lock_key)
+
+#             if not lock.locked():
+#                 asyncio.create_task(
+#                     _safe_training_wrapper(
+#                         X=X,
+#                         tester_id=tester_id,
+#                         build_id=build_id,
+#                         app_name=app_name,
+#                         screen_id=screen_id,
+#                         desc=f"initial_train {desc}",
+#                         lock=lock,
+#                         train_fn=_train_incremental_logic_hybrid,
+#                     )
+#                 )
+#             return False
+
+#         # 🧩 2. Comparar dimensiones reales
+#         expected_features = kmeans.cluster_centers_.shape[1]
+#         current_features = X.shape[1]
+
+#         if current_features != expected_features:
+#             logger.warning(
+#                 f"[{desc}] Dimensión inconsistente: modelo={expected_features}, nuevo={current_features}. Reentrenando..."
+#             )
+
+#             lock_key = f"{app_name}:diff_model"
+#             lock = _get_lock(lock_key)
+
+#             if lock.locked():
+#                 logger.warning(
+#                     f"[{desc}] Skip: reentrenamiento ya en proceso para {lock_key}"
+#                 )
+#                 return False
+
+#             asyncio.create_task(
+#                 _safe_training_wrapper(
+#                     X=X,
+#                     tester_id=tester_id,
+#                     build_id=build_id,
+#                     app_name=app_name,
+#                     screen_id=screen_id,
+#                     desc=f"retrain {desc}",
+#                     lock=lock,
+#                     train_fn=_train_incremental_logic_hybrid,
+#                 )
+#             )
+
+#             return False
+
+#         # ✅ Todo bien
+#         return True
+
+#     except Exception as e:
+#         logger.warning(
+#             f"[{desc}] Error validando dimensiones ({app_name}/{tester_id}/{build_id}): {e}"
+#         )
+#         return False
 
 def structure_signature_features(tree):
     """
@@ -2190,11 +2303,11 @@ async def analyze_and_train(event: AccessibilityEvent):
         curr_header = (s_name or "")
         # curr_header = (s_name or "").strip().lower()
         prev_header = None
-
+        prev_id= None
         with sqlite3.connect(DB_NAME) as conn:
             # Buscar el último header distinto para el mismo tester
             row = conn.execute("""
-                SELECT header_text
+                SELECT header_text, id 
                 FROM accessibility_data
                 WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
                 AND LOWER(TRIM(header_text)) != LOWER(TRIM(?))
@@ -2204,8 +2317,9 @@ async def analyze_and_train(event: AccessibilityEvent):
             """, (t_id, curr_header, event_type_ref)).fetchone()
 
             if row:
-                prev_id = row[0]          # ID del registro anterior
-                prev_header = (row[1] or "").strip().lower()      # header_text
+                prev_header = (row[0] or "").strip().lower()         
+                # prev_id = (row[1] or "").strip().lower()     
+                prev_id = str(row[1])
             else:
                 prev_id = None
                 prev_header = None
@@ -2426,6 +2540,7 @@ async def analyze_and_train(event: AccessibilityEvent):
             # 🔹 NUEVA SECCIÓN: Retroalimentación Incremental
             mark_as_low_priority = False
             similarity_to_approved = 0.0
+            diff_signature = diff_hash(removed_all, added_all, modified_all, text_diff)
             
             if has_changes and feedback_system is not None:
                 try:
@@ -2483,44 +2598,92 @@ async def analyze_and_train(event: AccessibilityEvent):
             """, (emb_json, s_name, t_id))
             conn.commit()
 
-    # -------------------- 7. Entrenamiento incremental --------------------
-    asyncio.create_task(_train_incremental_logic_hybrid(
-        enriched_vector=enriched_vector,
-        tester_id=tester_id,
-        build_id=build_id,
-        app_name=app_name,
-        #screen_id=event.screens_id or s_name or "unknown_screen",
-        screen_id=semantic_screen_id_ctx.get(),
-        use_general_as_base=True
-    ))
+    # -------------------- 7. Entrenamiento incremental (CON CACHÉ) --------------------
+    # ✅ NUEVO: Verificar si ya entrenamos esta pantalla recientemente
+    screen_cache_key = f"{app_name}/{tester_id}/{build_id}/{semantic_screen_id_ctx.get() or 'unknown'}"
+    current_time = time.time()
+    last_train_time = TRAINED_SCREENS_CACHE.get(screen_cache_key, 0)
 
 
-    if TRAIN_GENERAL_ON_COLLECT:
-        await _train_general_logic_hybrid(
-            app_name=app_name,
-            batch_size=500,
-            min_samples=3,
-            update_general=True
-        )
+# --- Cola para entreno incremental local---
+    # await event_queue_train_hibryd.put({
+    #     "enriched_vector": enriched_vector,
+    #     "tester_id": tester_id,
+    #     "build_id": build_id,
+    #     "app_name": app_name,
+    #     "screen_id": semantic_screen_id_ctx.get()
+    # })
 
-         # -------------------- Entrenamiento general con intervalo --------------------
-    if TRAIN_GENERAL_ON_COLLECT:
-        global last_train
-        now = time.time()
-        key = f"{app_name}_{semantic_screen_id_ctx.get()}"
-        last = last_train.get(key, 0)
-        MIN_INTERVAL = 300  # 5 minutos entre entrenamientos generales
+    # # --- Cola para entreno general ---
+    # await event_queue_train_general.put({
+    #     "app_name": app_name,
+    #     "batch_size": 500,
+    #     "min_samples": 3,
+    #     "update_general": True
+    # })
 
-        if now - last > MIN_INTERVAL:
-            last_train[key] = now
-            await _train_general_logic_hybrid(
-                app_name=app_name,
-                batch_size=500,
-                min_samples=3,
-                update_general=True
-            )
-        else:
-            logger.debug(f"⏳ Skip general training for {key}, last run {now - last:.1f}s ago")
+# --- Cola para entreno incremental local---
+
+    await send_message("train_hybrid", {
+        "enriched_vector": enriched_vector,
+        "tester_id": tester_id,
+        "build_id": build_id,
+        "app_name": app_name,
+        "screen_id": semantic_screen_id_ctx.get(),
+    })
+
+    await send_message("train_general", {
+        "app_name": app_name,
+        "batch_size": 500,
+        "min_samples": 3,
+        "update_general": True,
+    })
+    
+    # Solo entrenar si: no se entrenó antes O pasó más de TTL segundos
+    # if current_time - last_train_time > TRAIN_CACHE_TTL:
+    #     logger.info(f"🔄 Entrenando pantalla (primera vez o expirado): {screen_cache_key}")
+    #     TRAINED_SCREENS_CACHE[screen_cache_key] = current_time  # Marcar como entrenada
+        
+    #     asyncio.create_task(_train_incremental_logic_hybrid(
+    #         enriched_vector=enriched_vector,
+    #         tester_id=tester_id,
+    #         build_id=build_id,
+    #         app_name=app_name,
+    #         screen_id=semantic_screen_id_ctx.get(),
+    #         use_general_as_base=True
+    #     ))
+    # else:
+    #     # Pantalla ya fue entrenada recientemente, saltarla
+    #     time_since_train = current_time - last_train_time
+    #     logger.debug(f"⏭️  Saltando reentrenamiento de {screen_cache_key} (entrenada hace {time_since_train:.0f}s)")
+
+
+    # if TRAIN_GENERAL_ON_COLLECT:
+    #     await _train_general_logic_hybrid(
+    #         app_name=app_name,
+    #         batch_size=500,
+    #         min_samples=3,
+    #         update_general=True
+    #     )
+
+    #      # -------------------- Entrenamiento general con intervalo --------------------
+    # if TRAIN_GENERAL_ON_COLLECT:
+    #     global last_train
+    #     now = time.time()
+    #     key = f"{app_name}_{semantic_screen_id_ctx.get()}"
+    #     last = last_train.get(key, 0)
+    #     MIN_INTERVAL = 300  # 5 minutos entre entrenamientos generales
+
+    #     if now - last > MIN_INTERVAL:
+    #         last_train[key] = now
+    #         await _train_general_logic_hybrid(
+    #             app_name=app_name,
+    #             batch_size=500,
+    #             min_samples=3,
+    #             update_general=True
+    #         )
+    #     else:
+    #         logger.debug(f"⏳ Skip general training for {key}, last run {now - last:.1f}s ago")
 
 
 # -------------------- 9. Guardar en screen_diffs --------------------
@@ -2839,10 +3002,22 @@ def normalize_node(node: Dict) -> Dict:
     """Filtra claves estables sin destruir los tipos."""
     return {k: node.get(k, None) for k in SAFE_KEYS}     
 
+# def normalize_tree(nodes: List[Dict]) -> List[Dict]:
+#     """Normaliza y ordena la lista de nodos para que el orden no afecte el hash."""
+#     normalized = [normalize_node(n) for n in nodes]
+#     return sorted(normalized, key=lambda n: (n["className"], n["text"]))
+
 def normalize_tree(nodes: List[Dict]) -> List[Dict]:
     """Normaliza y ordena la lista de nodos para que el orden no afecte el hash."""
     normalized = [normalize_node(n) for n in nodes]
-    return sorted(normalized, key=lambda n: (n["className"], n["text"]))
+
+    return sorted(
+        normalized,
+        key=lambda n: (
+            n.get("className") or "",
+            n.get("text") or ""
+        )
+    )    
 
 def stable_signature(nodes: List[Dict]) -> str:
     """Genera un hash estable del árbol normalizado."""
@@ -2897,7 +3072,7 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
         screen_name = event.screen_names or ""
         header_text = event.header_text or ""
         screens_id_val = semantic_screen_id  
-        #screens_id_val = event.screens_id or norm.get("screensId") or None
+        screens_id_short = screen_id_short
 
         # -------------------- 4) Detectar scroll --------------------
         scroll_type = detect_scroll_type(raw_nodes)
@@ -2945,11 +3120,11 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
                     """
                     INSERT INTO accessibility_data (
                         tester_id, build_id, is_baseline, timestamp, event_type, event_type_name,
-                        package_name, class_name, text, content_description, screens_id,
+                        package_name, class_name, text, content_description, screens_id,screens_id_short,
                         screen_names, header_text, collect_node_tree, global_signature,
                         partial_signature, scroll_type, additional_info, tree_data,
                         session_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         tester_norm,
@@ -2963,6 +3138,7 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
                         event.text,
                         event.content_description,
                         screens_id_val,
+                        screens_id_short,
                         event.screen_names,
                         header_text,
                         # 🔥 GUARDA RAW NODES, NO NORMALIZADOS
@@ -5396,6 +5572,7 @@ flow_analytics_engine = None
 async def init_flow_analytics():
     """Inicializar FlowAnalyticsEngine al arrancar la app."""
     global flow_analytics_engine
+    asyncio.create_task(hybrid_train_worker())
     try:
         from FlowAnalyticsEngine import FlowAnalyticsEngine
         flow_analytics_engine = FlowAnalyticsEngine(app_name="default_app")

@@ -141,17 +141,36 @@ class IncrementalFeedbackSystem:
             # Registrar feedback del diff
             c.execute("""
                 INSERT INTO diff_feedback 
-                (diff_hash, diff_signature, app_name, tester_id, build_version_first, feedback_type, feedback_count, last_seen, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                (diff_hash, diff_signature, app_name, tester_id, 
+                build_version_first, feedback_type, feedback_count, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
                 ON CONFLICT(diff_hash, tester_id, app_name) DO UPDATE SET
                     feedback_count = feedback_count + 1,
-                    feedback_type = ?,
-                    last_seen = ?
+                    feedback_type = excluded.feedback_type,
+                    last_seen = excluded.last_seen
             """, (
-                diff_hash, diff_signature, app_name, tester_id, build_version,
-                feedback_type, timestamp, timestamp,
-                feedback_type, timestamp
+                diff_hash,
+                diff_signature,
+                app_name,
+                tester_id,
+                build_version,
+                feedback_type,
+                timestamp
             ))
+
+            # c.execute("""
+            #     INSERT INTO diff_feedback 
+            #     (diff_hash, diff_signature, app_name, tester_id, build_version_first, feedback_type, feedback_count, last_seen, created_at)
+            #     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+            #     ON CONFLICT(diff_hash, tester_id, app_name) DO UPDATE SET
+            #         feedback_count = feedback_count + 1,
+            #         feedback_type = ?,
+            #         last_seen = ?
+            # """, (
+            #     diff_hash, diff_signature, app_name, tester_id, build_version,
+            #     feedback_type, timestamp, timestamp,
+            #     feedback_type, timestamp
+            # ))
             
             # Actualizar tabla de patrones aprobados
             if feedback_type == 'approved':

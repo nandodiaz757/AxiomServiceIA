@@ -20,6 +20,7 @@ import logging
 from difflib import SequenceMatcher
 from SiameseEncoder import SiameseEncoder
 import difflib
+
  
 
 # HMM
@@ -45,8 +46,8 @@ encoder = SiameseEncoder()
 def model_dir_for(app_name: str, tester_id: str, build_id: str, screen_id: str) -> str:
     return os.path.join(MODEL_BASE, app_name or "default_app", tester_id or "general", str(build_id or "latest"), str(screen_id))
 
-def model_dir_general(app_name: str, screen_id: str) -> str:
-    return os.path.join(MODEL_BASE, app_name or "default_app", "general", str(screen_id))
+def model_dir_general(app_name: str, screen_id_short: str) -> str:
+    return os.path.join(MODEL_BASE, app_name or "default_app", "general", str(screen_id_short))
 
 def save_model(obj, path: str):
     # print("🔥 SAVE PATH:", path)
@@ -1210,11 +1211,11 @@ async def _train_general_logic_hybrid(
 
     # agrupar árboles y vectores por pantalla
     groups = {}
-    for collect_node_tree, enriched_vec, screen_id in rows:
-        if not screen_id:
+    for collect_node_tree, enriched_vec, screen_id_short in rows:
+        if not screen_id_short:
             continue
 
-        entry = groups.setdefault(screen_id, {"trees": [], "vecs": []})
+        entry = groups.setdefault(screen_id_short, {"trees": [], "vecs": []})
 
         # árbol de accesibilidad
         try:
@@ -1235,7 +1236,7 @@ async def _train_general_logic_hybrid(
     siamese_model = SiameseEncoder()
 
     # entrenar un modelo general por pantalla
-    for screen_id, data in groups.items():
+    for screen_id_short, data in groups.items():
         trees = data["trees"]
         vecs = data["vecs"]
 
@@ -1245,18 +1246,18 @@ async def _train_general_logic_hybrid(
             try:
                 emb_batch = siamese_model.encode_batch(trees)
                 X = emb_batch.cpu().numpy()
-                logger.info(f"✅ Generados {len(X)} embeddings Siamese para screen {screen_id}")
+                logger.info(f"✅ Generados {len(X)} embeddings Siamese para screen {screen_id_short}")
             except Exception as e:
-                logger.warning(f"Fallo al generar embeddings Siamese para {screen_id}: {e}")
+                logger.warning(f"Fallo al generar embeddings Siamese para {screen_id_short}: {e}")
                 X = None
 
         # 2️⃣ fallback: usar enriched_vectors si no hay árboles válidos
         if X is None or len(X) == 0:
             if vecs:
                 X = np.array(vecs)
-                logger.debug(f"Usando enriched_vectors para screen {screen_id} ({len(X)} muestras)")
+                logger.debug(f"Usando enriched_vectors para screen {screen_id_short} ({len(X)} muestras)")
             else:
-                logger.debug(f"No hay datos válidos para screen {screen_id}")
+                logger.debug(f"No hay datos válidos para screen {screen_id_short}")
                 continue
 
         # 3️⃣ limpieza
@@ -1282,7 +1283,7 @@ async def _train_general_logic_hybrid(
         clf.fit(Xs, y)
 
         model_obj = {"kmeans": kmeans, "scaler": scaler, "clf": clf}
-        safe_id = screen_id.replace("|", "_").replace("=", "-")
+        safe_id = screen_id_short.replace("|", "_").replace("=", "-")
         model_path = os.path.join(model_dir_general(app_name, safe_id), "hybrid_general.joblib")
         # model_path = os.path.join(model_dir_general(app_name, screen_id), "hybrid_general.joblib")
         save_model(model_obj, model_path)
@@ -1299,7 +1300,7 @@ async def _train_general_logic_hybrid(
                     tol=1e-3
                 )
                 hmm.fit(X)
-                save_model(hmm, os.path.join(model_dir_general(app_name, screen_id), "hmm.joblib"))
-                logger.info("Saved general HMM for %s / screen %s", app_name, screen_id)
+                save_model(hmm, os.path.join(model_dir_general(app_name, screen_id_short), "hmm.joblib"))
+                logger.info("Saved general HMM for %s / screen %s", app_name, screen_id_short)
             except Exception as e:
                 logger.warning("HMM general failed: %s", e)
