@@ -89,6 +89,7 @@ class IncrementalFeedbackSystem:
             );
         """)
         
+        
         # Tabla de historial de decisiones del modelo
         c.execute("""
             CREATE TABLE IF NOT EXISTS model_decision_log (
@@ -187,11 +188,20 @@ class IncrementalFeedbackSystem:
             
             # Registrar métrica de aprendizaje
             approval_rate = self._calculate_approval_rate(app_name, tester_id)
+
             c.execute("""
                 INSERT INTO learning_metrics
                 (app_name, tester_id, metric_name, metric_value, build_version)
                 VALUES (?, ?, 'approval_rate', ?, ?)
+                ON CONFLICT(app_name, tester_id, metric_name, build_version)
+                DO UPDATE SET metric_value = excluded.metric_value,
+                            recorded_at = CURRENT_TIMESTAMP
             """, (app_name, tester_id, approval_rate, build_version))
+            # c.execute("""
+            #     INSERT INTO learning_metrics
+            #     (app_name, tester_id, metric_name, metric_value, build_version)
+            #     VALUES (?, ?, 'approval_rate', ?, ?)
+            # """, (app_name, tester_id, approval_rate, build_version))
             
             conn.commit()
             conn.close()
