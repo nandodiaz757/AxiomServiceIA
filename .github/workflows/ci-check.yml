@@ -24,10 +24,11 @@ jobs:
 
       - name: Call AxiomQA CI check
         env:
-          AXIOM_API_URL: ${{ secrets.AXIOM_API_URL }}
-          AXIOM_API_KEY: ${{ secrets.AXIOM_API_KEY }}
-          BUILD_ID: ${{ github.sha }}
-          TESTER_ID: ${{ secrets.AXIOM_TESTER_ID }}
+          AXIOM_API_URL: ${{ env.AXIOM_API_URL }}
+          AXIOM_API_KEY: ${{ env.AXIOM_API_KEY }}
+          BUILD_ID: ${{ env.BUILD_ID }}
+          TESTER_ID: ${{ env.TESTER_ID }}
+
         run: |
           set -e
           THRESHOLD=0.7
