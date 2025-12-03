@@ -372,7 +372,7 @@ def extract_short_screen_id(semantic_screen_id: str, max_base_len: int = 20) -> 
     return f"{base}_{h}"
 
 def is_baseline_build(app_name, tester_id, build_id):
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
     c = conn.cursor()
     c.execute("""
         SELECT 1 FROM baseline_metadata
@@ -1065,7 +1065,8 @@ def init_metrics_table():
 # Actualizar métricas
 def update_metrics(tester_id: str, build_id: str, has_changes: bool,
                    added_count: int = 0, removed_count: int = 0, modified_count: int = 0):
-    with sqlite3.connect(DB_NAME) as conn:
+    with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO metrics_changes (
@@ -1651,7 +1652,7 @@ def generate_code():
 def save_reset_code(email: str, code: str):
     try:
         expires_at = int(time.time()) + 900
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
         c = conn.cursor()
         c.execute("""
             INSERT INTO password_reset_codes (email, code, expires_at)
@@ -2404,7 +2405,8 @@ async def analyze_and_train(event: AccessibilityEvent):
         )    
 
     # -------------------- (Opcional) Guardar embedding --------------------
-    with sqlite3.connect(DB_NAME) as conn:
+    with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("""
             UPDATE accessibility_data
             SET embedding_vector=?
@@ -2412,7 +2414,8 @@ async def analyze_and_train(event: AccessibilityEvent):
         """, (json.dumps(emb_curr.tolist()), prev_id))
         conn.commit()
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
         prev_rows = conn.execute("""
             SELECT collect_node_tree, header_text, signature, enriched_vector, build_id, event_type_name
             FROM accessibility_data
@@ -2717,7 +2720,8 @@ async def analyze_and_train(event: AccessibilityEvent):
             # --- Generar firma hash del diff (como tenías) ---
             diff_signature = diff_hash(removed_all, added_all, modified_all, text_diff)
 
-            with sqlite3.connect(DB_NAME) as conn:
+            with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
                 cur = conn.cursor()
 
                 # Verificar si YA existe este diff_hash
@@ -2900,7 +2904,8 @@ async def analyze_and_train(event: AccessibilityEvent):
 
 
 def _insert_diff_trace(tester_id, build_id, screen_normalized, message):
-    with sqlite3.connect(DB_NAME) as conn:
+    with sqlite3.connect(DB_NAME,timeout=30, check_same_thread=False) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
         c = conn.cursor()
         exists = c.execute("""
             SELECT 1 FROM diff_trace
@@ -2926,7 +2931,8 @@ def update_diff_trace(tester_id: str, build_id: str, screen: str, changes: list)
     """
     screen_normalized = normalize_header(screen)
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
         c = conn.cursor()
 
         if changes:
@@ -3099,7 +3105,7 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
 
         # -------------------- 7) Verificar si ya existe --------------------
         do_insert = True
-        with sqlite3.connect(DB_NAME) as conn:
+        with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
 
@@ -3897,7 +3903,7 @@ async def approve_diff(request: Request):
 
     # --- 3. Guardar en DB ---
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
         cursor = conn.cursor()
 
         # Crear tabla si no existe

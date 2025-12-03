@@ -419,18 +419,15 @@ def _generate_ai_dashboard_html(
     
     # Métricas por build
     metrics_by_build = {}
+
     for build_id in builds_sorted:
         diffs = builds_data.get(build_id, [])
-        
-        if not diffs:
-            continue
-        
         total_removed = sum(len(d["removed"]) for d in diffs)
         total_added = sum(len(d["added"]) for d in diffs)
         total_modified = sum(len(d["modified"]) for d in diffs)
         avg_risk = np.mean([d["risk_score"] for d in diffs]) if diffs else 0
         avg_stability = np.mean([d["stability_score"] for d in diffs]) if diffs else 100
-        
+
         metrics_by_build[build_id] = {
             "removed": total_removed,
             "added": total_added,
@@ -440,7 +437,8 @@ def _generate_ai_dashboard_html(
             "total_changes": total_removed + total_added + total_modified,
             "total_screens": len(diffs)
         }
-    
+        print(metrics_by_build)
+
     # Identificar pantallas críticas
     all_diffs = [d for diffs in builds_data.values() for d in diffs]
     critical_screens = sorted(
@@ -968,89 +966,93 @@ def _generate_ai_dashboard_html(
         </div>
         
         <script>
+
+        document.addEventListener('DOMContentLoaded', function() {
             // Chart 1: Tendencia de Cambios
             const trendsCtx = document.getElementById('trendsChart').getContext('2d');
-            const builds = {json.dumps(builds_sorted)};
-            const removedData = {json.dumps([metrics_by_build.get(b, {}).get('removed', 0) for b in builds_sorted])};
-            const addedData = {json.dumps([metrics_by_build.get(b, {}).get('added', 0) for b in builds_sorted])};
-            const modifiedData = {json.dumps([metrics_by_build.get(b, {}).get('modified', 0) for b in builds_sorted])};
+            const builds = {{ json.dumps(builds_sorted) }};
+            const removedData = {{ json.dumps([metrics_by_build[b]["removed"] if b in metrics_by_build else 0 for b in builds_sorted]) }};
+            const addedData = {{ json.dumps([metrics_by_build.get(b, {}).get("added", 0) for b in builds_sorted]) }};
+            const modifiedData = {{ json.dumps([metrics_by_build.get(b, {}).get("modified", 0) for b in builds_sorted]) }};
             
-            new Chart(trendsCtx, {{
+            new Chart(trendsCtx, {
                 type: 'line',
-                data: {{
+                data: {
                     labels: builds,
                     datasets: [
-                        {{
+                        {
                             label: 'Removidos',
                             data: removedData,
                             borderColor: '#ef4444',
                             backgroundColor: 'rgba(239, 68, 68, 0.1)',
                             tension: 0.4,
                             fill: true
-                        }},
-                        {{
+                        },
+                        {
                             label: 'Agregados',
                             data: addedData,
                             borderColor: '#10b981',
                             backgroundColor: 'rgba(16, 185, 129, 0.1)',
                             tension: 0.4,
                             fill: true
-                        }},
-                        {{
+                        },
+                        {
                             label: 'Modificados',
                             data: modifiedData,
                             borderColor: '#f59e0b',
                             backgroundColor: 'rgba(245, 158, 11, 0.1)',
                             tension: 0.4,
                             fill: true
-                        }}
+                        }
                     ]
-                }},
-                options: {{
+                },
+                options: {
                     responsive: true,
                     maintainAspectRatio: false,
-                    plugins: {{
-                        legend: {{ position: 'top' }},
-                        title: {{ display: false }}
-                    }},
-                    scales: {{
-                        y: {{ beginAtZero: true }},
-                        x: {{ grid: {{ display: false }} }}
-                    }}
-                }}
-            }});
-            
+                    plugins: {
+                        legend: { position: 'top' },
+                        title: { display: false }
+                    },
+                    scales: {
+                        y: { beginAtZero: true },
+                        x: { grid: { display: false } }
+                    }
+                }
+            });
+
             // Chart 2: Distribución de Riesgo
             const riskCtx = document.getElementById('riskDistributionChart').getContext('2d');
-            const riskData = {json.dumps([metrics_by_build.get(b, {}).get('avg_risk', 0) for b in builds_sorted])};
+            const riskData = {{ json.dumps([metrics_by_build.get(b, {}).get("avg_risk", 0) for b in builds_sorted]) }};
             
-            new Chart(riskCtx, {{
+            new Chart(riskCtx, {
                 type: 'bar',
-                data: {{
+                data: {
                     labels: builds,
-                    datasets: [{{
+                    datasets: [{
                         label: 'Score de Riesgo (%)',
                         data: riskData,
-                        backgroundColor: riskData.map(v => {{
+                        backgroundColor: riskData.map(v => {
                             if (v >= 80) return 'rgba(239, 68, 68, 0.8)';
                             if (v >= 60) return 'rgba(245, 158, 11, 0.8)';
                             if (v >= 40) return 'rgba(168, 85, 247, 0.8)';
                             return 'rgba(16, 185, 129, 0.8)';
-                        }})
-                    }}]
-                }},
-                options: {{
+                        })
+                    }]
+                },
+                options: {
                     responsive: true,
                     maintainAspectRatio: false,
                     indexAxis: 'y',
-                    scales: {{
-                        x: {{ max: 100 }}
-                    }},
-                    plugins: {{
-                        legend: {{ display: false }}
-                    }}
-                }}
-            }});
+                    scales: {
+                        x: { max: 100 }
+                    },
+                    plugins: {
+                        legend: { display: false }
+                    }
+                }
+            });
+        });
+
             
             // Plotly Comparison Chart
             const comparisonTrace = {{
