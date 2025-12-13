@@ -11,7 +11,6 @@ import torch.optim as optim
 import numpy as np
 import joblib 
 from joblib import dump, load
-# sklearn helpers (KMeans, classifier for hybrid)
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
@@ -20,8 +19,9 @@ import logging
 from difflib import SequenceMatcher
 from SiameseEncoder import SiameseEncoder
 import difflib
-
- 
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from db import get_conn_cm
 
 # HMM
 try:
@@ -276,17 +276,6 @@ def overlap_ratio(old_nodes, new_nodes):
     return inter / max(union, 1)
 
 
-# def overlap_ratio(old_nodes, new_nodes):
-#     # texto simple overlap
-#     old_texts = {normalize_node(n).get("text","").strip().lower() for n in old_nodes if normalize_node(n).get("text")}
-#     new_texts = {normalize_node(n).get("text","").strip().lower() for n in new_nodes if normalize_node(n).get("text")}
-
-#     if not old_texts and not new_texts:
-#         return 1.0
-#     inter = len(old_texts & new_texts)
-#     union = len(old_texts | new_texts)
-#     return inter / max(union, 1)
-
 def to_bool(val):
     """
     Convierte cualquier valor a booleano.
@@ -368,15 +357,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
                 filtered.append(n)
         return filtered
 
-    # def filter_ephemeral_nodes(tree):
-    #     """Elimina nodos efímeros que no afectan la UI visible."""
-    #     return [
-    #         n for _, n in flatten_tree(tree)
-    #         if not (
-    #             n.get("className") in EPHEMERAL_CLASSES
-    #             and not (n.get("text") or n.get("contentDescription"))
-    #         )
-    #     ]
 
     old_tree = preprocess_tree(old_tree)
     new_tree = preprocess_tree(new_tree)
@@ -385,23 +365,8 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
     flat_old = flatten_tree(old_tree)
     flat_new = flatten_tree(new_tree)
 
-    # filtered_old_nodes = filter_ephemeral_nodes(old_tree)
-    # filtered_new_nodes = filter_ephemeral_nodes(new_tree)
 
-
-    # old_tree = filter_ephemeral_nodes(old_tree)
-    # new_tree = filter_ephemeral_nodes(new_tree)
-
-    # if not filtered_old_nodes:
-    #     logger.info("No previous snapshot - base initial")
-    #     return {
-    #         "removed": [], "added": [], "modified": [],
-    #         "text_diff": {"removed_texts": [], "added_texts": [], "overlap_ratio": 1.0},
-    #         "structure_similarity": 1.0,
-    #         "has_changes": True  # new snapshot counts as change
-    #     }
-
-        # 🔹 Filtrar nodos efímeros sobre las listas aplanadas
+    # 🔹 Filtrar nodos efímeros sobre las listas aplanadas
     filtered_old_nodes = [
         n for _, n in flat_old
         if not (
@@ -456,17 +421,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
     if added_keys:
         print("🆕 Added keys (sample):", list(added_keys)[:3])
 
-    # old_idx = {}
-    # for path, node in flatten_tree(old_tree):
-    #     old_idx[make_key(node)] = normalize_node(node)
-
-    # new_idx = {}
-    # for path, node in flatten_tree(new_tree):
-    #     new_idx[make_key(node)] = normalize_node(node)
-
-    # debug text overlap raw
-    # old_nodes = [n for _, n in flatten_tree(old_tree)]
-    # new_nodes = [n for _, n in flatten_tree(new_tree)]
 
     # text_overlap_raw = overlap_ratio(old_nodes, new_nodes)
     text_overlap_raw = overlap_ratio(filtered_old_nodes, filtered_new_nodes)
@@ -538,33 +492,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
                     else:
                         changes[f] = {"old": old_val, "new": new_val}
                         #print(f"✅ Cambio detectado {f}: {old_val} → {new_val}")
-
-                # def is_compose_class(cls: str) -> bool:
-                #     cls = (cls or "").lower()
-                #     return (
-                #         "androidx.compose" in cls or
-                #         "composeview" in cls or
-                #         "viewfactoryholder" in cls
-                #     )
-
-                # if old_val != new_val:
-                #     cls = nn.get("className", "")
-
-                #     if is_compose_class(cls):
-                #         # Jetpack Compose → no ignorar cambios efímeros
-                #         changes[f] = {"old": old_val, "new": new_val}
-                #         #print(f"✅ Compose change {f}: {old_val} → {new_val}")
-
-                #     elif f in IGNORED_STATE_FIELDS and old_val is False and new_val is True:
-                #         # Views clásicas → ignorar efímeros
-                #         ignored_changes.append((cls, f, (old_val, new_val)))
-                #         #print(f"⚠️ Ignorado (efímero View) {f}: {old_val} → {new_val}")
-
-                #     else:
-                #         # Caso normal
-                #         changes[f] = {"old": old_val, "new": new_val}
-                #         #print(f"✅ Cambio detectado {f}: {old_val} → {new_val}")
-                # --- Fin del bloque de comparación de campos -
 
             if nn.get("className") in ("android.widget.CheckBox", "android.widget.Switch"):
                 print(f"[DEBUG CHECKED ATTR] oldn={oldn.get('checked')} | nn={nn.get('checked')}")
@@ -730,25 +657,7 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
 
         if changes:
             modified.append({"node": {"key": k, "class": nn.get("className")}, "changes": changes})
-            #print(f"🔹 Nodo modificado registrado: {changes}")
-
-    # detectar cambios de texto entre removed/added (moved text)
-
-
-    # ---------------------------------------------------------
-    # 🔹 Detección de cambios de texto entre nodos (versión semántica)
-    # ---------------------------------------------------------
-    
-    # def extract_text_from_key(key: str) -> str:
-    #     if not key:
-    #         return ""
-    #     parts = key.split("|")
-    #     for p in parts:
-    #         if "text:" in p:
-    #             return p.split("text:")[-1].strip()
-    #     if len(parts) > 1 and len(parts[-1]) > 2:
-    #         return parts[-1].strip()
-    #     return ""
+   
 
     def extract_text_from_key(key: str) -> str:
         """Extrae el texto representativo de un nodo (tanto Views como Compose)."""
@@ -997,13 +906,6 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
                 else:
                     logger.warning(f"Error general al predecir modelo híbrido: {e}")
 
-                # # si el modelo es HMM (caso especial)
-                # if GaussianHMM is not None and isinstance(model, GaussianHMM):
-                #     score = float(model.score(feat))
-                #     pred = "hmm_score"
-                #     conf = score
-                # else:
-                #     logger.warning(f"Error general al predecir modelo híbrido: {e}")
             model_prediction = pred
             model_confidence = conf
 
@@ -1075,47 +977,53 @@ def compare_trees(old_tree, new_tree, app_name: str = None,
 # Entrenamiento incremental y general (por pantalla)
 # ----------------------------
 
-async def _train_incremental_logic_hybrid(
+async def _train_general_logic_hybrid(
     enriched_vector: np.ndarray,
     tester_id: str,
     build_id: str,
     app_name: str,
     screen_id: str,
     min_samples: int = 1,
-    use_general_as_base: bool = True
+    use_general_as_base: bool = True,
+    batch_size: int = 1000
 ):
     """
-    Entrena modelos híbridos por pantalla para QA (incremental).
-    Usa embeddings del SiameseEncoder si hay árboles disponibles.
-    Guarda: models/{app}/{tester}/{build}/{screen}/hybrid_incremental.joblib
+    Entrena modelos híbridos por pantalla para QA (incremental) usando PostgreSQL.
     """
     if enriched_vector is None or np.count_nonzero(enriched_vector) == 0:
         logger.debug("enriched_vector vacío - skip")
         return
 
     # === Recuperar los árboles UI previos ===
-    with sqlite3.connect(DB_NAME) as conn:
-        c = conn.cursor()
-        c.execute("""
-            SELECT collect_node_tree
-            FROM accessibility_data
-            WHERE collect_node_tree IS NOT NULL AND screens_id = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, (screen_id, max(10, min_samples * 10)))
-        rows = c.fetchall()
-
     trees = []
-    for r in rows:
-        try:
-            tree = json.loads(r[0])
-            if isinstance(tree, list):
-                trees.append(tree)
-        except Exception:
-            continue
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as c:
+        # conn = psycopg2.connect(**conn_params)
+        # with conn.cursor(cursor_factory=RealDictCursor) as c:
+                    c.execute("""
+                        SELECT collect_node_tree
+                        FROM accessibility_data
+                        WHERE collect_node_tree IS NOT NULL AND screens_id = %s
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                    """, (screen_id, max(10, min_samples * 10)))
+                    rows = c.fetchall()
+                    for r in rows:
+                        try:
+                            tree = json.loads(r['collect_node_tree'])
+                            if isinstance(tree, list):
+                                trees.append(tree)
+                        except Exception:
+                            continue
+    except Exception as e:
+        logger.warning(f"Error recuperando árboles UI desde Postgres: {e}")
+        trees = []  
+    # finally:
+    #     conn.close()
 
     # === Generar embeddings con el modelo siamés (si hay árboles) ===
-    from SiameseEncoder import SiameseEncoder # asegúrate de tenerlo global o importado
+    from SiameseEncoder import SiameseEncoder
     siamese_model = SiameseEncoder()
 
     X = None
@@ -1128,7 +1036,7 @@ async def _train_incremental_logic_hybrid(
             logger.warning(f"Fallo al generar embeddings con SiameseEncoder: {e}")
             X = None
 
-    # Si no hay árboles válidos, usar enriched_vector como respaldo
+    # fallback: usar enriched_vector
     if X is None or len(X) == 0:
         X = np.array([enriched_vector])
 
@@ -1140,14 +1048,16 @@ async def _train_incremental_logic_hybrid(
     else:
         enriched_vector = enriched_vector[:EXPECTED_LEN]
 
-    # Agregar vector actual al dataset
     X = np.unique(np.vstack([enriched_vector.reshape(1, -1), X]), axis=0)
-
     if len(X) < min_samples:
         logger.debug("No hay suficientes muestras para incremental: %s < %s", len(X), min_samples)
         return
 
-    # === Entrenamiento híbrido (KMeans + RF) ===
+    # === Entrenamiento híbrido ===
+    from sklearn.cluster import MiniBatchKMeans
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.ensemble import RandomForestClassifier
+
     kmeans = MiniBatchKMeans(
         n_clusters=min(5, max(1, len(X))),
         random_state=42,
@@ -1157,12 +1067,9 @@ async def _train_incremental_logic_hybrid(
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
     clf = RandomForestClassifier(n_estimators=50, random_state=42)
-
-    # Etiquetas dummy (idéntico o distinto)
     y = [0 if np.allclose(v, enriched_vector, atol=1e-8) else 1 for v in X]
     clf.fit(Xs, y)
 
-    # === Guardado del modelo híbrido ===
     model_obj = {"kmeans": kmeans, "scaler": scaler, "clf": clf}
     path = os.path.join(model_dir_for(app_name, tester_id, build_id, screen_id), "hybrid_incremental.joblib")
     save_model(model_obj, path)
@@ -1179,128 +1086,109 @@ async def _train_incremental_logic_hybrid(
         except Exception as e:
             logger.warning(f"HMM incremental failed: {e}")
 
-async def _train_general_logic_hybrid(
+async def _train_incremental_logic_hybrid(
+    enriched_vector: np.ndarray,
+    tester_id: str,
+    build_id: str,
     app_name: str,
-    batch_size: int = 1000,
+    screen_id: str,
     min_samples: int = 1,
-    update_general: bool = False
+    use_general_as_base: bool = True
 ):
-    """
-    Entrena modelos generales por pantalla (solo si update_general=True).
-    Usa embeddings del SiameseEncoder si hay árboles disponibles.
-    Guarda: models/{app}/general/{screen}/hybrid_general.joblib
-    """
-    if not update_general:
-        logger.debug("update_general=False -> skip general training")
+    if enriched_vector is None or np.count_nonzero(enriched_vector) == 0:
+        logger.debug("enriched_vector vacío - skip")
         return
 
-    with sqlite3.connect(DB_NAME) as conn:
-        c = conn.cursor()
-        c.execute("""
-            SELECT collect_node_tree, enriched_vector, screens_id
-            FROM accessibility_data
-            WHERE collect_node_tree IS NOT NULL
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, (batch_size,))
-        rows = c.fetchall()
+    # === Recuperar los árboles UI previos desde Postgres ===
+    # conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+        # with conn.cursor() as c:
+                c.execute("""
+                    SELECT collect_node_tree
+                    FROM accessibility_data
+                    WHERE collect_node_tree IS NOT NULL AND screens_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (screen_id, max(10, min_samples * 10)))
+                rows = c.fetchall()
+    except Exception as e:
+        logger.warning(f"Error recuperando árboles UI desde Postgres: {e}")
+        rows = []
+    # finally:
+    #     conn.close()
 
-    if not rows:
-        logger.warning("⚠️ No hay datos para entrenamiento general.")
-        return
-
-    # agrupar árboles y vectores por pantalla
-    groups = {}
-    for collect_node_tree, enriched_vec, screen_id_short in rows:
-        if not screen_id_short:
-            continue
-
-        entry = groups.setdefault(screen_id_short, {"trees": [], "vecs": []})
-
-        # árbol de accesibilidad
+    trees = []
+    for r in rows:
         try:
-            tree = json.loads(collect_node_tree)
+            tree = json.loads(r[0])
             if isinstance(tree, list):
-                entry["trees"].append(tree)
-        except Exception:
-            pass
-
-        # vector enriquecido
-        try:
-            if enriched_vec:
-                entry["vecs"].append(np.array(json.loads(enriched_vec), dtype=float).flatten())
+                trees.append(tree)
         except Exception:
             continue
 
-    from SiameseEncoder import SiameseEncoder  # asegúrate de tenerlo global
+    # === Generar embeddings con SiameseEncoder ===
     siamese_model = SiameseEncoder()
+    X = None
+    if trees:
+        try:
+            emb_batch = siamese_model.encode_batch(trees)
+            X = emb_batch.cpu().numpy()
+            logger.info(f"✅ Generados {len(X)} embeddings desde árboles UI.")
+        except Exception as e:
+            logger.warning(f"Fallo al generar embeddings con SiameseEncoder: {e}")
+            X = None
 
-    # entrenar un modelo general por pantalla
-    for screen_id_short, data in groups.items():
-        trees = data["trees"]
-        vecs = data["vecs"]
+    if X is None or len(X) == 0:
+        X = np.array([enriched_vector])
 
-        X = None
-        # 1️⃣ intentar generar embeddings desde árboles
-        if trees:
-            try:
-                emb_batch = siamese_model.encode_batch(trees)
-                X = emb_batch.cpu().numpy()
-                logger.info(f"✅ Generados {len(X)} embeddings Siamese para screen {screen_id_short}")
-            except Exception as e:
-                logger.warning(f"Fallo al generar embeddings Siamese para {screen_id_short}: {e}")
-                X = None
+    # Normalizar longitudes
+    EXPECTED_LEN = X.shape[1]
+    enriched_vector = enriched_vector.flatten()
+    if len(enriched_vector) < EXPECTED_LEN:
+        enriched_vector = np.pad(enriched_vector, (0, EXPECTED_LEN - len(enriched_vector)))
+    else:
+        enriched_vector = enriched_vector[:EXPECTED_LEN]
 
-        # 2️⃣ fallback: usar enriched_vectors si no hay árboles válidos
-        if X is None or len(X) == 0:
-            if vecs:
-                X = np.array(vecs)
-                logger.debug(f"Usando enriched_vectors para screen {screen_id_short} ({len(X)} muestras)")
-            else:
-                logger.debug(f"No hay datos válidos para screen {screen_id_short}")
-                continue
+    X = np.unique(np.vstack([enriched_vector.reshape(1, -1), X]), axis=0)
 
-        # 3️⃣ limpieza
-        X = np.array([v for v in X if np.count_nonzero(v) > 0])
-        if len(X) < min_samples:
-            logger.debug("No hay suficientes muestras para general: %s < %s", len(X), min_samples)
-            continue
+    if len(X) < min_samples:
+        logger.debug("No hay suficientes muestras para incremental: %s < %s", len(X), min_samples)
+        return
 
-        # 4️⃣ clustering + clasificador
-        kmeans = MiniBatchKMeans(
-            n_clusters=min(5, max(1, len(X))),
-            random_state=42,
-            batch_size=min(100, len(X))
-        )
-        kmeans.fit(X)
+    # === Entrenamiento híbrido (KMeans + RF) ===
+    kmeans = MiniBatchKMeans(
+        n_clusters=min(5, max(1, len(X))),
+        random_state=42,
+        batch_size=min(100, len(X))
+    )
+    kmeans.fit(X)
 
-        scaler = StandardScaler()
-        Xs = scaler.fit_transform(X)
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
 
-        clf = RandomForestClassifier(n_estimators=100, random_state=42)
-        # etiquetas dummy (0/1 aleatorias o secuenciales)
-        y = [0 if i % 2 == 0 else 1 for i in range(len(Xs))]
-        clf.fit(Xs, y)
+    clf = RandomForestClassifier(n_estimators=50, random_state=42)
+    y = [0 if np.allclose(v, enriched_vector, atol=1e-8) else 1 for v in X]
+    clf.fit(Xs, y)
 
-        model_obj = {"kmeans": kmeans, "scaler": scaler, "clf": clf}
-        safe_id = screen_id_short.replace("|", "_").replace("=", "-")
-        model_path = os.path.join(model_dir_general(app_name, safe_id), "hybrid_general.joblib")
-        # model_path = os.path.join(model_dir_general(app_name, screen_id), "hybrid_general.joblib")
-        save_model(model_obj, model_path)
-        logger.info("💾 Saved general hybrid model: %s", model_path)
+    # === Guardado del modelo híbrido ===
+    model_obj = {"kmeans": kmeans, "scaler": scaler, "clf": clf}
+    model_dir = Path(f"models/{app_name}/{tester_id}/{build_id}/{screen_id}")
+    model_dir.mkdir(parents=True, exist_ok=True)
+    path = model_dir / "hybrid_incremental.joblib"
+    from joblib import dump
+    dump(model_obj, path)
+    logger.info("💾 Saved incremental hybrid model: %s", path)
 
-        # 5️⃣ HMM opcional
-        if GaussianHMM is not None and len(X) >= MIN_HMM_SAMPLES:
-            try:
-                n_components = max(2, min(5, len(X) // 10))
-                hmm = GaussianHMM(
-                    n_components=n_components,
-                    covariance_type="diag",
-                    n_iter=200,
-                    tol=1e-3
-                )
-                hmm.fit(X)
-                save_model(hmm, os.path.join(model_dir_general(app_name, screen_id_short), "hmm.joblib"))
-                logger.info("Saved general HMM for %s / screen %s", app_name, screen_id_short)
-            except Exception as e:
-                logger.warning("HMM general failed: %s", e)
+    # === HMM opcional ===
+    MIN_HMM_SAMPLES = 10
+    if GaussianHMM is not None and len(X) >= MIN_HMM_SAMPLES:
+        try:
+            n_components = max(2, min(5, len(X) // 10))
+            hmm = GaussianHMM(n_components=n_components, covariance_type="diag", n_iter=200, tol=1e-3)
+            hmm.fit(X)
+            dump(hmm, model_dir / "hmm.joblib")
+            logger.info("Saved incremental HMM: %s", model_dir / "hmm.joblib")
+        except Exception as e:
+            logger.warning(f"HMM incremental failed: {e}")

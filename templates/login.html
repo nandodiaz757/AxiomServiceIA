@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login QA Dashboard</title>
+    <style>
+        /* Reset básico */
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Arial', sans-serif;
+            background-color: #121212;
+            color: #FFFFFF;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+
+        .login-container {
+            background-color: #1E1E1E;
+            padding: 40px;
+            border-radius: 16px;
+            width: 320px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            text-align: center;
+        }
+
+        .login-title {
+            font-size: 36px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .login-subtitle {
+            font-size: 14px;
+            color: #59E960;
+            margin-bottom: 30px;
+        }
+
+        form label {
+            display: block;
+            text-align: left;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+
+        form input {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 20px;
+            border: none;
+            border-radius: 8px;
+        }
+
+        form button {
+            width: 100%;
+            padding: 12px;
+            background-color: #59E960;
+            border: none;
+            border-radius: 30px;
+            font-size: 16px;
+            font-weight: bold;
+            color: #121212;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+        form button:hover {
+            background-color: #4BCC56;
+        }
+
+        .login-links {
+            margin-top: 20px;
+        }
+
+        .login-links a {
+            display: block;
+            color: #59E960;
+            text-decoration: none;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .login-links a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h2 class="login-title">AXIOM TEST</h2>
+        <div class="login-subtitle">AI Platform for Testing Visual</div>
+
+        <form method="post" action="/login">
+            <label>Usuario:</label>
+            <input type="text" name="username" value="axiom"/>
+            
+            <label>Contraseña:</label>
+            <input type="password" name="password" value="axiom"/>
+            
+            <button type="submit">Ingresar</button>
+        </form>
+
+        <div class="login-links">
+            <a href="#">¿Olvidaste tu contraseña?</a>
+            <a href="#">Registrar usuario</a>
+        </div>
+    </div>
+</body>
+</html>

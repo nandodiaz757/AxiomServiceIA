@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPException, Depends, WebSocket, Body, BackgroundTasks
+from fastapi import FastAPI, Query, BackgroundTasks, Request, APIRouter, HTTPException, Depends, WebSocket, Body, BackgroundTasks, Form
 from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from typing import Optional, Union, List, Dict, Any
@@ -33,6 +33,7 @@ import string
 import random
 import time
 import torch
+import bcrypt
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -42,38 +43,36 @@ from slugify import slugify
 import logging
 from myqueue.message_queue import send_message
 from stable_signature import normalize_node
-
+import psycopg2
+from psycopg2.extras import RealDictCursor
 logger = logging.getLogger("backend")
 logging.basicConfig(level=logging.INFO)
-
-
-
+from dotenv import load_dotenv
+from psycopg2.pool import SimpleConnectionPool
+import os
+from contextlib import contextmanager
+from db import get_conn_cm, init_db
 # 🔹 NUEVA IMPORTACIÓN: ConfigManager para gestión centralizada
 from config_manager import get_config, init_config
-
 # 🔹 NUEVA IMPORTACIÓN: Sistema de retroalimentación incremental
-try:
-    from incremental_feedback_system import (
-        IncrementalFeedbackSystem,
-        check_approved_diff_pattern,
-        record_diff_decision
-    )
-except ImportError as e:
-    logger.warning(f"⚠️  No se pudo importar incremental_feedback_system: {e}")
+import uvicorn
+from fastapi.templating import Jinja2Templates
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from view_qa_dashboard import routers as qa_routers 
+import random, string, time
+from fastapi import APIRouter, Request
+import time
+import psycopg2.extras
 
-# 🔹 NUEVA IMPORTACIÓN: Motor de análisis de flujos
-try:
-    from FlowAnalyticsEngine import FlowAnalyticsEngine
-    logger.info("✅ FlowAnalyticsEngine importado correctamente")
-except ImportError as e:
-    logger.warning(f"⚠️  No se pudo importar FlowAnalyticsEngine: {e}")
-    FlowAnalyticsEngine = None
 
 # =========================================================
 # CONFIGURACIÓN
 # =========================================================
 
 app = FastAPI()
+
+
 router = APIRouter() 
 siamese_model = None
 SIM_THRESHOLD = 0.90
@@ -96,7 +95,7 @@ if 'kmeans_model' not in globals():
 if 'hmm_model' not in globals():
     hmm_model = hmm.GaussianHMM(n_components=5)
 
-DB_NAME = "accessibility.db"
+# DB_NAME = "accessibility.db"
 MODELS_DIR = "models"
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -110,7 +109,7 @@ TRAIN_CACHE_TTL = 3600  # Reentrenar si pasaron más de 1 hora (3600 seg)
 TRAIN_GENERAL_ON_COLLECT = True  # Habilitar entrenamiento general en /collect
 
 # Estructura para historial de booleanos (para alertas de cambios)
-
+templates = Jinja2Templates(directory="templates")
 BOOL_HISTORY = {}  
 codes_db = {}
 KMEANS_MODELS = {}
@@ -120,6 +119,9 @@ SEQ_LENGTH = {}  # Longitud de la secuencia para el modelo HMM
 # Limpieza inicial (por si hay residuos en hot reload)
 KMEANS_MODELS.clear()
 HMM_MODELS.clear()
+
+if __name__ == "__main__":
+    uvicorn.run("view_qa_dashboard:app", host="0.0.0.0", port=8000, reload=True)
 
 IGNORED_NODE_SUFFIXES = [
     "|enabled:True",
@@ -137,11 +139,101 @@ class TrainModeRequest(BaseModel):
     screen_id: str | None = None
     enriched_vector: list[float] | None = None
 
+load_dotenv()
+
+# MODELOS
+class UserSyn(BaseModel):
+    udid: str
+    email: str
+    phone: str | None = None
+    password: str
+
+class UserUpdate(BaseModel):
+    email: str | None = None
+    phone: str | None = None
+
+class PasswordUpdate(BaseModel):
+    password: str
+
+class TimestampQuery(BaseModel):
+    since: float
 
 semantic_screen_id_ctx = ContextVar("screen_id_final", default=None)
 semantic_screen_id_ctf = ContextVar("screen_id_final", default=None)
 
 last_ui_structure_similarity = 0.0
+user_router = APIRouter(prefix="/user", tags=["Users"])
+
+# ==========================================
+# LIFESPAN HANDLER (startup + shutdown)
+# ==========================================
+# 🔹 Variable global para feedback system
+feedback_system = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- Startup ---
+   
+    init_db()
+    logger.info("✔ DB inicializada correctamente")
+    # init_incremental_feedback()
+
+    try:     
+        logger.info("🚀 Iniciando FastAPI y cargando modelo siamés...")
+        load_siamese_model()
+
+        global feedback_system
+
+        feedback_system = IncrementalFeedbackSystem(db_name="feedback_model.db")
+        logger.info("✅ Sistema de retroalimentación incremental inicializado")
+    except Exception as e:
+        logger.warning(f"⚠️  No se pudo inicializar feedback_system: {e}")
+        feedback_system = None
+
+     # yield  # Aquí la app ya está corriendo
+
+
+    # 🚀 Registrar jobs como tareas background
+    asyncio.create_task(periodic_incremental_train())
+    asyncio.create_task(periodic_general_train())
+    asyncio.create_task(daily_cleanup())
+    asyncio.create_task(periodic_retrain())
+
+    logger.info("⚙️ Tareas periódicas registradas correctamente")
+
+    yield  # 👈 Aquí FastAPI inicia de verdad
+    # 🔹 Inicializar sistema de retroalimentación
+
+    # --- Shutdown ---
+    logger.info("🛑 Apagando aplicación y limpiando tareas...")
+    # worker_task.cancel()
+
+
+# ==============================
+# APP PRINCIPAL
+# ==============================
+
+app = FastAPI(lifespan=lifespan)
+
+# 🔹 INICIALIZAR CONFIG MANAGER AL STARTUP
+config = init_config()
+
+try:
+    from incremental_feedback_system import (
+        IncrementalFeedbackSystem,
+        check_approved_diff_pattern,
+        record_diff_decision
+    )
+except ImportError as e:
+    logger.warning(f"⚠️  No se pudo importar incremental_feedback_system: {e}")
+
+# 🔹 NUEVA IMPORTACIÓN: Motor de análisis de flujos
+try:
+    from FlowAnalyticsEngine import FlowAnalyticsEngine
+    logger.info("✅ FlowAnalyticsEngine importado correctamente")
+except ImportError as e:
+    logger.warning(f"⚠️  No se pudo importar FlowAnalyticsEngine: {e}")
+    FlowAnalyticsEngine = None
 
 # ===================== MODELOS BASE (fallbacks) =====================
 
@@ -371,17 +463,20 @@ def extract_short_screen_id(semantic_screen_id: str, max_base_len: int = 20) -> 
     # --- 4. Construir id final ---
     return f"{base}_{h}"
 
-def is_baseline_build(app_name, tester_id, build_id):
-    conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("""
-        SELECT 1 FROM baseline_metadata
-        WHERE app_name = ? AND tester_id = ? AND build_id = ?
-        LIMIT 1
-    """, (app_name, tester_id, build_id))
-    row = c.fetchone()
-    conn.close()
-    return row is not None
+def is_baseline_build(app_name: str, tester_id: str, build_id: str) -> bool:
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT 1 FROM baseline_metadata
+                    WHERE app_name = %s AND tester_id = %s AND build_id = %s
+                    LIMIT 1;
+                """, (app_name, tester_id, build_id))
+                row = c.fetchone()
+                return row is not None
+    except Exception as e:
+        logger.error(f"Error en is_baseline_build: {e}")
+        return False
 
 def sanitize_screen_id_for_fs(screen_id: str) -> str:
     """Sanitiza el screen_id para usarlo en paths del file system."""
@@ -661,31 +756,35 @@ def clean_old_diff_records(days: int = 90):
     cutoff = datetime.utcnow() - timedelta(days=days)
     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("""
-        DELETE FROM screen_diffs
-        WHERE id IN (
-            SELECT s.id
-            FROM screen_diffs s
-            JOIN diff_approvals a ON a.diff_id = s.id
-            WHERE s.created_at < ?
-        )
-    """, (cutoff_str,))
-    c.execute("""
-        DELETE FROM screen_diffs
-        WHERE id IN (
-            SELECT s.id
-            FROM screen_diffs s
-            JOIN diff_rejections r ON r.diff_id = s.id
-            WHERE s.created_at < ?
-        )
-    """, (cutoff_str,))
-    c.execute("DELETE FROM diff_approvals WHERE created_at < ?", (cutoff_str,))
-    c.execute("DELETE FROM diff_rejections WHERE created_at < ?", (cutoff_str,))
-    conn.commit()
-    conn.close()
-    logger.info(f"🧹 Limpieza de registros antiguos completada (>{days} días).")
+    with get_conn_cm() as conn:
+	    with conn.cursor() as c:
+                # conn = sqlite3.connect(DB_NAME)
+                expires_at = int(time.time()) + 900
+                # conn = get_conn()
+                # c = conn.cursor()
+                c.execute("""
+                    DELETE FROM screen_diffs
+                    WHERE id IN (
+                        SELECT s.id
+                        FROM screen_diffs s
+                        JOIN diff_approvals a ON a.diff_id = s.id
+                        WHERE s.created_at < ?
+                    )
+                """, (cutoff_str,))
+                c.execute("""
+                    DELETE FROM screen_diffs
+                    WHERE id IN (
+                        SELECT s.id
+                        FROM screen_diffs s
+                        JOIN diff_rejections r ON r.diff_id = s.id
+                        WHERE s.created_at < ?
+                    )
+                """, (cutoff_str,))
+                c.execute("DELETE FROM diff_approvals WHERE created_at < ?", (cutoff_str,))
+                c.execute("DELETE FROM diff_rejections WHERE created_at < ?", (cutoff_str,))
+                conn.commit()
+                conn.close()
+                logger.info(f"🧹 Limpieza de registros antiguos completada (>{days} días).")
 
 
 def load_siamese_model(path: str = "ui_encoder.pt"):
@@ -708,7 +807,6 @@ def retrain_diff_model():
 # TAREAS PERIÓDICAS
 # ==============================
 
-#@repeat_every(seconds=3600, wait_first=True)
 @repeat_every(seconds=3600, wait_first=False)
 async def periodic_retrain():
     lock = _get_lock("diff_model")
@@ -718,79 +816,146 @@ async def periodic_retrain():
         await asyncio.to_thread(retrain_diff_model)
 
 
-@repeat_every(seconds=86400, wait_first=True)
+@repeat_every(seconds=86400, wait_first=False)
 async def daily_cleanup():
     """Limpieza de registros cada 24 horas."""
     await asyncio.to_thread(clean_old_diff_records, days=90)
 
-
-@repeat_every(seconds=60 * 5, wait_first=False)  # cada 5 minutos
+@repeat_every(seconds=60 * 5, wait_first=False)
 async def periodic_incremental_train():
-    enriched_vector = ...
-    tester_id = ...
-    build_id = ...
-    app_name = ...
-    semantic_screen_id = semantic_screen_id_ctx.get()
-
-    asyncio.create_task(_train_incremental_logic_hybrid(
-        enriched_vector=enriched_vector,
-        tester_id=tester_id,
-        build_id=build_id,
-        app_name=app_name,
-        screen_id=semantic_screen_id,
-        use_general_as_base=True,
-    ))    
-
-
-@repeat_every(seconds=60 * 10, wait_first=False)  # cada 10 minutos
-async def periodic_general_train():
-
-    app_name = ...
-
-    await _train_general_logic_hybrid(
-        app_name=app_name,
-        batch_size=500,
-        min_samples=3,
-        update_general=True
-    )
-
-# ==========================================
-# LIFESPAN HANDLER (startup + shutdown)
-# ==========================================
-# 🔹 Variable global para feedback system
-feedback_system = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # --- Startup ---
-    global feedback_system
-    logger.info("🚀 Iniciando FastAPI y cargando modelo siamés...")
-    load_siamese_model()
-    
-    # 🔹 Inicializar sistema de retroalimentación
+    logger.info("⏱️ periodic_incremental_train arrancó")
     try:
-        feedback_system = IncrementalFeedbackSystem(db_name="feedback_model.db")
-        logger.info("✅ Sistema de retroalimentación incremental inicializado")
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+
+                # Obtener eventos recientes con enriched_vector para entrenar incremental
+                c.execute("""
+                    SELECT
+                        enriched_vector,
+                        tester_id,
+                        build_id,
+                        package_name,
+                        header_text
+                    FROM accessibility_data
+                    WHERE enriched_vector IS NOT NULL
+                    AND is_baseline = FALSE  -- incremental NO debe entrenar base
+                    ORDER BY created_at DESC
+                    LIMIT 300
+                """)
+
+                rows = c.fetchall()
+
+        if not rows:
+            logger.info("⏳ No hay datos para entrenamiento incremental")
+            return
+
+        enriched_vectors = []
+        last_tester = None
+        last_build = None
+        last_app = None
+        last_screen = None
+
+        for ev, tester, build, pkg, header in rows:
+            try:
+                vec = np.array(json.loads(ev), dtype=float)
+                enriched_vectors.append(vec)
+                last_tester = tester
+                last_build = build
+                last_app = pkg
+                last_screen = header
+            except Exception:
+                pass
+
+        if len(enriched_vectors) < 2:
+            logger.info(f"📌 Solo {len(enriched_vectors)} muestras incremento → esperar más")
+            return
+
+        logger.info(f"🚀 Entrenando incremental con {len(enriched_vectors)} vectores")
+
+        await _train_incremental_logic_hybrid(
+            enriched_vector=None,  # Entrenamiento por lote
+            tester_id=last_tester or "general",
+            build_id=last_build or "general",
+            app_name=last_app or "default_app",
+            screen_id=last_screen or "general",
+            use_general_as_base=True,  # parte de modelo general
+        )
+
+        logger.info("✨ Entrenamiento incremental completado")
+
     except Exception as e:
-        logger.warning(f"⚠️  No se pudo inicializar feedback_system: {e}")
-        feedback_system = None
-
-    yield  # Aquí la app ya está corriendo
-
-    # --- Shutdown ---
-    logger.info("🛑 Apagando aplicación y limpiando tareas...")
-    # worker_task.cancel()
+        logger.error(f"🔥 Error en entrenamiento incremental periódico: {e}")
 
 
-# ==============================
-# APP PRINCIPAL
-# ==============================
+@repeat_every(seconds=60 * 10, wait_first=False)
+async def periodic_general_train():
+    logger.info("⏱️ periodic_general_train arrancó")
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
 
-app = FastAPI(lifespan=lifespan)
+                # Selecciona solo los registros que tienen embedding válido y no son baseline
+                c.execute("""
+                    SELECT
+                        enriched_vector,
+                        tester_id,
+                        build_id,
+                        package_name,
+                        header_text,
+                        is_baseline
+                    FROM accessibility_data
+                    WHERE enriched_vector IS NOT NULL
+                    ORDER BY created_at DESC
+                    LIMIT 500
+                """)
 
-# 🔹 INICIALIZAR CONFIG MANAGER AL STARTUP
-config = init_config()
+                rows = c.fetchall()
 
+        if not rows:
+            logger.info("⏳ No hay datos suficientes para entrenar aún")
+            return
+
+        enriched_vectors = []
+        last_tester = None
+        last_build = None
+        last_app = None
+        last_screen = None
+        last_is_baseline = None
+
+        for ev, tester, build, pkg, header, baseline in rows:
+            try:
+                enriched_vectors.append(np.array(json.loads(ev), dtype=float))
+                last_tester = tester
+                last_build = build
+                last_app = pkg
+                last_screen = header
+                last_is_baseline = baseline
+            except Exception:
+                pass
+
+        if len(enriched_vectors) < 3:
+            logger.info(f"📌 Solo {len(enriched_vectors)} muestras → esperar más")
+            return
+
+        logger.info(f"📊 Entrenando modelo general con {len(enriched_vectors)} muestras")
+
+        # Aquí usamos los valores reales que vienen desde BD
+        await _train_general_logic_hybrid(
+            enriched_vector=None,  # No es 1 evento — es entrenamiento global
+            tester_id=last_tester or "general",
+            build_id=last_build or "general",
+            app_name=last_app or "default_app",
+            screen_id=last_screen or "general",
+            min_samples=3,
+            use_general_as_base=bool(last_is_baseline),
+            # conn_params=None,
+            batch_size=500,
+        )
+
+        logger.info("🎯 Entrenamiento general periódico completado")
+
+    except Exception as e:
+        logger.error(f"🔥 Error en entrenamiento general periódico: {e}")
 
 def send_slack_alert(webhook_url: Optional[str] = None, title: str = "", payload: dict = None):
     """
@@ -1044,374 +1209,65 @@ def sequence_entropy(seq: list[str]) -> float:
 
 
 def init_metrics_table():
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS metrics_changes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tester_id TEXT,
-                build_id TEXT,
-                total_events INTEGER DEFAULT 0,
-                total_changes INTEGER DEFAULT 0,
-                total_added INTEGER DEFAULT 0,
-                total_removed INTEGER DEFAULT 0,
-                total_modified INTEGER DEFAULT 0,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(tester_id, build_id)
-            )
-        """)
-        conn.commit()
+    with get_conn_cm() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS metrics_changes (
+                    id SERIAL PRIMARY KEY,
+                    tester_id TEXT,
+                    build_id TEXT,
+                    total_events INTEGER DEFAULT 0,
+                    total_changes INTEGER DEFAULT 0,
+                    total_added INTEGER DEFAULT 0,
+                    total_removed INTEGER DEFAULT 0,
+                    total_modified INTEGER DEFAULT 0,
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(tester_id, build_id)
+                )
+            """)
+            c.commit()
 
 
 # Actualizar métricas
 def update_metrics(tester_id: str, build_id: str, has_changes: bool,
                    added_count: int = 0, removed_count: int = 0, modified_count: int = 0):
-    with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO metrics_changes (
-                tester_id, build_id, total_events, total_changes,
-                total_added, total_removed, total_modified
-    
-        # 🔹 Asegurar columnas nuevas para retroalimentación incremental (retrocompatible)
-        try:
-            c.execute("ALTER TABLE screen_diffs ADD COLUMN IF NOT EXISTS diff_priority TEXT DEFAULT 'high'")
-            c.execute("ALTER TABLE screen_diffs ADD COLUMN IF NOT EXISTS similarity_to_approved REAL DEFAULT 0.0")
-            c.execute("ALTER TABLE screen_diffs ADD COLUMN IF NOT EXISTS approved_before INTEGER DEFAULT 0")
-        except Exception as e:
-            logger.warning(f"⚠️  No se pudieron agregar columnas (puede que ya existan): {e}")
+    # with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
+    with get_conn_cm() as conn:
+        with conn.cursor() as c:
 
-        conn.commit()
-        conn.close()
-            DO UPDATE SET
-                total_events = total_events + 1,
-                total_changes = total_changes + EXCLUDED.total_changes,
-                total_added = total_added + EXCLUDED.total_added,
-                total_removed = total_removed + EXCLUDED.total_removed,
-                total_modified = total_modified + EXCLUDED.total_modified,
-                last_updated = CURRENT_TIMESTAMP
-        """, (
-            tester_id,
-            build_id,
-            1 if has_changes else 0,
-            added_count,
-            removed_count,
-            modified_count
-        ))
-        conn.commit()
-
-# =========================================================
-# BASE DE DATOS
-# =========================================================
-
-def get_db():
-    """
-    Devuelve una conexión SQLite que se cierra automáticamente
-    al finalizar la petición.
-    """
-    db = sqlite3.connect(DB_NAME)
-    db.row_factory = sqlite3.Row  # Para poder acceder a columnas por nombre
-    try:
-        yield db
-    finally:
-        db.close()
+        # conn.execute("PRAGMA journal_mode=WAL;")
+        # cur = conn.cursor()
+            c.execute("""
+                INSERT INTO metrics_changes (
+                    tester_id, build_id, total_events, total_changes,
+                    total_added, total_removed, total_modified
         
-        
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS accessibility_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tester_id TEXT,
-            build_id TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            event_type TEXT,
-            event_type_name TEXT,
-            package_name TEXT,
-            class_name TEXT,
-            text TEXT,
-            content_description TEXT,
-            screens_id TEXT,
-            screens_id_short TEXT,
-            screen_names TEXT,
-            header_text TEXT,
-            actual_device TEXT,
-            global_signature TEXT,
-            partial_signature TEXT,
-            scroll_type TEXT,
-            signature TEXT,
-            version TEXT,
-            collect_node_tree TEXT,
-            additional_info TEXT,
-            tree_data TEXT,
-            is_baseline INTEGER DEFAULT 0,   
-            enriched_vector TEXT,
-            cluster_id INTEGER,
-            is_stable INTEGER DEFAULT 0,
-            anomaly_score REAL,
-            session_key TEXT,
-            embedding_vector  TEXT, 
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS screen_diffs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tester_id TEXT,
-            build_id TEXT,
-            screen_name TEXT,
-            header_text TEXT,
-            removed TEXT,
-            added TEXT,
-            modified TEXT,
-            cluster_info TEXT,
-            anomaly_score REAL DEFAULT 0,
-            diff_hash TEXT UNIQUE NOT NULL,
-            diff_priority TEXT DEFAULT 'high',
-            text_diff TEXT,  
-            text_overlap REAL DEFAULT 0,
-            overlap_ratio REAL DEFAULT 0,
-            ui_structure_similarity REAL DEFAULT 0,      
-            cluster_id INTEGER DEFAULT -1,  
-            screen_status TEXT DEFAULT 'unknown',  
-            similarity_to_approved REAL DEFAULT 0.0,
-            approved_before INTEGER DEFAULT 0,
-            approval_status TEXT,   
-            rejection_reason TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+            # 🔹 Asegurar columnas nuevas para retroalimentación incremental (retrocompatible)
+            try:
+                c.execute("ALTER TABLE screen_diffs ADD COLUMN IF NOT EXISTS diff_priority TEXT DEFAULT 'high'")
+                c.execute("ALTER TABLE screen_diffs ADD COLUMN IF NOT EXISTS similarity_to_approved REAL DEFAULT 0.0")
+                c.execute("ALTER TABLE screen_diffs ADD COLUMN IF NOT EXISTS approved_before INTEGER DEFAULT 0")
+            except Exception as e:
+                logger.warning(f"⚠️  No se pudieron agregar columnas (puede que ya existan): {e}")
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS metrics_summary (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            metric_group TEXT NOT NULL,   -- screen / build / global
-            metric_name TEXT NOT NULL,
-            metric_value TEXT
-        )
-    """)
-    c.execute("""
-		CREATE TABLE IF NOT EXISTS diff_items (
-		  id INTEGER PRIMARY KEY,
-		  diff_id INTEGER NOT NULL REFERENCES screen_diffs(id),
-		  action TEXT NOT NULL,          
-		  node_class TEXT,
-		  node_key TEXT,
-		  node_text TEXT,
-		  changes_json TEXT,            
-		  raw_json TEXT,               
-		  label TEXT,                   
-		  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		);
-	""")
-    c.execute("""
-       CREATE TABLE IF NOT EXISTS ignored_changes_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tester_id TEXT,
-            build_id INTEGER,
-            header_text TEXT,
-            signature TEXT,
-            class_name TEXT,
-            field TEXT,
-            old_value TEXT,
-            new_value TEXT,
-            reason TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS boolean_history (
-            screen_id TEXT,
-            node_key TEXT,
-            property TEXT,
-            last_value BOOLEAN,
-            PRIMARY KEY(screen_id, node_key, property)
-        );
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS baseline_metadata (
-            app_name TEXT,
-            tester_id TEXT,
-            build_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (app_name, tester_id, build_id)
-        );
-    """)
-    # Crear la tabla
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS active_plans (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,  -- <--- aquí va el nombre
-        plan_name TEXT UNIQUE NOT NULL,
-        description TEXT NOT NULL,
-        active INTEGER DEFAULT 1,
-        currency TEXT CHECK(currency IN ('USD', 'COP', 'EUR')) NOT NULL DEFAULT 'USD',
-        rate_usd REAL DEFAULT 1.0,       
-        rate_cop REAL DEFAULT 4100.0,   
-        rate_eur REAL DEFAULT 0.94,      
-        rate REAL DEFAULT 1.0,
-        price REAL NOT NULL,
-        no_associate REAL DEFAULT 0.0,  -- costo por código sin plan activo
-        max_tester INTEGER NOT NULL,      
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-
-    # Insertar los planes por defecto
-    default_plans = [
-        ('BASIC', 'Basic Plan', 'USD', 1.0, 1, 1),
-        ('STANDARD', 'Standard Plan', 'USD', 1.0, 25, 5)
-    ]
-
-    for plan in default_plans:
-        c.execute("""
-            INSERT OR IGNORE INTO active_plans (plan_name, description, currency, rate, price, max_tester)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, plan)
-
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS login_codes (
-            codigo TEXT PRIMARY KEY,
-            usuario_id TEXT NOT NULL,
-            plan_id INTEGER,  
-            generado_en INTEGER NOT NULL,
-            expira_en INTEGER NOT NULL,
-            usos_permitidos INTEGER NOT NULL,
-            usos_actuales INTEGER DEFAULT 0,
-            pago_confirmado INTEGER DEFAULT 0,  
-            activo INTEGER DEFAULT 1,  
-            is_paid INTEGER DEFAULT 0,
-            FOREIGN KEY (plan_id) REFERENCES active_plans(id)  
-        );
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS usuarios (
-            id TEXT PRIMARY KEY,
-            nombre TEXT,
-            rol TEXT CHECK(rol IN ('owner', 'tester')) DEFAULT 'tester',
-            plan_id INTEGER,
-            FOREIGN KEY(plan_id) REFERENCES active_plans(id)
-        );
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS pagos (
-            pago_id TEXT PRIMARY KEY,    
-            membresia_id TEXT NOT NULL,     
-            usuario_id TEXT NOT NULL,
-            proveedor TEXT NOT NULL,           
-            proveedor_id TEXT,                  
-            monto INTEGER NOT NULL,
-            moneda TEXT DEFAULT 'USD',
-            estado TEXT DEFAULT 'PENDIENTE',  
-            transaccion_id TEXT   
-            cantidad_codigos INTEGER NOT NULL,
-            fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            fecha_confirmacion INTEGER 
-        );
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS membresias (
-            membresia_id TEXT PRIMARY KEY,
-            usuario_id TEXT NOT NULL,
-            tipo_plan TEXT NOT NULL,
-            cantidad_codigos INTEGER NOT NULL,
-            fecha_inicio INTEGER NOT NULL,
-            fecha_fin INTEGER NOT NULL 
-        );
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS pagos_log  (
-            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pago_id TEXT NOT NULL,
-            evento TEXT NOT NULL,             -- Ej: "CREADO", "CONFIRMADO", "FALLIDO", "CODIGO_GENERADO"
-            descripcion TEXT,                 -- Detalles del evento
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(pago_id) REFERENCES pagos(pago_id)
-        );
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS transacciones (
-            transaccion_id TEXT PRIMARY KEY,
-            proveedor TEXT NOT NULL,          -- Stripe, PayPal, Banco
-            proveedor_id TEXT,                -- ID de la transacción en el proveedor
-            monto REAL NOT NULL,
-            moneda TEXT DEFAULT 'USD',
-            estado TEXT DEFAULT 'PENDIENTE',  -- PENDIENTE, CONFIRMADA, FALLIDA
-            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS diff_trace (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tester_id TEXT,
-            build_id TEXT,
-            screen_name TEXT,
-            message TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS diff_approvals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            diff_id INTEGER,
-            approved INTEGER DEFAULT 0, 
-            approved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS diff_rejections (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            diff_id INTEGER,
-            rejection_reason TEXT, 
-            rejected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-        # --- OPCIONAL: para almacenar códigos de verificación ---
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS password_reset_codes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT NOT NULL,
-            code TEXT NOT NULL,
-            expires_at INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # ✅ NUEVA TABLA: métricas de cambios
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS metrics_changes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tester_id TEXT,
-            build_id TEXT,
-            total_events INTEGER DEFAULT 0,
-            total_changes INTEGER DEFAULT 0,
-            total_added INTEGER DEFAULT 0,      
-            total_removed INTEGER DEFAULT 0,    
-            total_modified INTEGER DEFAULT 0,   
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(tester_id, build_id)
-        )
-    """)
-    c.execute("""
-        CREATE INDEX IF NOT EXISTS idx_data_tester_build_screen
-        ON accessibility_data(tester_id, build_id, screen_names, created_at DESC)
-    """)
-    c.execute("""
-        CREATE INDEX IF NOT EXISTS idx_diffs_tester_build_screen
-        ON screen_diffs(tester_id, build_id, screen_name, created_at DESC)
-    """)
-
-
-    conn.commit()
-    conn.close()
-    
-init_db()
+            conn.commit()
+            conn.close()
+                DO UPDATE SET
+                    total_events = total_events + 1,
+                    total_changes = total_changes + EXCLUDED.total_changes,
+                    total_added = total_added + EXCLUDED.total_added,
+                    total_removed = total_removed + EXCLUDED.total_removed,
+                    total_modified = total_modified + EXCLUDED.total_modified,
+                    last_updated = CURRENT_TIMESTAMP
+            """, (
+                tester_id,
+                build_id,
+                1 if has_changes else 0,
+                added_count,
+                removed_count,
+                modified_count
+            ))
+            conn.commit()
 
 # =========================================================
 # MODELOS DE ENTRADA
@@ -1651,53 +1507,94 @@ def generate_code():
 
 def save_reset_code(email: str, code: str):
     try:
-        expires_at = int(time.time()) + 900
-        conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO password_reset_codes (email, code, expires_at)
-            VALUES (?, ?, ?)
-        """, (email, code, expires_at))
-        conn.commit()
-        conn.close()
-        #print(f"✅ Código guardado para {email}")
+
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+                expires_at = int(time.time()) + 900
+
+            # conn = get_conn()
+            # c = conn.cursor()
+
+                c.execute("""
+                    INSERT INTO password_reset_codes (email, code, expires_at)
+                    VALUES (%s, %s, %s)
+                """, (email, code, expires_at))
+
+            conn.commit()
+
     except Exception as e:
         print(f"❌ Error guardando código en BD: {e}")
 
+    # finally:
+    #     if conn:
+    #         release_conn(conn)
 
 def validate_code(email: str, code: str, expiration_seconds: int = 300) -> bool:
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("""
-        SELECT expires_at FROM password_reset_codes
-        WHERE email = ? AND code = ?
-        ORDER BY created_at DESC
-        LIMIT 1
-    """, (email, code))
-    row = c.fetchone()
-    conn.close()
+    conn = None
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+            # conn = get_conn()
+            # c = conn.cursor()
 
-    if not row:
+                c.execute("""
+                    SELECT expires_at FROM password_reset_codes
+                    WHERE email = %s AND code = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (email, code))
+
+                row = c.fetchone()
+
+    except Exception as e:
+        print(f"❌ Error validando código: {e}")
         return False
 
-    if int(time.time()) > row[0]:
-        return False
+    # finally:
+    #     if conn:
+    #             release_conn(conn)
 
-    return True  
+        # No existe el código
+        if not row:
+            return False
+
+        expires_at = row[0]
+
+        # Código expirado
+        if int(time.time()) > expires_at:
+            return False
+
+        return True
 
 
-def update_bool_history(screen_id, db_conn):
-    """Guarda BOOL_HISTORY en la BD."""
-    cursor = db_conn.cursor()
-    for node_key, props in BOOL_HISTORY.items():
-        for prop, val in props.items():
-            cursor.execute("""
-                INSERT INTO boolean_history(screen_id, node_key, property, last_value)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(screen_id, node_key, property)
-                DO UPDATE SET last_value = excluded.last_value
-            """, (screen_id, node_key, prop, int(val)))
-    db_conn.commit()
+def update_bool_history(screen_id):
+    """Guarda BOOL_HISTORY en la BD usando PostgreSQL."""
+    conn = None
+    try:
+        with get_conn_cm() as conn:
+	        with conn.cursor() as c:
+            # conn = get_conn()
+            # cursor = conn.cursor()
+
+                    for node_key, props in BOOL_HISTORY.items():
+                        for prop, val in props.items():
+
+                            c.execute("""
+                                INSERT INTO boolean_history (screen_id, node_key, property, last_value)
+                                VALUES (%s, %s, %s, %s)
+                                ON CONFLICT (screen_id, node_key, property)
+                                DO UPDATE SET last_value = EXCLUDED.last_value
+                            """, (screen_id, node_key, prop, bool(val)))
+
+                    conn.commit()
+
+    except Exception as e:
+        print(f"❌ Error actualizando boolean_history: {e}")
+
+    # finally:
+    #     if conn:
+    #         release_conn(conn)
+
 
 
  # =========================================================
@@ -1943,83 +1840,6 @@ async def ensure_model_dimensions(
         )
         return False
 
-
-# async def ensure_model_dimensions(
-#     kmeans,
-#     X,
-#     tester_id,
-#     build_id,
-#     app_name="default_app",
-#     screen_id="unknown_screen",
-#     desc=""
-# ):
-#     try:
-#         # 🛑 1. Modelo aún no entrenado → entrenar ahora
-#         if not hasattr(kmeans, "cluster_centers_"):
-#             logger.warning(
-#                 f"[{desc}] KMeans aún no entrenado — iniciando entrenamiento inicial"
-#             )
-
-#             lock_key = f"{app_name}:initial_train"
-#             lock = _get_lock(lock_key)
-
-#             if not lock.locked():
-#                 asyncio.create_task(
-#                     _safe_training_wrapper(
-#                         X=X,
-#                         tester_id=tester_id,
-#                         build_id=build_id,
-#                         app_name=app_name,
-#                         screen_id=screen_id,
-#                         desc=f"initial_train {desc}",
-#                         lock=lock,
-#                         train_fn=_train_incremental_logic_hybrid,
-#                     )
-#                 )
-#             return False
-
-#         # 🧩 2. Comparar dimensiones reales
-#         expected_features = kmeans.cluster_centers_.shape[1]
-#         current_features = X.shape[1]
-
-#         if current_features != expected_features:
-#             logger.warning(
-#                 f"[{desc}] Dimensión inconsistente: modelo={expected_features}, nuevo={current_features}. Reentrenando..."
-#             )
-
-#             lock_key = f"{app_name}:diff_model"
-#             lock = _get_lock(lock_key)
-
-#             if lock.locked():
-#                 logger.warning(
-#                     f"[{desc}] Skip: reentrenamiento ya en proceso para {lock_key}"
-#                 )
-#                 return False
-
-#             asyncio.create_task(
-#                 _safe_training_wrapper(
-#                     X=X,
-#                     tester_id=tester_id,
-#                     build_id=build_id,
-#                     app_name=app_name,
-#                     screen_id=screen_id,
-#                     desc=f"retrain {desc}",
-#                     lock=lock,
-#                     train_fn=_train_incremental_logic_hybrid,
-#                 )
-#             )
-
-#             return False
-
-#         # ✅ Todo bien
-#         return True
-
-#     except Exception as e:
-#         logger.warning(
-#             f"[{desc}] Error validando dimensiones ({app_name}/{tester_id}/{build_id}): {e}"
-#         )
-#         return False
-
 def structure_signature_features(tree):
     """
     Extrae características estructurales de una jerarquía de nodos de UI,
@@ -2256,7 +2076,6 @@ async def analyze_and_train(event: AccessibilityEvent):
     t_id = str(norm.get("tester_id_norm") or "").strip()
     b_id = str(norm.get("build_id_norm") or "").strip()
     s_name = event.header_text 
-    # s_name = normalize_header(event.header_text)
     event_type_ref = normalize_header(event.event_type_name)
     app_name = event.package_name or "default_app"
     tester_id = event.tester_id or "general"
@@ -2300,48 +2119,45 @@ async def analyze_and_train(event: AccessibilityEvent):
     has_changes = False  
 
     # -------------------- Verificación rápida de cambio de header --------------------
+    
+    # -------------------- Verificación rápida de cambio de header --------------------
     try:
         curr_header = (s_name or "")
-        # curr_header = (s_name or "").strip().lower()
         prev_header = None
-        prev_id= None
-        with sqlite3.connect(DB_NAME) as conn:
-            # Buscar el último header distinto para el mismo tester
-            row = conn.execute("""
-                SELECT header_text, id 
-                FROM accessibility_data
-                WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
-                AND LOWER(TRIM(header_text)) != LOWER(TRIM(?))
-                AND LOWER(TRIM(event_type_name)) = LOWER(TRIM(?))
-                ORDER BY created_at DESC
-                LIMIT 1
-            """, (t_id, curr_header, event_type_ref)).fetchone()
+        prev_id = None
 
-            if row:
-                prev_header = (row[0] or "").strip().lower()         
-                # prev_id = (row[1] or "").strip().lower()     
-                prev_id = str(row[1])
-            else:
-                prev_id = None
-                prev_header = None
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+                # Buscar el último header distinto para el mismo tester
+                c.execute("""
+                    SELECT header_text, id
+                    FROM accessibility_data
+                    WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(%s))
+                    AND LOWER(TRIM(header_text)) = LOWER(TRIM(%s))
+                    AND LOWER(TRIM(event_type_name)) = LOWER(TRIM(%s))
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (t_id, curr_header, event_type_ref))
 
-            # if row: 
-            #     prev_header = (row[0] or "").strip().lower()
+                row = c.fetchone()
 
+                if row:
+                    prev_header = (row[0] or "").strip().lower()
+                    prev_id = str(row[1])
+                else:
+                    prev_id = None
+                    prev_header = None
 
-        # print(f"curr_header: '{curr_header}' | prev_header: '{prev_header}'")
-        if prev_header and prev_header != curr_header:
-            # print(f"⚠️ Header cambió (detección temprana): '{prev_header}' → '{curr_header}'")
-            header_changed = {"before": prev_header, "after": curr_header}
-            has_changes = True
-        else:
-            header_changed = None
-            # print("✅ Header sin cambios (verificación temprana).")
+                # Comparación del header
+                if prev_header and prev_header != curr_header:
+                    header_changed = {"before": prev_header, "after": curr_header}
+                    has_changes = True
+                else:
+                    header_changed = None
 
     except Exception as e:
         header_changed = None
         logger.warning(f"⚠️ Error en verificación temprana de header_text: {e}")
-
 
     def normalize_node(node):
         return {k: v for k, v in node.items() if k not in IGNORED_FIELDS}
@@ -2381,10 +2197,7 @@ async def analyze_and_train(event: AccessibilityEvent):
 
         except Exception as e:
             logger.exception(f"Error generando embedding: {e} -- usando vector neutro")
-            # emb_curr = np.zeros((1, siamese_model.embedding_dim))
 
-        # emb_curr = ensure_model_dimensions(emb_curr)
-            # Fallback seguro
             try:
                 emb_dim = getattr(siamese_model, "embedding_dim", 64)
 
@@ -2394,81 +2207,172 @@ async def analyze_and_train(event: AccessibilityEvent):
             emb_curr = np.zeros((1, emb_dim), dtype=float)
 
             # 🔍 VALIDAR DIMENSIONES DEL MODELO
-        valid_dimensions = await ensure_model_dimensions(
-            kmeans=kmeans_model,
-            X=emb_curr,
-            tester_id=t_id,
-            build_id=b_id,
-            app_name=app_name,
-            screen_id=semantic_screen_id_ctx.get(),
-            desc="embedding_validation"
-        )    
+            valid_dimensions = await ensure_model_dimensions(
+                kmeans=kmeans_model,
+                X=emb_curr,
+                tester_id=t_id,
+                build_id=b_id,
+                app_name=app_name,
+                screen_id=semantic_screen_id_ctx.get(),
+                desc="embedding_validation"
+            )    
 
     # -------------------- (Opcional) Guardar embedding --------------------
-    with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("""
-            UPDATE accessibility_data
-            SET embedding_vector=?
-            WHERE id=?
-        """, (json.dumps(emb_curr.tolist()), prev_id))
-        conn.commit()
+    conn = None
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    UPDATE accessibility_data
+                    SET embedding_vector = %s
+                    WHERE id = %s
+                """, (json.dumps(emb_curr.tolist()), prev_id))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"❌ Error actualizando embedding_vector: {e}")
 
-    with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        prev_rows = conn.execute("""
-            SELECT collect_node_tree, header_text, signature, enriched_vector, build_id, event_type_name
-            FROM accessibility_data
-            WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(?))
-              AND LOWER(TRIM(build_id)) != LOWER(TRIM(?))
-            ORDER BY created_at DESC
-            LIMIT 5
-        """, (t_id, b_id)).fetchall()
+    conn = None
+    prev_rows = []
 
-    # esto es nuevo tocar o eliminar 
-        if not prev_rows:
-            #print("ℹ️ No hay snapshots previos para comparar.")
-            has_changes = True
-            prev_tree = None
-        else:
-            # -------------------- 4. Calcular similitud aprendida --------------------
-            best_sim, best_row = 0.0, None
-            for row in prev_rows:
-                try:
-                    prev_tree = sanitize_tree(ensure_list(json.loads(row[0])))
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
 
-                    #prev_tree = ensure_list(json.loads(row[0]))
-                    with torch.no_grad():
-                        emb_prev = siamese_model.encode_tree(prev_tree)
-                    emb_prev = emb_prev.cpu().numpy().reshape(1, -1)
+                c.execute("""
+                    WITH latest AS (
+                        SELECT MAX(created_at) AS ts
+                        FROM accessibility_data
+                        WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(%s))
+                        AND LOWER(TRIM(header_text)) = LOWER(TRIM(%s))
+                        AND LOWER(TRIM(build_id)) = LOWER(TRIM(%s))
 
-                    # Validar ambas dimensiones están alineadas
-                    if emb_curr.shape[1] != emb_prev.shape[1]:
-                        logger.warning(f"Dimensiones incompatibles: emb_curr={emb_curr.shape[1]}, emb_prev={emb_prev.shape[1]}")
-                        continue
+                        UNION ALL
 
-                    sim_torch = torch.nn.functional.cosine_similarity(
-                        torch.tensor(emb_curr, dtype=torch.float32),
-                        torch.tensor(emb_prev, dtype=torch.float32),
-                        dim=1
+                        SELECT MAX(created_at) AS ts
+                        FROM accessibility_data
+                        WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(%s))
+                        AND LOWER(TRIM(header_text)) = LOWER(TRIM(%s))
+                        AND LOWER(TRIM(build_id)) <> LOWER(TRIM(%s))
                     )
-                    print("Similitud (torch):", sim_torch.mean().item())
+                    SELECT collect_node_tree,
+                        header_text,
+                        signature,
+                        enriched_vector,
+                        build_id,
+                        event_type_name,
+                        created_at
+                    FROM accessibility_data
+                    WHERE LOWER(TRIM(tester_id)) = LOWER(TRIM(%s))
+                    AND LOWER(TRIM(header_text)) = LOWER(TRIM(%s))
+                    AND created_at < (SELECT MAX(ts) FROM latest)
+                    ORDER BY created_at DESC
+                    LIMIT 1;
+                """, (
+                    t_id, header_text, b_id,
+                    t_id, header_text, b_id,
+                    t_id, header_text
+                ))
 
-                    sim = float(cosine_similarity(emb_curr, emb_prev)[0][0])
+                prev_rows = c.fetchall()
 
-                    if sim > best_sim:
-                        best_sim, best_row = sim, row
-                except Exception:
+    except Exception as e:
+        logger.error(f"❌ Error consultando registros previos: {e}")
+
+
+    # try:
+    #     with get_conn_cm() as conn:
+    #         with conn.cursor() as c:
+
+    #             # 1️⃣ Buscar los snapshots más recientes de ESTA PANTALLA
+    #             #    que NO sean del build actual
+    #             c.execute("""
+
+    #                 SELECT collect_node_tree,
+    #                     header_text,
+    #                     signature,
+    #                     enriched_vector,
+    #                     build_id,
+    #                     event_type_name,
+    #                     created_at
+    #                 FROM accessibility_data
+    #                 WHERE tester_id = LOWER(TRIM(%s))
+    #                 AND header_text = LOWER(TRIM(%s))
+    #                 AND created_at < (
+    #                     SELECT COALESCE(
+    #                         (
+    #                             -- Si ya hay capturas del mismo screen en el build actual
+    #                             SELECT MAX(created_at)
+    #                             FROM accessibility_data
+    #                             WHERE tester_id = LOWER(TRIM(%s))
+    #                             AND header_text = LOWER(TRIM(%s))
+    #                             AND build_id = LOWER(TRIM(%s))
+    #                         ),
+    #                         (
+    #                             -- Si NO hay capturas del mismo screen en el build actual
+    #                             SELECT MAX(created_at)
+    #                             FROM accessibility_data
+    #                             WHERE tester_id = LOWER(TRIM(%s))
+    #                             AND header_text = LOWER(TRIM(%s))
+    #                             AND build_id <> LOWER(TRIM(%s))
+    #                         )
+    #                     )
+    #                 )
+    #                 ORDER BY created_at DESC
+    #                 LIMIT 1;
+    #             """, (t_id, header_text, t_id, header_text, b_id))
+
+    #             prev_rows = c.fetchall()
+
+    # except Exception as e:
+    #     logger.error(f"❌ Error consultando registros previos: {e}")
+
+    # ------------------------------------------------------------------
+    # 2️⃣ Determinar prev_tree usando similitud del modelo siamés
+    # ------------------------------------------------------------------
+
+    if not prev_rows:
+        logger.info("ℹ️ No hay snapshots previos en BD")
+        has_changes = True
+        prev_tree = None
+
+    else:
+        best_sim, best_row = -1.0, None
+
+        for row in prev_rows:
+            try:
+                prev_tree_candidate = sanitize_tree(
+                    ensure_list(json.loads(row[0]))
+                )
+
+                with torch.no_grad():
+                    emb_prev = siamese_model.encode_tree(prev_tree_candidate)
+
+                emb_prev = emb_prev.cpu().numpy().reshape(1, -1)
+
+                # Compatibilidad de dimensiones
+                if emb_curr.shape[1] != emb_prev.shape[1]:
+                    logger.warning(f"Dim mismatch: curr={emb_curr.shape[1]}, prev={emb_prev.shape[1]}")
                     continue
 
-            if best_sim > SIM_THRESHOLD and best_row:
-                logger.info(f"🤝 Coincidencia detectada por modelo siamés (sim={best_sim:.3f})")
-                #prev_tree = ensure_list(json.loads(best_row[0]))
-                prev_tree = sanitize_tree(ensure_list(json.loads(best_row[0])))
-            else:
-                logger.warning("⚠️ No se encontró coincidencia fuerte, usar estructura directa.")
-                prev_tree = ensure_list(json.loads(prev_rows[0][0]))    
-    
+                sim = float(cosine_similarity(emb_curr, emb_prev)[0][0])
+
+                if sim > best_sim:
+                    best_sim, best_row = sim, row
+
+            except Exception as e:
+                logger.debug(f"Ignorando row por error: {e}")
+                continue
+
+        # ------------------------------------------------------------------
+        # 3️⃣ Seleccionar prev_tree final
+        # ------------------------------------------------------------------
+        if best_sim >= SIM_THRESHOLD and best_row:
+            logger.info(f"🤝 Coincidencia fuerte detectada (sim={best_sim:.3f})")
+            prev_tree = sanitize_tree(ensure_list(json.loads(best_row[0])))
+        else:
+            logger.warning(f"⚠️ Sim débil (max={best_sim:.3f}), usar más reciente por fecha")
+            prev_tree = sanitize_tree(ensure_list(json.loads(prev_rows[0][0])))
+
 
     # esto es nuevo  tocar o eliminar  
     if prev_tree:
@@ -2519,13 +2423,6 @@ async def analyze_and_train(event: AccessibilityEvent):
                 logger.error(f"Error comparando orden UI: {e}")
                 diff_result["order_score"] = 1.0
 
-
-            # has_changes = bool(
-            #     diff_result.get("removed") or diff_result.get("added") or diff_result.get("modified") or
-            #     diff_result.get("text_diff", {}).get("overlap_ratio", 1.0) < 0.9 or
-            #     diff_result.get("has_changes")
-            # )
-
             # AHORA SÍ: incluir orden en el análisis final
             has_changes = bool(
                 diff_result.get("removed")
@@ -2575,31 +2472,26 @@ async def analyze_and_train(event: AccessibilityEvent):
         similarity_to_approved = 0.0   # 🔹 NUEVA LÍNEA
 
 
-    # 🔹 Recalcular enriched_vector (después de emb_curr y fuera del if)
-    # enriched_vector = np.concatenate([
-    #     struct_vec,
-    #     sig_vec,
-    #     np.array([avg_dwell, num_gestos], dtype=float),
-    #     input_vec,
-    #     emb_curr.flatten()
-    # ])  
-
-    if (
-        enriched_vector is not None 
-        and hasattr(enriched_vector, "size") 
-        and enriched_vector.size > 0
-    ):    
-
-        # -------------------- 6. Guardar diff + enriquecimiento --------------------
-        with sqlite3.connect(DB_NAME) as conn:
+    if enriched_vector is not None and getattr(enriched_vector, "size", 0) > 0:
+        try:
             emb_json = json.dumps(emb_curr.tolist())
-            conn.execute("""
-                UPDATE accessibility_data
-                SET enriched_vector=?
-                WHERE TRIM(LOWER(header_text)) LIKE '%' || TRIM(LOWER(?)) || '%'
-                AND TRIM(tester_id)=TRIM(?)
-            """, (emb_json, s_name, t_id))
-            conn.commit()
+
+            with get_conn_cm() as conn:
+                with conn.cursor() as c:
+                    # Actualiza enriched_vector solo para el header y tester correspondientes
+                    c.execute("""
+                        UPDATE accessibility_data
+                        SET enriched_vector = %s
+                        WHERE LOWER(header_text) LIKE LOWER(%s)
+                        AND TRIM(tester_id) = TRIM(%s)
+                    """, (emb_json, f"%{s_name}%", t_id))
+
+                    conn.commit()
+                    logger.info(f"✅ enriched_vector actualizado para tester_id={t_id}, header='{s_name}'")
+
+        except Exception as e:
+            logger.error(f"❌ Error actualizando enriched_vector para tester_id={t_id}, header='{s_name}': {e}")
+
 
     # -------------------- 7. Entrenamiento incremental (CON CACHÉ) --------------------
     # ✅ NUEVO: Verificar si ya entrenamos esta pantalla recientemente
@@ -2608,22 +2500,6 @@ async def analyze_and_train(event: AccessibilityEvent):
     last_train_time = TRAINED_SCREENS_CACHE.get(screen_cache_key, 0)
 
 
-# --- Cola para entreno incremental local---
-    # await event_queue_train_hibryd.put({
-    #     "enriched_vector": enriched_vector,
-    #     "tester_id": tester_id,
-    #     "build_id": build_id,
-    #     "app_name": app_name,
-    #     "screen_id": semantic_screen_id_ctx.get()
-    # })
-
-    # # --- Cola para entreno general ---
-    # await event_queue_train_general.put({
-    #     "app_name": app_name,
-    #     "batch_size": 500,
-    #     "min_samples": 3,
-    #     "update_general": True
-    # })
 
 # --- Cola para entreno incremental local---
 
@@ -2642,53 +2518,6 @@ async def analyze_and_train(event: AccessibilityEvent):
         "update_general": True,
     })
     
-    # Solo entrenar si: no se entrenó antes O pasó más de TTL segundos
-    # if current_time - last_train_time > TRAIN_CACHE_TTL:
-    #     logger.info(f"🔄 Entrenando pantalla (primera vez o expirado): {screen_cache_key}")
-    #     TRAINED_SCREENS_CACHE[screen_cache_key] = current_time  # Marcar como entrenada
-        
-    #     asyncio.create_task(_train_incremental_logic_hybrid(
-    #         enriched_vector=enriched_vector,
-    #         tester_id=tester_id,
-    #         build_id=build_id,
-    #         app_name=app_name,
-    #         screen_id=semantic_screen_id_ctx.get(),
-    #         use_general_as_base=True
-    #     ))
-    # else:
-    #     # Pantalla ya fue entrenada recientemente, saltarla
-    #     time_since_train = current_time - last_train_time
-    #     logger.debug(f"⏭️  Saltando reentrenamiento de {screen_cache_key} (entrenada hace {time_since_train:.0f}s)")
-
-
-    # if TRAIN_GENERAL_ON_COLLECT:
-    #     await _train_general_logic_hybrid(
-    #         app_name=app_name,
-    #         batch_size=500,
-    #         min_samples=3,
-    #         update_general=True
-    #     )
-
-    #      # -------------------- Entrenamiento general con intervalo --------------------
-    # if TRAIN_GENERAL_ON_COLLECT:
-    #     global last_train
-    #     now = time.time()
-    #     key = f"{app_name}_{semantic_screen_id_ctx.get()}"
-    #     last = last_train.get(key, 0)
-    #     MIN_INTERVAL = 300  # 5 minutos entre entrenamientos generales
-
-    #     if now - last > MIN_INTERVAL:
-    #         last_train[key] = now
-    #         await _train_general_logic_hybrid(
-    #             app_name=app_name,
-    #             batch_size=500,
-    #             min_samples=3,
-    #             update_general=True
-    #         )
-    #     else:
-    #         logger.debug(f"⏳ Skip general training for {key}, last run {now - last:.1f}s ago")
-
-
 # -------------------- 9. Guardar en screen_diffs --------------------
     try:
         if has_changes:
@@ -2699,10 +2528,26 @@ async def analyze_and_train(event: AccessibilityEvent):
             text_diff = diff_result.get("text_diff", {})
 
 
+             # 🔹 Calcular anomaly_score aquí
+            def calculate_anomaly_score(diff_result, text_diff):
+                structure = 1 - diff_result.get("structure_similarity", 1.0)
+                order = 1 - diff_result.get("order_score", 1.0)
+                text = 1 - text_diff.get("overlap_ratio", 1.0)
+                total_nodes = (
+                    len(diff_result.get("added", [])) +
+                    len(diff_result.get("removed", [])) +
+                    len(diff_result.get("modified", [])) + 1
+                )
+                nodes_score = min(1.0, total_nodes / 10)
+                anomaly = 0.4*structure + 0.3*order + 0.2*text + 0.1*nodes_score
+                return round(anomaly, 3)
 
-            # --- mantener lo tuyo ---
+            anomaly_score = calculate_anomaly_score(diff_result, text_diff)
+
+            # Mantener tu info de header
             header_changed = text_diff.get("header_changed", None)
 
+            # Vector de diff
             diff_vector = np.array([
                 len(removed_all),
                 len(added_all),
@@ -2717,113 +2562,107 @@ async def analyze_and_train(event: AccessibilityEvent):
                 except Exception:
                     diff_result["structure_similarity"] = 1.0  
 
-            # --- Generar firma hash del diff (como tenías) ---
+            # Generar firma hash
             diff_signature = diff_hash(removed_all, added_all, modified_all, text_diff)
 
-            with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
-                conn.execute("PRAGMA journal_mode=WAL;")
-                cur = conn.cursor()
+            # Verificar si ya existe
+            existing = None
+            try:
+                with get_conn_cm() as conn:
+                    with conn.cursor() as c:
+                        c.execute("""
+                            SELECT id FROM screen_diffs WHERE diff_hash = %s
+                        """, (diff_signature,))
+                        existing = c.fetchone()
+            except Exception as e:
+                logger.error(f"❌ Error consultando diff_hash: {e}")
 
-                # Verificar si YA existe este diff_hash
-                cur.execute("""
-                    SELECT id FROM screen_diffs WHERE diff_hash = ?
-                """, (diff_signature,))
-                existing = cur.fetchone()
+            if existing:
+                logger.info(f"⚠️ Diff {diff_signature[:8]} ya existe — NO insertamos screen_diffs NI diff_items")
+                added_count = len(added_all)
+                removed_count = len(removed_all)
+                modified_count = len(modified_all)
+                return has_changes, added_count, removed_count, modified_count
 
-                # if existing:
-                #     logger.info(f"⚠️ Diff {diff_signature[:8]} ya existe — NO insertamos screen_diffs NI diff_items")
-                #     return   # ⬅️ AQUÍ SE CORTA TODO
-                
-                if existing:
-                    logger.info(f"⚠️ Diff {diff_signature[:8]} ya existe — NO insertamos screen_diffs NI diff_items")
-                    # devolver métricas coherentes
-                    added_count = len(added_all) if 'added_all' in locals() else 0
-                    removed_count = len(removed_all) if 'removed_all' in locals() else 0
-                    modified_count = len(modified_all) if 'modified_all' in locals() else 0
-                    return has_changes, added_count, removed_count, modified_count
+            # Calcular valores
+            text_overlap = text_diff.get("overlap_ratio", 1.0)
+            ui_sim = diff_result.get("structure_similarity", 1.0)
 
-                # ---- calcular valores ----
-                text_overlap = text_diff.get("overlap_ratio", 1.0)
-                ui_sim = diff_result.get("structure_similarity", 1.0)
+            if text_overlap >= 0.9 and ui_sim >= 0.9:
+                screen_status = "identical"
+            elif text_overlap >= 0.6 and ui_sim >= 0.6:
+                screen_status = "minor_changes"
+            else:
+                screen_status = "different"
 
-                # estado textual
-                if text_overlap >= 0.9 and ui_sim >= 0.9:
-                    screen_status = "identical"
-                elif text_overlap >= 0.6 and ui_sim >= 0.6:
-                    screen_status = "minor_changes"
-                else:
-                    screen_status = "different"
-
-            
-                # serializar
-                removed_j = json.dumps(removed_all, ensure_ascii=False)
-                added_j = json.dumps(added_all, ensure_ascii=False)
-                modified_j = json.dumps(modified_all, ensure_ascii=False)
-                text_diff_j = json.dumps(text_diff, ensure_ascii=False)
+            # Serializar
+            removed_j = json.dumps(removed_all, ensure_ascii=False)
+            added_j = json.dumps(added_all, ensure_ascii=False)
+            modified_j = json.dumps(modified_all, ensure_ascii=False)
+            text_diff_j = json.dumps(text_diff, ensure_ascii=False)
 
             break_insert = False
-
-            if (
-                len(removed_all) == 0
+            if (len(removed_all) == 0
                 and len(added_all) == 0
                 and len(modified_all) == 0
-                and (not text_diff or text_diff.get("overlap_ratio", 1.0) >= 0.99)
-
-            ):                 
+                and (not text_diff or text_diff.get("overlap_ratio", 1.0) >= 0.99)):
                 logger.info("🔍 Diff vacío — NO se inserta en screen_diffs.")
                 break_insert = True
-                has_changes = False  # No hubo cambios
+                has_changes = False
                 added_count = 0
                 removed_count = 0
                 modified_count = 0
-
                 return has_changes, added_count, removed_count, modified_count
 
-
-                # Insertar diff
+            # Insertar diff si aplica
             if not break_insert:
-                # Determinar prioridad basada en retroalimentación
                 diff_priority = 'low' if mark_as_low_priority else 'high'
-
-                cur.execute("""
-                    INSERT INTO screen_diffs (
-                        tester_id, build_id, screen_name, header_text,
-                        removed, added, modified, text_diff, diff_hash,
-                        text_overlap, overlap_ratio, ui_structure_similarity, screen_status,
-                        diff_priority, similarity_to_approved
-                    )
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    t_id, b_id, s_name, header_text,
-                    removed_j, added_j, modified_j, text_diff_j,
-                    diff_signature, text_overlap, text_overlap,
-                    ui_sim, screen_status,
-                    diff_priority, similarity_to_approved
-                ))
-
-                conn.commit()
-
-                # obtener diff_id real
-                cur.execute("SELECT id FROM screen_diffs WHERE diff_hash = ?", (diff_signature,))
-                diff_id = cur.fetchone()[0]
-
-                # 🔹 Registrar decisión inicial en el feedback system (si está disponible)
+                diff_id = None
                 try:
-                    if feedback_system is not None:
-                        record_diff_decision(
-                            diff_hash=diff_signature,
-                            diff_signature=diff_signature,
-                            app_name=app_name,
-                            tester_id=t_id,
-                            build_version=b_id,
-                            decision='show' if diff_priority == 'high' else 'low_priority',
-                            user_approved=True,
-                            feedback_system=feedback_system
-                        )
+                    with get_conn_cm() as conn:
+                        with conn.cursor() as c:
+                            c.execute("""
+                                INSERT INTO screen_diffs (
+                                    tester_id, build_id, screen_name, header_text,
+                                    removed, added, modified, text_diff, diff_hash,
+                                    text_overlap, overlap_ratio, ui_structure_similarity, screen_status,
+                                    diff_priority, similarity_to_approved, anomaly_score
+                                )
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                RETURNING id
+                            """, (
+                                t_id, b_id, s_name, header_text,
+                                removed_j, added_j, modified_j, text_diff_j,
+                                diff_hash(removed_all, added_all, modified_all, text_diff),
+                                text_diff.get("overlap_ratio", 1.0),
+                                text_diff.get("overlap_ratio", 1.0),
+                                diff_result.get("structure_similarity", 1.0),
+                                "different" if has_changes else "identical",
+                                'low' if mark_as_low_priority else 'high',
+                                similarity_to_approved,
+                                anomaly_score
+                            ))
+                            diff_id = c.fetchone()[0]
+                            conn.commit()
                 except Exception as e:
-                    logger.warning(f"⚠️  No se pudo registrar decision inicial en feedback_system: {e}")
+                    logger.error(f"❌ Error insertando screen_diffs: {e}")
+                    # Registrar decisión en feedback_system si aplica
+                    try:
+                        if feedback_system:
+                            record_diff_decision(
+                                diff_hash=diff_signature,
+                                diff_signature=diff_signature,
+                                app_name=app_name,
+                                tester_id=t_id,
+                                build_version=b_id,
+                                decision='show' if diff_priority == 'high' else 'low_priority',
+                                user_approved=True,
+                                feedback_system=feedback_system
+                            )
+                    except Exception as e:
+                        logger.warning(f"⚠️ No se pudo registrar decision inicial en feedback_system: {e}")
 
-                # ---- dedupe ----
+                # Insertar diff_items para nodos añadidos
                 def dedupe_nodes(items):
                     seen = set()
                     unique = []
@@ -2836,28 +2675,35 @@ async def analyze_and_train(event: AccessibilityEvent):
 
                 added_all = dedupe_nodes(added_all)
 
-                # ---- insertar diff_items ----
-                for item in added_all:
-                    node = item.get("node", {})
-                    cur.execute("""
-                        INSERT INTO diff_items (diff_id, action, node_class, node_key, node_text, raw_json)
-                        VALUES (?,?,?,?,?,?)
-                    """, (
-                        diff_id, "added",
-                        node.get("class"), node.get("key"),
-                        node.get("text"),
-                        json.dumps(item, ensure_ascii=False)
-                    ))
-
-                conn.commit()
+                try:
+                    with get_conn_cm() as conn:
+                        with conn.cursor() as c:
+                            for item in added_all:
+                                node = item.get("node", {})
+                                c.execute("""
+                                    INSERT INTO diff_items (
+                                        diff_id, action, node_class, node_key, node_text, raw_json
+                                    )
+                                    VALUES (%s, %s, %s, %s, %s, %s)
+                                """, (
+                                    diff_id,
+                                    "added",
+                                    node.get("class"),
+                                    node.get("key"),
+                                    node.get("text"),
+                                    json.dumps(item, ensure_ascii=False)
+                                ))
+                            conn.commit()
+                except Exception as e:
+                    logger.error(f"❌ Error insertando diff_items: {e}")
 
                 logger.info(f"🧩 Guardado cambio ({diff_signature[:8]}) en screen_diffs")
-
         else:
             logger.info(f"🧩 Sin cambios detectados para {s_name}")
 
     except Exception as e:
         logger.exception(f"❌ Error guardando diff en screen_diffs: {e}")
+
 
 
     # --------------------------------------
@@ -2870,7 +2716,7 @@ async def analyze_and_train(event: AccessibilityEvent):
         get_sequence_from_db
     )
 
-    ENABLE_FLOW_VALIDATION = True  # puedes apagarlo según config
+    ENABLE_FLOW_VALIDATION = True  # Puedes apagarlo según config
 
     if ENABLE_FLOW_VALIDATION:
         try:
@@ -2882,9 +2728,8 @@ async def analyze_and_train(event: AccessibilityEvent):
             if len(seq) < 2:
                 logger.info(f"🔹 Secuencia demasiado corta para validar flujo: {seq}")
             else:
-
                 flow_trees = FLOW_MODELS.get(app_name, {})
-                
+
                 result = validate_flow_sequence(flow_trees, seq)
                 if result["valid"]:
                     logger.info(f"✅ Flujo válido: {seq}")
@@ -2892,9 +2737,7 @@ async def analyze_and_train(event: AccessibilityEvent):
                     logger.warning(f"⚠️ Flujo anómalo ({result['reason']}) → {seq}")
 
         except Exception as e:
-            logger.error(f"Error al validar flujo: {e}")
-
-
+            logger.error(f"❌ Error al validar flujo: {e}")
 
     # -------------------- 8. Retornar métricas --------------------
     added_count = len(diff_result.get("added", []))
@@ -2904,88 +2747,108 @@ async def analyze_and_train(event: AccessibilityEvent):
 
 
 def _insert_diff_trace(tester_id, build_id, screen_normalized, message):
-    with sqlite3.connect(DB_NAME,timeout=30, check_same_thread=False) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        c = conn.cursor()
-        exists = c.execute("""
-            SELECT 1 FROM diff_trace
-            WHERE tester_id=? AND build_id=? AND screen_name=? AND message=?
-            LIMIT 1
-        """, (tester_id, build_id, screen_normalized, message)).fetchone()
-        if not exists:
-            c.execute("""
-                INSERT INTO diff_trace (tester_id, build_id, screen_name, message)
-                VALUES (?, ?, ?, ?)
-            """, (tester_id, build_id, screen_normalized, message))
-            conn.commit()
-            logger.info(f"📝 Trace guardado: {message}")
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+                # Verificar si ya existe
+                c.execute("""
+                    SELECT 1 FROM diff_trace
+                    WHERE tester_id = %s
+                    AND build_id = %s
+                    AND screen_name = %s
+                    AND message = %s
+                    LIMIT 1
+                """, (tester_id, build_id, screen_normalized, message))
+
+                exists = c.fetchone()
+
+                # Insertar solo si NO existe
+                if not exists:
+                    c.execute("""
+                        INSERT INTO diff_trace (tester_id, build_id, screen_name, message)
+                        VALUES (%s, %s, %s, %s)
+                    """, (tester_id, build_id, screen_normalized, message))
+
+                    conn.commit()
+                    logger.info(f"📝 Trace guardado: {message}")
+
+    except Exception as e:
+        logger.error(f"❌ Error insertando en diff_trace: {e}")
+
+
+
 
  
-
-
 def update_diff_trace(tester_id: str, build_id: str, screen: str, changes: list) -> None:
     """
-    Actualiza la tabla diff_trace:
-      - Si hay cambios, borra registros "No hay cambios" y agrega cada cambio.
-      - Si no hay cambios, asegura que quede un único registro "No hay cambios".
+    PostgreSQL version:
+      - Si hay cambios → borra "No hay cambios" y agrega nuevos evitando duplicados.
+      - Si NO hay cambios → borra otros mensajes y deja solo "No hay cambios".
     """
     screen_normalized = normalize_header(screen)
 
-    with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        c = conn.cursor()
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+                if changes:
+                    # ❌ borrar mensajes "No hay cambios"
+                    c.execute("""
+                        DELETE FROM diff_trace
+                        WHERE tester_id = %s AND build_id = %s AND screen_name = %s
+                        AND message = 'No hay cambios'
+                    """, (tester_id, build_id, screen_normalized))
 
-        if changes:
-            # Eliminar registros "No hay cambios" para este tester/pantalla/build
-            c.execute("""
-                DELETE FROM diff_trace
-                WHERE tester_id=? AND build_id=? AND screen_name=? AND message='No hay cambios'
-            """, (tester_id, build_id, screen_normalized))
+                    # insertar cambios evitando duplicados
+                    for ch in changes:
+                        c.execute("""
+                            INSERT INTO diff_trace (tester_id, build_id, screen_name, message)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT DO NOTHING
+                        """, (tester_id, build_id, screen_normalized, ch))
 
-            # Insertar cada cambio, ignorando duplicados automáticamente
-            for ch in changes:
-                c.execute("""
-                    INSERT OR IGNORE INTO diff_trace (tester_id, build_id, screen_name, message)
-                    VALUES (?, ?, ?, ?)
-                """, (tester_id, build_id, screen_normalized, ch))
+                else:
+                    # borrar todo excepto "No hay cambios"
+                    c.execute("""
+                        DELETE FROM diff_trace
+                        WHERE tester_id = %s AND build_id = %s AND screen_name = %s
+                        AND message <> 'No hay cambios'
+                    """, (tester_id, build_id, screen_normalized))
 
-        else:
-            # Borrar otros mensajes distintos de "No hay cambios"
-            c.execute("""
-                DELETE FROM diff_trace
-                WHERE tester_id=? AND build_id=? AND screen_name=? AND message <> 'No hay cambios'
-            """, (tester_id, build_id, screen_normalized))
+                    # insertar "No hay cambios" si no existe
+                    c.execute("""
+                        INSERT INTO diff_trace (tester_id, build_id, screen_name, message)
+                        VALUES (%s, %s, %s, 'No hay cambios')
+                        ON CONFLICT DO NOTHING
+                    """, (tester_id, build_id, screen_normalized))
 
-            # Asegurar que exista solo un registro "No hay cambios"
-            c.execute("""
-                INSERT OR IGNORE INTO diff_trace (tester_id, build_id, screen_name, message)
-                VALUES (?, ?, ?, 'No hay cambios')
-            """, (tester_id, build_id, screen_normalized))
+                conn.commit()
 
-        conn.commit()
+    except Exception as e:
+        logger.error(f"❌ Error en update_diff_trace: {e}")
 
-
-def last_hash_for_screen(tester_id: Optional[str],
-                         screen_name: Optional[str]) -> Optional[str]:
+def last_hash_for_screen(tester_id: Optional[str], screen_name: Optional[str]) -> Optional[str]:
     """
     Devuelve el último screens_id guardado para un tester/pantalla.
     Útil para saber si la pantalla ya fue procesada.
     """
-    conn = sqlite3.connect(DB_NAME)
     try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT screens_id
-            FROM accessibility_data
-            WHERE IFNULL(tester_id,'') = IFNULL(?, '')
-              AND IFNULL(screen_names,'') = IFNULL(?, '')
-            ORDER BY created_at DESC
-            LIMIT 1
-        """, (tester_id or "", screen_name or ""))
-        row = cursor.fetchone()
-        return row[0] if row else None
-    finally:
-        conn.close()
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT screens_id
+                    FROM accessibility_data
+                    WHERE COALESCE(tester_id, '') = COALESCE(%s, '')
+                    AND COALESCE(screen_names, '') = COALESCE(%s, '')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (tester_id or "", screen_name or ""))
+                
+                row = c.fetchone()
+                return row[0] if row else None
+
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo last_hash_for_screen: {e}")
+        return None
         
         
 # =========================================================
@@ -3008,10 +2871,6 @@ def normalize_node(node: Dict) -> Dict:
     """Filtra claves estables sin destruir los tipos."""
     return {k: node.get(k, None) for k in SAFE_KEYS}     
 
-# def normalize_tree(nodes: List[Dict]) -> List[Dict]:
-#     """Normaliza y ordena la lista de nodos para que el orden no afecte el hash."""
-#     normalized = [normalize_node(n) for n in nodes]
-#     return sorted(normalized, key=lambda n: (n["className"], n["text"]))
 
 def normalize_tree(nodes: List[Dict]) -> List[Dict]:
     """Normaliza y ordena la lista de nodos para que el orden no afecte el hash."""
@@ -3060,12 +2919,6 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
         screen_id_short = extract_short_screen_id(semantic_screen_id)
         semantic_screen_id_ctf.set(screen_id_short)
 
-        # 3. Recuperar EL VALOR REAL
-        #semantic_screen_id_value = semantic_screen_id_ctf.get()
-
-        # 4. Ahora sí llamar a extract_model_key()
-       # model_key2 = extract_model_key(semantic_screen_id_value)
-
         # -------------------- 2) Firmas estables (aquí adentro ya se normaliza) -------
         signatures = stable_signatures(raw_nodes, header_text=event.header_text or "")
         global_signature = signatures["global_signature"]
@@ -3104,64 +2957,89 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
             root_class_name = "SplashActivity"
 
         # -------------------- 7) Verificar si ya existe --------------------
+
         do_insert = True
-        with sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            cursor = conn.cursor()
 
-            existing = cursor.execute(
-                """
-                SELECT 1 FROM accessibility_data
-                WHERE tester_id=? AND build_id=? AND global_signature=? AND partial_signature=?
-                """,
-                (tester_norm, build_norm, global_signature, partial_signature),
-            ).fetchone()
+        with get_conn_cm() as conn:
+            with conn.cursor() as cursor:
 
-            if existing:
-                do_insert = False
+                cursor.execute("""
+                    SELECT 1 
+                    FROM accessibility_data
+                    WHERE tester_id = %s
+                        AND build_id = %s
+                        AND global_signature = %s
+                        AND partial_signature = %s
+                """, (
+                    tester_norm,
+                    build_norm,
+                    global_signature,
+                    partial_signature
+                ))
 
-            # -------------------- 8) Insertar solo si hay cambios --------------------
-            if do_insert:
-                cursor.execute(
-                    """
+                existing = cursor.fetchone()
+
+                if existing:
+                    return JSONResponse(
+                        status_code=208,
+                        content={
+                            "status": "ignored",
+                            "reason": "duplicate_screen_event",
+                            "inserted": False,
+                        }
+                    )
+                
+                # do_insert = False
+
+        # -------------------- Insertar solo si no existe --------------------
+        
+                # if do_insert:
+                    #event_ts = datetime.fromtimestamp(event.timestamp) if event.timestamp is not None else None
+                event_ts = datetime.fromtimestamp(event.timestamp / 1000) if event.timestamp else None
+
+                cursor.execute("""
                     INSERT INTO accessibility_data (
                         tester_id, build_id, is_baseline, timestamp, event_type, event_type_name,
-                        package_name, class_name, text, content_description, screens_id,screens_id_short,
+                        package_name, class_name, text, content_description, screens_id, screens_id_short,
                         screen_names, header_text, collect_node_tree, global_signature,
-                        partial_signature, scroll_type, additional_info, tree_data,
-                        session_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        tester_norm,
-                        build_norm,
-                        1 if baseline_flag else 0, 
-                        event.timestamp,
-                        event.event_type,
-                        event.event_type_name,
-                        event.package_name,
-                        root_class_name,
-                        event.text,
-                        event.content_description,
-                        screens_id_val,
-                        screens_id_short,
-                        event.screen_names,
-                        header_text,
-                        # 🔥 GUARDA RAW NODES, NO NORMALIZADOS
-                        json.dumps(raw_nodes, ensure_ascii=False),
+                        partial_signature, scroll_type, additional_info, tree_data, session_key
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s
+                    )
+                    RETURNING id
+                """, (
+                    tester_norm,
+                    build_norm,
+                    bool(baseline_flag),
+                    event_ts,
+                    int(event.event_type) if event.event_type is not None else None,
+                        # event.event_type,
+                    event.event_type_name,
+                    event.package_name,
+                    root_class_name,
+                    event.text,
+                    event.content_description,
+                    screens_id_val,
+                    screens_id_short,
+                    event.screen_names,
+                    header_text,
+                    json.dumps(raw_nodes, ensure_ascii=False),
+                    global_signature,
+                    partial_signature,
+                    scroll_type,
+                    json.dumps(event.additional_info or {}, ensure_ascii=False),
+                    json.dumps(event.tree_data or [], ensure_ascii=False),
+                    event.session_key,
+                ))
 
-                        global_signature,
-                        partial_signature,
-                        scroll_type,
-                        json.dumps(event.additional_info or {}, ensure_ascii=False),
-                        json.dumps(event.tree_data or [], ensure_ascii=False),
-                        event.session_key,
-                    ),
-                )
+                inserted_id = cursor.fetchone()[0]
                 conn.commit()
-
-            inserted_id = cursor.lastrowid
-            # logger.info("[collect] Insert completado (nuevo build o cambios detectados).")
+            # else:
+            #     inserted_id = None
 
         # -------------------- 9) Encolar para análisis --------------------
         await event_queue.put((event, do_insert, partial_signature))
@@ -3186,7 +3064,6 @@ async def collect_event(event: AccessibilityEvent, background_tasks: BackgroundT
         logger.error(f"Error en /collect: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
  
-
 async def worker_process_queue():
     while True:
         batch = []
@@ -3218,17 +3095,22 @@ async def worker_process_queue():
                         continue
                     last_processed[key] = now
 
-                    # -------------------- Solo analizar si insertó o cambio de snapshot --------------------
+                    # -------------------- Solo analizar si no insertó --------------------
                     if not inserted:
-                        # Revisar si la última versión en DB es idéntica
-                        with sqlite3.connect(DB_NAME) as conn:
-                            existing_sig = conn.execute(
-                                "SELECT signature FROM accessibility_data WHERE tester_id=? AND build_id=? ORDER BY created_at DESC LIMIT 1",
-                                (tester_norm, build_norm)
-                            ).fetchone()
-                            if existing_sig and existing_sig[0] == signature:
-                                logger.debug(f"[worker] No cambios reales detectados para {tester_norm}/{screen_name}")
-                                continue
+                        with get_conn_cm() as conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute("""
+                                    SELECT signature 
+                                    FROM accessibility_data
+                                    WHERE tester_id = %s AND build_id = %s
+                                    ORDER BY created_at DESC
+                                    LIMIT 1
+                                """, (tester_norm, build_norm))
+                                existing_sig = cursor.fetchone()
+
+                                if existing_sig and existing_sig[0] == signature:
+                                    logger.debug(f"[worker] No cambios reales detectados para {tester_norm}/{screen_name}")
+                                    continue  # <--- dentro del with, correcto
 
                     # -------------------- Ejecutar análisis y métricas --------------------
                     has_changes, added_count, removed_count, modified_count = await analyze_and_train(ev)
@@ -3251,6 +3133,7 @@ async def worker_process_queue():
 
         await asyncio.sleep(0.01)
 
+
 @app.get("/status")
 async def get_status(
     testerId: Optional[str] = Query(None),
@@ -3264,42 +3147,66 @@ async def get_status(
         except Exception:
             return []
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    try:
+        # Usar context manager para conexión y cursor
+        with get_conn_cm() as conn:
+            with conn.cursor() as cursor:  # <-- usar 'cursor' consistente
+                query = """
+                    SELECT s.id,
+                        s.header_text,
+                        s.removed,
+                        s.added,
+                        s.modified,
+                        s.created_at
+                    FROM screen_diffs AS s
+                    LEFT JOIN diff_approvals AS a
+                        ON a.diff_id = s.id
+                    WHERE a.id IS NULL
+                """
 
-    query = """
-        SELECT s.id,
-               s.header_text,
-               s.removed,
-               s.added,
-               s.modified,
-               s.created_at
-        FROM screen_diffs AS s
-        LEFT JOIN diff_approvals AS a
-               ON a.diff_id = s.id     
-        WHERE a.id IS NULL
-    """
-    clauses, params = [], []
+                clauses = []
+                params = []
 
-    if testerId:
-        clauses.append("s.tester_id = ?")
-        params.append(testerId)
-    if buildId:
-        clauses.append("s.build_id = ?")
-        params.append(buildId)
-    if screenName:
-        clauses.append("s.header_text = ?")
-        params.append(screenName)
+                if testerId:
+                    clauses.append("s.tester_id = %s")
+                    params.append(testerId)
 
-    if clauses:
-        query += " AND " + " AND ".join(clauses)
+                if buildId:
+                    clauses.append("s.build_id = %s")
+                    params.append(buildId)
 
-    query += " ORDER BY s.created_at DESC LIMIT ?"
-    params.append(limit)
+                if screenName:
+                    clauses.append("s.header_text = %s")
+                    params.append(screenName)
 
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
-    conn.close()
+                if clauses:
+                    query += " AND " + " AND ".join(clauses)
+
+                # LIMIT en PostgreSQL
+                query += " ORDER BY s.created_at DESC LIMIT %s"
+                params.append(limit)
+
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+
+                # Opcional: convertir los resultados a lista de dicts
+                results = [
+                    {
+                        "id": r[0],
+                        "header_text": r[1],
+                        "removed": safe_json(r[2]),
+                        "added": safe_json(r[3]),
+                        "modified": safe_json(r[4]),
+                        "created_at": r[5].isoformat() if r[5] else None
+                    }
+                    for r in rows
+                ]
+
+                return {"status": "ok", "data": results}
+
+    except Exception as e:
+        logger.error(f"[status] Error consultando screen_diffs: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}\
 
     # Construcción de diffs
     diffs = []
@@ -3322,14 +3229,19 @@ async def get_status(
 
     return {"status": "changes", "diffs": diffs}
 
+
 @app.get("/train/general")
 async def trigger_general_train(
     app_name: str = Query(..., description="Nombre de la aplicación"),
     batch_size: int = Query(1000, ge=1, description="Tamaño máximo de muestras para entrenar"),
     min_samples: int = Query(2, ge=1, description="Mínimo de muestras por pantalla para poder entrenar"),
     # update_general: bool = Query(True, description="Forzar entrenamiento general híbrido")
-    update_general: bool = Query(True, description="Usar modelo general como base")
-):    
+    update_general: bool = Query(True, description="Usar modelo general como base"),
+    enriched_vector: Optional[List[float]] = Query(None, description="Vector enriquecido actual"),
+    tester_id: str = Query("general", description="Identificador del tester"),
+    build_id: str = Query("general", description="ID del build o versión de la app"),
+    screen_id: str = Query("general", description="ID de la pantalla actual") ,
+):
     """
     Endpoint para disparar el entrenamiento general híbrido por aplicación.
     Llama a _train_general_logic_hybrid con los parámetros especificados.
@@ -3338,8 +3250,13 @@ async def trigger_general_train(
         app_name=app_name,
         batch_size=batch_size,
         min_samples=min_samples,
-        update_general=update_general
+        use_general_as_base=update_general,
+        enriched_vector=enriched_vector,      # o el vector real
+        tester_id=tester_id,
+        build_id=build_id,
+        screen_id=screen_id
     )
+
 
     return {
         "status": "success",
@@ -3430,27 +3347,43 @@ def ci_check_diff(req: CIRequest):
                 "status": "forbidden",
                 "message": "Subscription inactive or not found."
             })
+        
+        try:
+            #cur = conn.cursor()
 
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
+            with get_conn_cm() as conn:
+                with conn.cursor() as c:
+                    params = [req.tester_id, req.build_id]
 
-        params = [req.tester_id, req.build_id]
-        query = """
-            SELECT id, screen_name, overlap_ratio, ui_structure_similarity, diff_priority, created_at
-            FROM screen_diffs
-            WHERE tester_id=? AND build_id=?
-        """
+                    query = """
+                        SELECT id,
+                            screen_name,
+                            overlap_ratio,
+                            ui_structure_similarity,
+                            diff_priority,
+                            created_at
+                        FROM screen_diffs
+                        WHERE tester_id = %s
+                        AND build_id   = %s
+                    """
 
-        if req.screens:
-            placeholders = ",".join("?" for _ in req.screens)
-            query += f" AND screen_name IN ({placeholders})"
-            params.extend(req.screens)
+                    # Screens → IN (%s, %s, %s)
+                    if req.screens:
+                        placeholders = ",".join(["%s"] * len(req.screens))
+                        query += f" AND screen_name IN ({placeholders})"
+                        params.extend(req.screens)
 
-        query += " ORDER BY created_at DESC LIMIT ?"
-        params.append(req.max_results)
+                    # LIMIT también usa %s
+                    query += " ORDER BY created_at DESC LIMIT %s"
+                    params.append(req.max_results)
 
-        rows = cur.execute(query, params).fetchall()
-        conn.close()
+                    c.execute(query, params)
+                    rows = c.fetchall()
+
+        # finally:
+        #     release_conn(conn)
+        except Exception as e:
+            logger.error(f"❌ Error : {e}")
 
         if not rows:
             return {"status": "pass", "severity": 0.0, "message": "No diffs detected", "diffs": []}
@@ -3526,61 +3459,64 @@ def get_screen_diffs(
     only_rejected: bool = Query(False)
 ):
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    # 📌 Obtener conexión correctamente, sin finally
+    with get_conn_cm() as conn:
+        with conn.cursor() as c:
 
-    # 🔹 QUERY MEJORADA: incluye JOIN a diff_rejections
-    query = """
-        SELECT 
-            s.id, 
-            s.tester_id, 
-            s.build_id, 
-            s.screen_name, 
-            s.header_text,
-            s.removed, 
-            s.added, 
-            s.modified, 
-            s.text_diff, 
-            s.created_at, 
-            s.cluster_info,
-            CASE 
-                WHEN a.id IS NOT NULL THEN 'approved'
-                WHEN r.id IS NOT NULL THEN 'rejected'
-                ELSE 'pending'
-            END AS approval_status,
-            a.created_at AS approved_at,
-            r.created_at AS rejected_at,
-            r.rejection_reason
-        FROM screen_diffs AS s
-        LEFT JOIN diff_approvals AS a ON a.diff_id = s.id
-        LEFT JOIN diff_rejections AS r ON r.diff_id = s.id
-        WHERE 1=1
-    """
-    params = []
+            query = """
+                SELECT 
+                    s.id, 
+                    s.tester_id, 
+                    s.build_id, 
+                    s.screen_name, 
+                    s.header_text,
+                    s.removed, 
+                    s.added, 
+                    s.modified, 
+                    s.text_diff, 
+                    s.created_at, 
+                    s.cluster_info,
+                    CASE 
+                        WHEN a.id IS NOT NULL THEN 'approved'
+                        WHEN r.id IS NOT NULL THEN 'rejected'
+                        ELSE 'pending'
+                    END AS approval_status,
+                    a.created_at AS approved_at,
+                    r.created_at AS rejected_at,
+                    r.rejection_reason
+                FROM screen_diffs AS s
+                LEFT JOIN diff_approvals AS a ON a.diff_id = s.id
+                LEFT JOIN diff_rejections AS r ON r.diff_id = s.id
+                WHERE 1=1
+            """
 
-    # 🔹 FILTRO DE ESTADO MEJORADO
-    if only_pending:
-        query += " AND a.id IS NULL AND r.id IS NULL"
-    elif only_approved:
-        query += " AND a.id IS NOT NULL"
-    elif only_rejected:
-        query += " AND r.id IS NOT NULL"
+            params: list = []
 
-    # 🔹 FILTRO TESTER_ID SIMPLIFICADO
-    if tester_id is not None and tester_id != "":
-        query += " AND s.tester_id = ?"
-        params.append(tester_id)
+            # 🔹 FILTRO DE ESTADO
+            if only_pending:
+                query += " AND a.id IS NULL AND r.id IS NULL"
+            elif only_approved:
+                query += " AND a.id IS NOT NULL"
+            elif only_rejected:
+                query += " AND r.id IS NOT NULL"
 
-    # 🔹 FILTRO HEADER_TEXT MEJORADO
-    if header_text is not None and header_text != "":
-        query += " AND LOWER(TRIM(s.header_text)) LIKE LOWER(TRIM(?))"
-        params.append(f"%{header_text.strip()}%")
+            # 🔹 FILTER tester_id
+            if tester_id:
+                query += " AND s.tester_id = %s"
+                params.append(tester_id)
 
-    query += " ORDER BY s.created_at DESC LIMIT 1000"
+            # 🔹 FILTER header_text (ILIKE opcional)
+            if header_text:
+                query += " AND LOWER(TRIM(s.header_text)) LIKE LOWER(TRIM(%s))"
+                params.append(f"%{header_text.strip()}%")
 
-    cursor.execute(query, tuple(params))
-    rows = cursor.fetchall()
-    conn.close()
+            query += " ORDER BY s.created_at DESC LIMIT 1000"
+
+            c.execute(query, params)
+            rows = c.fetchall()
+
+    # 📌 A partir de aquí ya NO estás dentro del with
+    #     la conexión YA está liberada correctamente
 
     # 🧮 Filtro de build_id semántico (menor o igual)
     if build_id is not None:
@@ -3591,7 +3527,7 @@ def get_screen_diffs(
             for r in rows:
                 r_build_str = extract_numeric_version(str(r[2]))
                 if not r_build_str:
-                    continue  # ignora los registros sin versión válida
+                    continue
                 try:
                     if version.parse(r_build_str) <= build_ver:
                         filtered_rows.append(r)
@@ -3606,9 +3542,6 @@ def get_screen_diffs(
             return []
 
     # --- Función auxiliar para generar el resumen elegante ---
-    from io import StringIO
-
-
     def capture_pretty_summary(removed_all, added_all, modified_all, text_diff):
         lines = []
 
@@ -3621,42 +3554,34 @@ def get_screen_diffs(
                 or node.get("key", "")
             )
 
-        # --- Eliminados ---
         for node in removed_all:
             text = format_node_text(node)
             lines.append(f"🗑️ {node.get('class','unknown')} eliminado: “{text}”")
 
-        # --- Agregados ---
         for node in added_all:
             text = format_node_text(node)
             lines.append(f"🆕 {node.get('class','unknown')} agregado: “{text}”")
 
-        # --- Modificados ---
         for change in modified_all:
             node = change.get("node", {})
             changes = change.get("changes", {})
-
             if not changes:
                 text = format_node_text(node)
                 lines.append(f"✏️ {node.get('class','unknown')} sin cambios visibles: “{text}”")
                 continue
 
             for attr, vals in changes.items():
-                # Manejar si vals no es un dict (por ejemplo, str, bool, int)
                 if isinstance(vals, dict):
                     old = vals.get("old")
                     new = vals.get("new")
                 else:
                     old = new = vals
-                    new = vals
 
-                # Simplificar estructuras grandes
                 if isinstance(old, str) and old.startswith("{"): old = "(estructura)"
                 if isinstance(new, str) and new.startswith("{"): new = "(estructura)"
 
                 lines.append(f"✏️ {node.get('class','unknown')} modificado ({attr}): “{old}” → “{new}”")
 
-        # --- Si no hay líneas ---
         if not lines:
             if isinstance(text_diff, dict) and "header_changed" in text_diff:
                 before = text_diff["header_changed"].get("before", "")
@@ -3667,10 +3592,10 @@ def get_screen_diffs(
 
         return "\n".join(lines)
 
+    # ----------- Resto del código SIN cambios -----------
+    # (todo estaba bien indentado a partir de aquí)
+    # ----------------------------------------------------
 
-
-
-    # --- Construir lista de diffs ---
     diffs = []
     traces_to_batch = []
 
@@ -3782,6 +3707,13 @@ def get_screen_diffs(
         rejected_at = row[13] if len(row) > 13 else None
         rejection_reason = row[14] if len(row) > 14 else None
 
+        pretty_summary = capture_pretty_summary(
+            removed,
+            added,
+            modified,
+            text_diff
+        )
+        
         diffs.append({
             "id": row[0],
             "tester_id": row[1],
@@ -3796,6 +3728,7 @@ def get_screen_diffs(
             "modified": modified,
             "text_diff": text_diff,
             "text_overlap": overlap_ratio,
+            "pretty_summary": pretty_summary,
             "screen_status": screen_status,
             "detailed_changes": detailed_changes,
             "created_at": row[9],
@@ -3865,72 +3798,89 @@ async def screen_exists(buildId: str = Query(...)):
     Devuelve {"exists": true/false} si hay al menos una fila
     en accessibility_data con build_id <= buildId.
     """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
 
-    cursor.execute("""
-        SELECT 1 FROM accessibility_data
-        WHERE CAST(build_id AS INTEGER) <= CAST(? AS INTEGER)
-        LIMIT 1
-    """, (buildId,))
+    with get_conn_cm() as conn:
+	    with conn.cursor() as c:
+                c.execute("""
+                    SELECT 1 FROM accessibility_data
+                    WHERE CAST(build_id AS INTEGER) <= CAST(%s AS INTEGER)
+                    LIMIT 1
+                """, (buildId,))
 
-    row = cursor.fetchone()
-    conn.close()
+                row = c.fetchone()
 
+    # finally:
+    #     release_conn(conn)
+        
     return {"exists": bool(row)}
-    
+
 @app.post("/approve_diff")
 async def approve_diff(request: Request):
     """
     Espera JSON: {"diff_id": <id>} o {"diff_id": "11"}.
-    Registra la aprobación en DB y devuelve resultado.
+    Registra la aprobación en PostgreSQL y devuelve estado.
     """
-    # --- 1. Leer JSON ---
+
+    # --- Leer JSON ---
     try:
         payload = await request.json()
     except ValueError:
-        raise HTTPException(status_code=400, detail="Cuerpo JSON inválido o vacío")
+        raise HTTPException(status_code=400, detail="JSON inválido o vacío")
 
-    # --- 2. Validar diff_id ---
     diff_id = payload.get("diff_id") or payload.get("id")
     if diff_id is None:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "diff_id missing"})
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "diff_id missing"}
+        )
 
     try:
         diff_id_int = int(diff_id)
     except (TypeError, ValueError):
-        return JSONResponse(status_code=400, content={"status": "error", "message": "diff_id must be integer"})
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "diff_id must be integer"}
+        )
 
-    # --- 3. Guardar en DB ---
+    # --- DB ---
     try:
-        conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
-        cursor = conn.cursor()
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
 
-        # Crear tabla si no existe
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS diff_approvals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                diff_id INTEGER,
-                approved INTEGER DEFAULT 1,
-                approved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+                # Crear tabla si no existe (solo PostgreSQL)
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS diff_approvals (
+                        id SERIAL PRIMARY KEY,
+                        diff_id INTEGER NOT NULL,
+                        approved BOOLEAN DEFAULT TRUE,
+                        approved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
 
-        # Verificar si ya está aprobado
-        cursor.execute("SELECT 1 FROM diff_approvals WHERE diff_id = ?", (diff_id_int,))
-        if cursor.fetchone():
-            return {"status": "already_approved", "diff_id": diff_id_int}
+                # Verificar si ya está aprobado
+                c.execute(
+                    "SELECT 1 FROM diff_approvals WHERE diff_id = %s",
+                    (diff_id_int,)
+                )
+                if c.fetchone():
+                    return {"status": "already_approved", "diff_id": diff_id_int}
 
-        # Insertar aprobación
-        cursor.execute("INSERT INTO diff_approvals(diff_id, approved) VALUES (?, 1)", (diff_id_int,))
-        conn.commit()
+                # Insertar aprobación
+                c.execute(
+                    "INSERT INTO diff_approvals(diff_id, approved) VALUES (%s, TRUE)",
+                    (diff_id_int,)
+                )
+                conn.commit()
+
+                return {"status": "approved", "diff_id": diff_id_int}
 
     except Exception as db_err:
-        logger.exception("Error de base de datos en /approve_diff")
-        raise HTTPException(status_code=500, detail=f"DB error: {db_err}")
-    finally:
-        conn.close()
+        logger.exception("❌ Error en /approve_diff")
+        raise HTTPException(
+            status_code=500,
+            detail=f"DB error: {db_err}"
+        )
 
     logger.info("✅ Diff %s aprobado vía API", diff_id_int)
     return {"status": "success", "diff_id": diff_id_int}
@@ -3964,28 +3914,28 @@ async def reject_diff(request: Request):
             content={"status": "error", "message": "diff_id must be integer"},
         )
 
-    # --- 3. Guardar en la base de datos ---
     try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS diff_rejections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                diff_id INTEGER,
-                rejection_reason TEXT,       
-                rejected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("INSERT INTO diff_rejections(diff_id) VALUES (?)", (diff_id_int,))
-        conn.commit()
+        with get_conn_cm() as conn:
+	        with conn.cursor() as c:
+
+        # Insertar el rechazo
+                    c.execute(
+                        """
+                        INSERT INTO diff_rejections(diff_id)
+                        VALUES (%s)
+                        """,
+                        (diff_id_int,)
+                    )
+
+                    conn.commit()
+
     except Exception as db_err:
         logger.exception("Error de base de datos en /reject_diff")
         raise HTTPException(status_code=500, detail=f"DB error: {db_err}")
-    finally:
-        conn.close()
 
     logger.info("Diff %s rechazado vía API", diff_id_int)
     return {"status": "success", "diff_id": diff_id_int}
+
 
 @app.post("/cleanup_diffs")
 async def cleanup_diffs(older_than_days: int = 90):
@@ -3997,36 +3947,36 @@ async def cleanup_diffs(older_than_days: int = 90):
 
     cutoff = datetime.utcnow() - timedelta(days=older_than_days)
     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with get_conn_cm() as conn:
+	        with conn.cursor() as c:
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
+        # Borrar diffs aprobados
+                    c.execute("""
+                        DELETE FROM screen_diffs sd
+                        USING diff_approvals a
+                        WHERE a.diff_id = sd.id
+                        AND sd.created_at < %s
+                    """, (cutoff_str,))
 
-    # Borrar diffs aprobados
-    c.execute("""
-        DELETE FROM screen_diffs
-        WHERE id IN (
-            SELECT s.id
-            FROM screen_diffs s
-            JOIN diff_approvals a ON a.diff_id = s.id
-            WHERE s.created_at < ?
-        )
-    """, (cutoff_str,))
+                    # Borrar diffs rechazados
+                    c.execute("""
+                        DELETE FROM screen_diffs sd
+                        USING diff_rejections r
+                        WHERE r.diff_id = sd.id
+                        AND sd.created_at < %s
+                    """, (cutoff_str,))
 
-    # Borrar diffs rechazados
-    c.execute("""
-        DELETE FROM screen_diffs
-        WHERE id IN (
-            SELECT s.id
-            FROM screen_diffs s
-            JOIN diff_rejections r ON r.diff_id = s.id
-            WHERE s.created_at < ?
-        )
-    """, (cutoff_str,))
+                    conn.commit()
 
-    conn.commit()
-    conn.close()
-    return {"status": "success", "message": f"Difs anteriores a {cutoff_str} eliminados."}
-    
+        return {
+            "status": "success",
+            "message": f"Difs anteriores a {cutoff_str} eliminados."
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.post("/cleanup_approvals_rejections")
 async def cleanup_approvals_rejections(older_than_days: int = 90):
     from datetime import datetime, timedelta
@@ -4035,91 +3985,133 @@ async def cleanup_approvals_rejections(older_than_days: int = 90):
     cutoff = datetime.utcnow() - timedelta(days=older_than_days)
     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
+    try:
+        with get_conn_cm() as conn:
+	        with conn.cursor() as c:
 
-    c.execute("DELETE FROM diff_approvals WHERE created_at < ?", (cutoff_str,))
-    c.execute("DELETE FROM diff_rejections WHERE created_at < ?", (cutoff_str,))
+                    # Eliminar aprobaciones antiguas
+                    c.execute(
+                        "DELETE FROM diff_approvals WHERE created_at < %s",
+                        (cutoff_str,)
+                    )
 
-    conn.commit()
-    conn.close()
-    return {"status": "success", "message": f"Approvals y rejections anteriores a {cutoff_str} eliminados."}
-    
-   
+                    # Eliminar rechazos antiguos
+                    c.execute(
+                        "DELETE FROM diff_rejections WHERE created_at < %s",
+                        (cutoff_str,)
+                    )
+
+                    conn.commit()
+
+        return {
+            "status": "success",
+            "message": f"Approvals y rejections anteriores a {cutoff_str} eliminados."
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @router.get("/reports/screen-changes")
-def screen_changes(build_id: str, db=Depends(get_db)):
-    rows = db.execute("""
-        SELECT screen_name, removed, added, modified, created_at
-        FROM screen_diffs
-        WHERE build_id = ?
-        ORDER BY created_at DESC
-    """, (build_id,)).fetchall()
+def screen_changes(build_id: str):
 
-    return [
-        {
-            "screen_name": r["screen_name"],
-            "removed": json.loads(r["removed"] or "[]"),
-            "added": json.loads(r["added"] or "[]"),
-            "modified": json.loads(r["modified"] or "[]"),
-            "timestamp": r["created_at"]
-        }
-        for r in rows
-    ]
-    
+    with get_conn_cm() as conn:
+	    with conn.cursor() as c:
+
+                c.execute("""
+                     SELECT screen_name, removed, added, modified, created_at
+                    FROM screen_diffs
+                    WHERE build_id = %s
+                    ORDER BY created_at DESC
+                """, (build_id,))
+
+                rows = c.fetchall()
+
+                # Transformar a diccionarios
+                result = []
+                for r in rows:
+                    result.append({
+                        "screen_name": r[0],
+                        "removed": json.loads(r[1] or "[]"),
+                        "added": json.loads(r[2] or "[]"),
+                        "modified": json.loads(r[3] or "[]"),
+                        "timestamp": r[4]
+                    })
+
+                return result
+
+
 @router.get("/reports/ui-stability")
-def ui_stability(
-    start_date: datetime,
-    end_date: datetime,
-    db=Depends(get_db)
-):
-    rows = db.execute("""
-        SELECT screen_name,
-               COUNT(*) as changes,
-               COUNT(DISTINCT build_id) as builds_affected
-        FROM screen_diffs
-        WHERE created_at BETWEEN ? AND ?
-        GROUP BY screen_name
-        ORDER BY changes DESC
-    """, (start_date, end_date)).fetchall()
+def ui_stability(start_date: datetime, end_date: datetime):
+    # conn = get_conn()
+    try:
+        # cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        with get_conn_cm() as conn:
+	        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
 
-    return [
-        {
-            "screen_name": r["screen_name"],
-            "total_changes": r["changes"],
-            "builds_affected": r["builds_affected"]
-        }
-        for r in rows
-    ]   
-    
+                    c.execute("""
+                        SELECT screen_name,
+                            COUNT(*) AS changes,
+                            COUNT(DISTINCT build_id) AS builds_affected
+                        FROM screen_diffs
+                        WHERE created_at BETWEEN %s AND %s
+                        GROUP BY screen_name
+                        ORDER BY changes DESC
+                    """, (start_date, end_date))
+
+                    rows = c.fetchall()
+
+                    # Devuelve lista de dicts directamente
+                    result = [
+                        {
+                            "screen_name": r["screen_name"],
+                            "total_changes": r["changes"],
+                            "builds_affected": r["builds_affected"]
+                        }
+                        for r in rows
+                    ]
+
+                    return result
+    except Exception as e:
+        logger.exception(f"Error en /reports/ui-stability: {e}")
+ 
+
 @router.get("/reports/capture-coverage")
-def capture_coverage(
-    base_build: str,
-    compare_build: str,
-    db=Depends(get_db)
-):
-    base = db.execute("""
-        SELECT DISTINCT screen_names
-        FROM accessibility_data
-        WHERE build_id = ?
-    """, (base_build,)).fetchall()
+def capture_coverage(base_build: str, compare_build: str):
 
-    comp = db.execute("""
-        SELECT DISTINCT screen_names
-        FROM accessibility_data
-        WHERE build_id = ?
-    """, (compare_build,)).fetchall()
+    try:
+        with get_conn_cm() as conn:
+	        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
 
-    base_screens = {r[0] for r in base}
-    comp_screens = {r[0] for r in comp}
+                    # Screens del build base
+                    c.execute("""
+                        SELECT DISTINCT screen_names
+                        FROM accessibility_data
+                        WHERE build_id = %s
+                    """, (base_build,))
+                    base = c.fetchall()
 
-    return {
-        "base_build": base_build,
-        "compare_build": compare_build,
-        "only_in_base": list(base_screens - comp_screens),
-        "only_in_compare": list(comp_screens - base_screens),
-        "common": list(base_screens & comp_screens)
-    }    
-    
+                    # Screens del build a comparar
+                    c.execute("""
+                        SELECT DISTINCT screen_names
+                        FROM accessibility_data
+                        WHERE build_id = %s
+                    """, (compare_build,))
+                    comp = c.fetchall()
+
+                    base_screens = {r["screen_names"] for r in base}
+                    comp_screens = {r["screen_names"] for r in comp}
+
+                    return {
+                        "base_build": base_build,
+                        "compare_build": compare_build,
+                        "only_in_base": list(base_screens - comp_screens),
+                        "only_in_compare": list(comp_screens - base_screens),
+                        "common": list(base_screens & comp_screens)
+                    }
+    except Exception as e:
+        logger.exception(f"Error en /reports/capture-coverage: {e}")
+        
 app.include_router(router)
         
 @app.websocket("/ws/status")
@@ -4135,7 +4127,6 @@ async def websocket_status(websocket: WebSocket):
 
 @router.post("/send-reset-code")
 def send_reset_code(req: ResetRequest):
-    #print(f"📩 Petición recibida desde Android: {req.email}")
     try:
         code = generate_code()
         codes_db[req.email] = {"code": code, "expires": time.time() + 300}  # 5 minutos
@@ -4153,38 +4144,37 @@ def send_reset_code(req: ResetRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al enviar correo: {e}")
 
+from fastapi import APIRouter, HTTPException
+
+router = APIRouter()
 
 @router.post("/reset-password")
 def reset_password(req: ResetPasswordRequest):
-    # Validar código desde SQLite (sin eliminarlo)
+    # Validar código desde PostgreSQL
     if not validate_code(req.email, req.code):
         raise HTTPException(status_code=400, detail="Código inválido o expirado")
 
     try:
-        # Actualizar la contraseña real en tu DB principal
-        #print(f"🔑 Password for {req.email} updated to: {req.new_password}")
-        # aquí iría tu lógica real de actualización en tu tabla de usuarios
 
         # Solo si la actualización es exitosa, eliminar el código
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("""
-            DELETE FROM password_reset_codes
-            WHERE email = ? AND code = ?
-        """, (req.email, req.code))
-        conn.commit()
-        conn.close()
+        with get_conn_cm() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    DELETE FROM password_reset_codes
+                    WHERE email = %s AND code = %s
+                """, (req.email, req.code))
+                conn.commit()
 
         return {"success": True, "message": "Contraseña actualizada correctamente"}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error actualizando contraseña: {e}")
-    
+
+
+router = APIRouter()
 
 @router.post("/create_code")
 async def create_code(usuario_id: str, duracion_dias: int = 30, usos_permitidos: int = 1):
-    import random, string, time, sqlite3
-
     chars = string.ascii_uppercase + string.digits
     prefix_char = random.choice(chars)
     device_prefix = ''.join(random.choices("0123456789ABCDEF", k=2))
@@ -4194,70 +4184,82 @@ async def create_code(usuario_id: str, duracion_dias: int = 30, usos_permitidos:
     generado_en = int(time.time())
     expira_en = generado_en + duracion_dias * 24 * 3600
 
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.execute("PRAGMA foreign_keys = ON;")
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
+    try:
 
         # 1️⃣ Verificar si el usuario tiene plan activo
-        plan = c.execute("""
-            SELECT id, plan_name, price, no_associate, max_tester
-            FROM active_plans
-            WHERE active = 1
-            ORDER BY id ASC LIMIT 1
-        """).fetchone()
+        with get_conn_cm() as conn:
+	        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                    c.execute("""
+                        SELECT id, plan_name, price, no_associate, max_tester
+                        FROM active_plans
+                        WHERE active = 1
+                        ORDER BY id ASC
+                        LIMIT 1
+                    """)
+                    plan = c.fetchone()
 
-        if plan:
-            plan_id = plan["id"]
-            price = plan["price"]
-            max_tester = plan["max_tester"]
+                    if plan:
+                        plan_id = plan["id"]
+                        price = plan["price"]
+                        max_tester = plan["max_tester"]
 
-            # Verificar si el usuario no ha superado su límite mensual (30 códigos)
-            codigos_mes = c.execute("""
-                SELECT COUNT(*) AS total FROM login_codes
-                WHERE usuario_id = ? AND plan_id = ? AND activo = 1
-            """, (usuario_id, plan_id)).fetchone()["total"]
+                        # Verificar límite mensual de códigos (30)
+                        c.execute("""
+                            SELECT COUNT(*) AS total
+                            FROM login_codes
+                            WHERE usuario_id = %s AND plan_id = %s AND activo = 1
+                        """, (usuario_id, plan_id))
+                        codigos_mes = c.fetchone()["total"]
 
-            if codigos_mes >= 30:
-                return {"success": False, "reason": "Límite de 30 códigos alcanzado este mes."}
+                        if codigos_mes >= 30:
+                            return {"success": False, "reason": "Límite de 30 códigos alcanzado este mes."}
 
-            costo = price
-            plan_tipo = plan["plan_name"]
+                        costo = price
+                        plan_tipo = plan["plan_name"]
 
-        else:
-            # Usuario sin plan activo
-            plan = c.execute("""
-                SELECT id, no_associate FROM active_plans
-                WHERE plan_name = 'BASIC'
-            """).fetchone()
-            if not plan:
-                return {"success": False, "reason": "No hay plan base configurado."}
+                    else:
+                        # Usuario sin plan activo → usar plan básico
+                        c.execute("""
+                            SELECT id, no_associate
+                            FROM active_plans
+                            WHERE plan_name = 'BASIC'
+                        """)
+                        plan = c.fetchone()
+                        if not plan:
+                            return {"success": False, "reason": "No hay plan base configurado."}
 
-            plan_id = plan["id"]
-            costo = plan["no_associate"]
-            plan_tipo = "NO_PLAN"
+                        plan_id = plan["id"]
+                        costo = plan["no_associate"]
+                        plan_tipo = "NO_PLAN"
 
-        # 2️⃣ Guardar el código generado
-        c.execute("""
-            INSERT INTO login_codes (codigo, usuario_id, plan_id, generado_en, expira_en, usos_permitidos, usos_actuales, activo)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (codigo, usuario_id, plan_id, generado_en, expira_en, usos_permitidos, 0, 1))
-        conn.commit()
+                    # 2️⃣ Guardar el código generado
+                    c.execute("""
+                        INSERT INTO login_codes (
+                            codigo, usuario_id, plan_id, generado_en, expira_en,
+                            usos_permitidos, usos_actuales, activo
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (codigo, usuario_id, plan_id, generado_en, expira_en, usos_permitidos, 0, 1))
 
-    return {
-        "success": True,
-        "codigo": codigo,
-        "plan": plan_tipo,
-        "costo_usd": costo,
-        "expira_en": expira_en,
-        "duracion_dias": duracion_dias
-    }
+                    conn.commit()
 
+                    return {
+                        "success": True,
+                        "codigo": codigo,
+                        "plan": plan_tipo,
+                        "costo_usd": costo,
+                        "expira_en": expira_en,
+                        "duracion_dias": duracion_dias
+                    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {e}")
+
+
+
+router = APIRouter()
 
 @router.post("/validate_code")
 async def validate_code(request: Request):
-    import time, sqlite3
     data = await request.json()
     codigo = data.get("codigo", "").strip().upper()
 
@@ -4266,47 +4268,55 @@ async def validate_code(request: Request):
 
     now = int(time.time())
 
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.execute("PRAGMA foreign_keys = ON;")
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
+    # conn = get_conn()
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+                cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        row = c.execute("""
-            SELECT l.*, a.plan_name
-            FROM login_codes l
-            LEFT JOIN active_plans a ON a.id = l.plan_id
-            WHERE l.codigo = ? AND l.activo = 1 AND l.is_paid = 1
-        """, (codigo,)).fetchone()
+                # Buscar el código
+                cursor.execute("""
+                    SELECT l.*, a.plan_name
+                    FROM login_codes l
+                    LEFT JOIN active_plans a ON a.id = l.plan_id
+                    WHERE l.codigo = %s AND l.activo = 1 AND l.is_paid = 1
+                """, (codigo,))
+                row = cursor.fetchone()
 
-        if not row:
-            return {"valid": False, "reason": "Código no encontrado"}
+                if not row:
+                    return {"valid": False, "reason": "Código no encontrado"}
 
-        if now > row["expira_en"]:
-            return {"valid": False, "reason": "Código expirado"}
+                if now > row["expira_en"]:
+                    return {"valid": False, "reason": "Código expirado"}
 
-        if row["usos_actuales"] >= row["usos_permitidos"]:
-            return {"valid": False, "reason": "Límite de usos alcanzado"}
+                if row["usos_actuales"] >= row["usos_permitidos"]:
+                    return {"valid": False, "reason": "Límite de usos alcanzado"}
 
-        # Incrementar uso
-        c.execute("""
-            UPDATE login_codes
-            SET usos_actuales = usos_actuales + 1
-            WHERE codigo = ?
-        """, (codigo,))
-        conn.commit()
+                # Incrementar uso
+                cursor.execute("""
+                    UPDATE login_codes
+                    SET usos_actuales = usos_actuales + 1
+                    WHERE codigo = %s
+                """, (codigo,))
+                conn.commit()
 
         restante = row["expira_en"] - now
 
-    return {
-        "valid": True,
-        "codigo": codigo,
-        "usuario_id": row["usuario_id"],
-        "plan": row["plan_name"],
-        "expira_en": row["expira_en"],
-        "restante_en_segundos": restante,
-        "usos_restantes": row["usos_permitidos"] - (row["usos_actuales"] + 1)
-    }
+        return {
+            "valid": True,
+            "codigo": codigo,
+            "usuario_id": row["usuario_id"],
+            "plan": row["plan_name"],
+            "expira_en": row["expira_en"],
+            "restante_en_segundos": restante,
+            "usos_restantes": row["usos_permitidos"] - (row["usos_actuales"] + 1)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {e}")
+    # finally:
+    #     release_conn(conn)
+
 
 def verificar_pago_externo(payment_token: str) -> bool:
     """
@@ -4333,66 +4343,79 @@ async def confirm_payment(request: Request):
 
     codigo = data.get("codigo")
     payment_token = data.get("payment_token")
-    usuario_id = data.get("usuario_id")  # 👈 agregado
+    usuario_id = data.get("usuario_id")
 
     if not codigo or not payment_token or not usuario_id:
         raise HTTPException(status_code=400, detail="Faltan parámetros requeridos")
 
-    # 1️⃣ Verificar que el código existe y pertenece al usuario
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        row = c.execute("""
-            SELECT * FROM login_codes 
-            WHERE codigo = ? AND usuario_id = ?
-        """, (codigo, usuario_id)).fetchone()
+    # conn = get_conn()
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+                cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        if not row:
-            raise HTTPException(status_code=404, detail="Código no encontrado o no pertenece al usuario")
-        if row["activo"] == 1:
-            raise HTTPException(status_code=400, detail="Código ya está activo o pagado")
+                # 1️⃣ Verificar que el código existe y pertenece al usuario
+                cursor.execute("""
+                    SELECT * FROM login_codes
+                    WHERE codigo = %s AND usuario_id = %s
+                """, (codigo, usuario_id))
+                row = cursor.fetchone()
 
-    # 2️⃣ Verificar pago (mock temporal)
-    pago_exitoso = verificar_pago_externo(payment_token)
+                if not row:
+                    raise HTTPException(status_code=404, detail="Código no encontrado o no pertenece al usuario")
+                if row["activo"] == 1:
+                    raise HTTPException(status_code=400, detail="Código ya está activo o pagado")
 
-    if not pago_exitoso:
-        return {"success": False, "reason": "Pago rechazado por el proveedor (mock)"}
+                # 2️⃣ Verificar pago (mock temporal)
+                pago_exitoso = verificar_pago_externo(payment_token)
+                if not pago_exitoso:
+                    return {"success": False, "reason": "Pago rechazado por el proveedor (mock)"}
 
-    # 3️⃣ Activar el código solo si pertenece al usuario correcto
-    with sqlite3.connect(DB_NAME) as conn:
-        c = conn.cursor()
-        c.execute("""
-            UPDATE login_codes
-            SET activo = 1
-            WHERE codigo = ? AND usuario_id = ?
-        """, (codigo, usuario_id))
-        conn.commit()
+                # 3️⃣ Activar el código solo si pertenece al usuario correcto
+                cursor.execute("""
+                    UPDATE login_codes
+                    SET activo = 1
+                    WHERE codigo = %s AND usuario_id = %s
+                """, (codigo, usuario_id))
+                conn.commit()
 
-    return {
-        "success": True,
-        "codigo": codigo,
-        "usuario_id": usuario_id,
-        "message": "✅ Pago confirmado y código activado correctamente"
-    }
+                return {
+                    "success": True,
+                    "codigo": codigo,
+                    "usuario_id": usuario_id,
+                    "message": "✅ Pago confirmado y código activado correctamente"
+                }
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {e}")    
 
 @router.get("/qa_summary/{build_id}")
-def qa_summary(build_id: str, db: sqlite3.Connection = Depends(get_db)):
-    rows = db.execute("""
-        SELECT screen_name, message
-        FROM diff_trace
-        WHERE build_id=? 
-        ORDER BY screen_name
-    """, (build_id,)).fetchall()
+def qa_summary(build_id: str):
+    # conn = get_conn()
 
-    summary = {}
-    for r in rows:
-        screen = r["screen_name"]
-        summary.setdefault(screen, []).append(r["message"])
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as  cursor:
+        # cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-    return JSONResponse(content=summary)
+                cursor.execute("""
+                    SELECT screen_name, message
+                    FROM diff_trace
+                    WHERE build_id = %s
+                    ORDER BY screen_name
+                """, (build_id,))
+                rows = cursor.fetchall()
 
+                summary = {}
+                for r in rows:
+                    screen = r["screen_name"]
+                    summary.setdefault(screen, []).append(r["message"])
 
+                return JSONResponse(content=summary)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {e}") 
+    
 # =====================================================
 # ENDPOINTS DE CONFIGURACIÓN
 # =====================================================
@@ -4671,7 +4694,6 @@ def config_health_check():
 
 
 @app.get("/qa_summary/{build_id}")
-
 def qa_summary(build_id: str, tester_id: Optional[str] = None):
     """
     Devuelve resumen de cambios por pantalla para QA.
@@ -4680,52 +4702,57 @@ def qa_summary(build_id: str, tester_id: Optional[str] = None):
     - cluster_id
     - histórico de builds previas (últimas 5)
     """
-    with sqlite3.connect(DB_NAME) as conn:
-        c = conn.cursor()
+    try:
 
-        # Obtener los diffs por pantalla
-        c.execute("""
-            SELECT header_text, removed, added, modified, cluster_info, created_at
-            FROM screen_diffs
-            WHERE build_id = ?
-        """, (build_id,))
-        diffs = c.fetchall()
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+        
+                # Obtener los diffs por pantalla
+                c.execute("""
+                    SELECT header_text, removed, added, modified, cluster_info, created_at
+                    FROM screen_diffs
+                    WHERE build_id = ?
+                """, (build_id,))
+                diffs = c.fetchall()
 
-        summary = []
-        for row in diffs:
-            header_text, removed, added, modified, cluster_info, created_at = row
-            summary.append({
-                "screen": header_text,
-                "removed": json.loads(removed) if removed else [],
-                "added": json.loads(added) if added else [],
-                "modified": json.loads(modified) if modified else [],
-                "cluster_info": cluster_info,
-                "timestamp": created_at
-            })
-
-        # Obtener anomaly_score y cluster_id de accessibility_data
-        c.execute("""
-            SELECT header_text, enriched_vector, cluster_id, anomaly_score
-            FROM accessibility_data
-            WHERE build_id = ?
-            {}
-        """.format("AND tester_id=?" if tester_id else ""), (build_id,) if not tester_id else (build_id, tester_id))
-        vecs = c.fetchall()
-
-        for row in vecs:
-            header_text, enriched_vector, cluster_id, anomaly_score = row
-            for s in summary:
-                if normalize_header(s["screen"]) == normalize_header(header_text):
-                    s.update({
-                        "enriched_vector": json.loads(enriched_vector) if enriched_vector else None,
-                        "cluster_id": cluster_id,
-                        "anomaly_score": anomaly_score
+                summary = []
+                for row in diffs:
+                    header_text, removed, added, modified, cluster_info, created_at = row
+                    summary.append({
+                        "screen": header_text,
+                        "removed": json.loads(removed) if removed else [],
+                        "added": json.loads(added) if added else [],
+                        "modified": json.loads(modified) if modified else [],
+                        "cluster_info": cluster_info,
+                        "timestamp": created_at
                     })
 
-    # Ordenar por anomaly_score descendente
-    summary.sort(key=lambda x: x.get("anomaly_score") or 0, reverse=True)
+                # Obtener anomaly_score y cluster_id de accessibility_data
+                c.execute("""
+                    SELECT header_text, enriched_vector, cluster_id, anomaly_score
+                    FROM accessibility_data
+                    WHERE build_id = ?
+                    {}
+                """.format("AND tester_id=?" if tester_id else ""), (build_id,) if not tester_id else (build_id, tester_id))
+                vecs = c.fetchall()
 
-    return JSONResponse(content={"build_id": build_id, "summary": summary})
+                for row in vecs:
+                    header_text, enriched_vector, cluster_id, anomaly_score = row
+                    for s in summary:
+                        if normalize_header(s["screen"]) == normalize_header(header_text):
+                            s.update({
+                                "enriched_vector": json.loads(enriched_vector) if enriched_vector else None,
+                                "cluster_id": cluster_id,
+                                "anomaly_score": anomaly_score
+                            })
+
+            # Ordenar por anomaly_score descendente
+            summary.sort(key=lambda x: x.get("anomaly_score") or 0, reverse=True)
+
+            return JSONResponse(content={"build_id": build_id, "summary": summary})
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {e}")
 
 
 @app.get("/qa_dashboard/{build_id}", response_class=HTMLResponse)
@@ -4807,6 +4834,42 @@ def qa_dashboard(build_id: str, tester_id: Optional[str] = None):
 
     return HTMLResponse(content=html_content)
 
+@user_router.put("/{udid}/password")
+def update_password(udid: str, pwd: PasswordUpdate):
+    with get_conn_cm() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as c:
+            c.execute("SELECT 1 FROM users WHERE udid = %s", (udid,))
+            if not c.fetchone():
+                raise HTTPException(status_code=404, detail="User not found")
+
+            c.execute("""
+                UPDATE users
+                SET password = %s, updated_at = NOW()
+                WHERE udid = %s
+            """, (pwd.password, udid))
+            conn.commit()
+
+    return {"status": "password_changed"}
+
+
+@user_router.post("/changes")
+def get_changes(query: TimestampQuery):
+    with get_conn_cm() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as c:
+            c.execute("""
+                SELECT udid, mail, phone, EXTRACT(EPOCH FROM updated_at) AS updated_at
+                FROM users
+                WHERE EXTRACT(EPOCH FROM updated_at) > %s
+            """, (query.since,))
+
+            rows = c.fetchall()
+            return {
+                "count": len(rows),
+                "users": rows,
+                "timestamp_now": time.time()
+            }                
+        
+app.include_router(user_router)
 
 @app.get("/qa_dashboard_advanced/{tester_id}", response_class=HTMLResponse)
 def qa_dashboard_advanced(tester_id: str, builds: Optional[int] = 5):
@@ -4816,343 +4879,328 @@ def qa_dashboard_advanced(tester_id: str, builds: Optional[int] = 5):
     - Evolución de builds recientes
     - Anomaly score y cluster visualizados
     """
-    import json
-    import sqlite3
+    
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    # Tomar las últimas N builds para el tester
-    c.execute("""
-        SELECT screen_diffs.build_id, screen_diffs.header_text, screen_diffs.removed, 
-        screen_diffs.added, screen_diffs.modified, screen_diffs.anomaly_score, 
-        screen_diffs.cluster_id
-        FROM screen_diffs
-        LEFT JOIN accessibility_data USING (tester_id, header_text)
-        WHERE tester_id = ?
-        ORDER BY screen_diffs.created_at DESC
-        LIMIT ?
-    """, (tester_id, builds*50))  # asume hasta 50 pantallas por build
-    rows = c.fetchall()
-    conn.close()
+                # Tomar las últimas N builds para el tester (asume hasta 50 pantallas por build)
+                cursor.execute("""
+                    SELECT sd.build_id, sd.header_text, sd.removed, sd.added, sd.modified,
+                        ad.anomaly_score, ad.cluster_id
+                    FROM screen_diffs sd
+                    LEFT JOIN accessibility_data ad
+                    ON sd.tester_id = ad.tester_id AND sd.header_text = ad.header_text
+                    WHERE sd.tester_id = %s
+                    ORDER BY sd.created_at DESC
+                    LIMIT %s
+                """, (tester_id, builds*50))
+                rows = cursor.fetchall()
 
-    # Preparar datos
-    builds_dict = {}
-    for r in rows:
-        build_id = r[0]
-        screen = r[1]
-        removed = len(json.loads(r[2])) if r[2] else 0
-        added = len(json.loads(r[3])) if r[3] else 0
-        modified = len(json.loads(r[4])) if r[4] else 0
-        anomaly_score = r[5] or 0
-        cluster_id = r[6] or "-"
-        if build_id not in builds_dict:
-            builds_dict[build_id] = []
-        builds_dict[build_id].append({
-            "screen": screen,
-            "removed": removed,
-            "added": added,
-            "modified": modified,
-            "anomaly_score": anomaly_score,
-            "cluster_id": cluster_id
-        })
+                # Preparar datos
+                builds_dict = {}
+                for r in rows:
+                    build_id = r["build_id"]
+                    screen = r["header_text"]
+                    removed = len(json.loads(r["removed"])) if r["removed"] else 0
+                    added = len(json.loads(r["added"])) if r["added"] else 0
+                    modified = len(json.loads(r["modified"])) if r["modified"] else 0
+                    anomaly_score = r["anomaly_score"] or 0
+                    cluster_id = r["cluster_id"] or "-"
+                    builds_dict.setdefault(build_id, []).append({
+                        "screen": screen,
+                        "removed": removed,
+                        "added": added,
+                        "modified": modified,
+                        "anomaly_score": anomaly_score,
+                        "cluster_id": cluster_id
+                    })
 
-    builds_sorted = sorted(builds_dict.keys())  # orden cronológico
+                builds_sorted = sorted(builds_dict.keys())  # orden cronológico
 
-    # Generar HTML con Chart.js
-    html_content = f"""
-    <html>
-    <head>
-        <title>QA Dashboard Avanzado - Tester {tester_id}</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <style>
-            body {{ font-family: Arial, sans-serif; padding: 20px; }}
-            table {{ border-collapse: collapse; width: 100%; margin-bottom: 40px; }}
-            th, td {{ border: 1px solid #ddd; padding: 8px; }}
-            th {{ background-color: #f2f2f2; }}
-            .removed {{ background-color: #f8d7da; }} 
-            .added {{ background-color: #d4edda; }}
-            .modified {{ background-color: #fff3cd; }}
-            .anomaly-high {{ font-weight: bold; color: red; }}
-        </style>
-    </head>
-    <body>
-        <h2>QA Dashboard Avanzado - Tester {tester_id}</h2>
-    """
+                # Generar HTML con Chart.js
+                html_content = f"""
+                <html>
+                <head>
+                    <title>QA Dashboard Avanzado - Tester {tester_id}</title>
+                    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+                    <style>
+                        body {{ font-family: Arial, sans-serif; padding: 20px; }}
+                        table {{ border-collapse: collapse; width: 100%; margin-bottom: 40px; }}
+                        th, td {{ border: 1px solid #ddd; padding: 8px; }}
+                        th {{ background-color: #f2f2f2; }}
+                        .removed {{ background-color: #f8d7da; }} 
+                        .added {{ background-color: #d4edda; }}
+                        .modified {{ background-color: #fff3cd; }}
+                        .anomaly-high {{ font-weight: bold; color: red; }}
+                    </style>
+                </head>
+                <body>
+                    <h2>QA Dashboard Avanzado - Tester {tester_id}</h2>
+                """
 
-    # Tabla por build
-    for build_id in builds_sorted:
-        html_content += f"<h3>Build: {build_id}</h3>"
-        html_content += """
-        <table>
-            <tr>
-                <th>Screen</th>
-                <th>Removed</th>
-                <th>Added</th>
-                <th>Modified</th>
-                <th>Anomaly Score</th>
-                <th>Cluster ID</th>
-            </tr>
-        """
-        for s in builds_dict[build_id]:
-            removed_cls = "removed" if s["removed"] > 0 else ""
-            added_cls = "added" if s["added"] > 0 else ""
-            modified_cls = "modified" if s["modified"] > 0 else ""
-            anomaly_cls = "anomaly-high" if s["anomaly_score"] > 1 else ""
+                # Tabla por build
+                for build_id in builds_sorted:
+                    html_content += f"<h3>Build: {build_id}</h3>"
+                    html_content += """
+                    <table>
+                        <tr>
+                            <th>Screen</th>
+                            <th>Removed</th>
+                            <th>Added</th>
+                            <th>Modified</th>
+                            <th>Anomaly Score</th>
+                            <th>Cluster ID</th>
+                        </tr>
+                    """
+                    for s in builds_dict[build_id]:
+                        removed_cls = "removed" if s["removed"] > 0 else ""
+                        added_cls = "added" if s["added"] > 0 else ""
+                        modified_cls = "modified" if s["modified"] > 0 else ""
+                        anomaly_cls = "anomaly-high" if s["anomaly_score"] > 1 else ""
 
-            html_content += f"""
-            <tr>
-                <td>{s['screen']}</td>
-                <td class="{removed_cls}">{s['removed']}</td>
-                <td class="{added_cls}">{s['added']}</td>
-                <td class="{modified_cls}">{s['modified']}</td>
-                <td class="{anomaly_cls}">{s['anomaly_score']:.2f}</td>
-                <td>{s['cluster_id']}</td>
-            </tr>
-            """
-        html_content += "</table>"
+                        html_content += f"""
+                        <tr>
+                            <td>{s['screen']}</td>
+                            <td class="{removed_cls}">{s['removed']}</td>
+                            <td class="{added_cls}">{s['added']}</td>
+                            <td class="{modified_cls}">{s['modified']}</td>
+                            <td class="{anomaly_cls}">{s['anomaly_score']:.2f}</td>
+                            <td>{s['cluster_id']}</td>
+                        </tr>
+                        """
+                    html_content += "</table>"
 
-    # Gráfico agregado: tendencia de Removed / Added / Modified por build
-    removed_series = [sum(s["removed"] for s in builds_dict[b]) for b in builds_sorted]
-    added_series = [sum(s["added"] for s in builds_dict[b]) for b in builds_sorted]
-    modified_series = [sum(s["modified"] for s in builds_dict[b]) for b in builds_sorted]
+                # Gráfico agregado: tendencia de Removed / Added / Modified por build
+                removed_series = [sum(s["removed"] for s in builds_dict[b]) for b in builds_sorted]
+                added_series = [sum(s["added"] for s in builds_dict[b]) for b in builds_sorted]
+                modified_series = [sum(s["modified"] for s in builds_dict[b]) for b in builds_sorted]
 
-    html_content += f"""
-    <canvas id="trendChart" width="800" height="400"></canvas>
-    <script>
-        const ctx = document.getElementById('trendChart').getContext('2d');
-        new Chart(ctx, {{
-            type: 'line',
-            data: {{
-                labels: {json.dumps(builds_sorted, ensure_ascii=False)},
-                datasets: [
-                    {{ label: 'Removed', data: {removed_series}, borderColor: 'red', fill: false }},
-                    {{ label: 'Added', data: {added_series}, borderColor: 'green', fill: false }},
-                    {{ label: 'Modified', data: {modified_series}, borderColor: 'orange', fill: false }}
-                ]
-            }},
-            options: {{
-                responsive: true,
-                plugins: {{
-                    legend: {{ position: 'top' }},
-                    title: {{ display: true, text: 'Cambios por Build' }}
-                }}
-            }}
-        }});
-    </script>
-    </body>
-    </html>
-    """
+                html_content += f"""
+                <canvas id="trendChart" width="800" height="400"></canvas>
+                <script>
+                    const ctx = document.getElementById('trendChart').getContext('2d');
+                    new Chart(ctx, {{
+                        type: 'line',
+                        data: {{
+                            labels: {json.dumps(builds_sorted, ensure_ascii=False)},
+                            datasets: [
+                                {{ label: 'Removed', data: {removed_series}, borderColor: 'red', fill: false }},
+                                {{ label: 'Added', data: {added_series}, borderColor: 'green', fill: false }},
+                                {{ label: 'Modified', data: {modified_series}, borderColor: 'orange', fill: false }}
+                            ]
+                        }},
+                        options: {{
+                            responsive: true,
+                            plugins: {{
+                                legend: {{ position: 'top' }},
+                                title: {{ display: true, text: 'Cambios por Build' }}
+                            }}
+                        }}
+                    }});
+                </script>
+                </body>
+                </html>
+                """
 
-    return HTMLResponse(content=html_content)
+                return HTMLResponse(content=html_content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {e}")
+
 
 @app.get("/qa_report/{tester_id}", response_class=HTMLResponse)
 def qa_report(tester_id: str, builds: Optional[int] = 5):
-
-    import json
-    import sqlite3
-    from collections import defaultdict
-
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-
-    # 🔍 Tomar los últimos builds y todas sus pantallas
-    c.execute("""
-        SELECT build_id, header_text, removed, added, modified, anomaly_score, cluster_id
-        FROM screen_diffs
-        WHERE tester_id = ?
-        ORDER BY created_at DESC
-        LIMIT ?
-    """, (tester_id, builds * 50))
-
-    rows = c.fetchall()
-    conn.close()
-
-    # Estructuras
-    builds_dict = defaultdict(list)
-    cluster_map = defaultdict(list)
-
-    for build_id, screen, removed_raw, added_raw, modified_raw, anomaly_score, cluster_id in rows:
-
-        removed = json.loads(removed_raw) if removed_raw else []
-        added = json.loads(added_raw) if added_raw else []
-        modified = json.loads(modified_raw) if modified_raw else []
-
-        entry = {
-            "screen": screen,
-            "removed": removed,
-            "added": added,
-            "modified": modified,
-            "anomaly_score": anomaly_score or 0,
-            "cluster_id": cluster_id or "-"
-        }
-
-        builds_dict[build_id].append(entry)
-        cluster_map[entry["cluster_id"]].append(entry)
-
-    builds_sorted = sorted(builds_dict.keys())
-
-    # ======== HTML =========
-    html = """
-    <html>
-    <head>
-        <title>QA Report Avanzado</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
-        <style>
-            body { font-family: Arial; padding:20px; }
-
-            .section-title {
-                margin-top: 40px;
-                font-size: 24px;
-                border-bottom: 2px solid #ccc;
-                padding-bottom: 5px;
-            }
-
-            table { width:100%; border-collapse:collapse; margin-bottom:20px; }
-            th, td { border:1px solid #ddd; padding:6px; }
-
-            .removed-row { background:#fdd; }
-            .added-row { background:#dfd; }
-            .modified-row { background:#ffd; }
-
-            .change-box {
-                margin:4px; padding:6px; border-radius:4px;
-                background:#fafafa; border:1px solid #ccc;
-            }
-
-            .similarity-low { color:red; font-weight:bold; }
-            .similarity-mid { color:orange; font-weight:bold; }
-            .similarity-high { color:green; font-weight:bold; }
-
-            details { margin-bottom:5px; }
-        </style>
-    </head>
-    <body>
     """
+    Reporte avanzado de QA:
+    - Removed / Added / Modified
+    - anomaly_score
+    - cluster_id
+    - Agrupación por clusters y detalle por build
+    """
+    # conn = get_conn()
 
-    html += f"<h1>Reporte Avanzado QA — Tester <b>{tester_id}</b></h1>"
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+        # cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-    # ============================
-    #   📊 SECCIÓN 1 — GRAFICO GENERAL
-    # ============================
+                # 🔍 Tomar los últimos builds y todas sus pantallas (hasta 50 pantallas por build)
+                cursor.execute("""
+                    SELECT build_id, header_text, removed, added, modified, anomaly_score, cluster_id
+                    FROM screen_diffs
+                    WHERE tester_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (tester_id, builds * 50))
 
-    removed_series = [sum(len(s["removed"]) for s in builds_dict[b]) for b in builds_sorted]
-    added_series   = [sum(len(s["added"]) for s in builds_dict[b]) for b in builds_sorted]
-    modified_series= [sum(len(s["modified"]) for s in builds_dict[b]) for b in builds_sorted]
-    anomaly_avg    = [
-        sum(s["anomaly_score"] for s in builds_dict[b]) / max(1, len(builds_dict[b]))
-        for b in builds_sorted
-    ]
+                rows = cursor.fetchall()
 
-    html += """
-    <div class="section-title">📈 Tendencias Generales</div>
-    <canvas id="chart1" height="120"></canvas>
-    <script>
-        new Chart(document.getElementById('chart1'), {
-            type: 'line',
-            data: {
-                labels: """ + json.dumps(builds_sorted) + """,
-                datasets: [
-                    {label:'Removed', data:""" + json.dumps(removed_series) + """, borderColor:'red'},
-                    {label:'Added', data:""" + json.dumps(added_series) + """, borderColor:'green'},
-                    {label:'Modified', data:""" + json.dumps(modified_series) + """, borderColor:'orange'},
-                    {label:'Anomaly Avg', data:""" + json.dumps(anomaly_avg) + """, borderColor:'blue'}
+                # Estructuras
+                builds_dict = defaultdict(list)
+                cluster_map = defaultdict(list)
+
+                for r in rows:
+                    removed = json.loads(r["removed"]) if r["removed"] else []
+                    added = json.loads(r["added"]) if r["added"] else []
+                    modified = json.loads(r["modified"]) if r["modified"] else []
+
+                    entry = {
+                        "screen": r["header_text"],
+                        "removed": removed,
+                        "added": added,
+                        "modified": modified,
+                        "anomaly_score": r["anomaly_score"] or 0,
+                        "cluster_id": r["cluster_id"] or "-"
+                    }
+
+                    builds_dict[r["build_id"]].append(entry)
+                    cluster_map[entry["cluster_id"]].append(entry)
+
+                builds_sorted = sorted(builds_dict.keys())
+
+                # ======== HTML =========
+                html = """
+                <html>
+                <head>
+                    <title>QA Report Avanzado</title>
+                    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+                    <style>
+                        body { font-family: Arial; padding:20px; }
+                        .section-title { margin-top: 40px; font-size: 24px; border-bottom: 2px solid #ccc; padding-bottom: 5px; }
+                        table { width:100%; border-collapse:collapse; margin-bottom:20px; }
+                        th, td { border:1px solid #ddd; padding:6px; }
+                        .removed-row { background:#fdd; }
+                        .added-row { background:#dfd; }
+                        .modified-row { background:#ffd; }
+                        .change-box { margin:4px; padding:6px; border-radius:4px; background:#fafafa; border:1px solid #ccc; }
+                        .similarity-low { color:red; font-weight:bold; }
+                        .similarity-mid { color:orange; font-weight:bold; }
+                        .similarity-high { color:green; font-weight:bold; }
+                        details { margin-bottom:5px; }
+                    </style>
+                </head>
+                <body>
+                """
+
+                html += f"<h1>Reporte Avanzado QA — Tester <b>{tester_id}</b></h1>"
+
+                # ============================
+                #   📊 SECCIÓN 1 — GRAFICO GENERAL
+                # ============================
+
+                removed_series = [sum(len(s["removed"]) for s in builds_dict[b]) for b in builds_sorted]
+                added_series   = [sum(len(s["added"]) for s in builds_dict[b]) for b in builds_sorted]
+                modified_series= [sum(len(s["modified"]) for s in builds_dict[b]) for b in builds_sorted]
+                anomaly_avg    = [
+                    sum(s["anomaly_score"] for s in builds_dict[b]) / max(1, len(builds_dict[b]))
+                    for b in builds_sorted
                 ]
-            }
-        });
-    </script>
-    """
 
-    # ============================
-    #   🧬 SECCIÓN 2 — CLUSTERS
-    # ============================
+                html += """
+                <div class="section-title">📈 Tendencias Generales</div>
+                <canvas id="chart1" height="120"></canvas>
+                <script>
+                    new Chart(document.getElementById('chart1'), {
+                        type: 'line',
+                        data: {
+                            labels: """ + json.dumps(builds_sorted) + """,
+                            datasets: [
+                                {label:'Removed', data:""" + json.dumps(removed_series) + """, borderColor:'red'},
+                                {label:'Added', data:""" + json.dumps(added_series) + """, borderColor:'green'},
+                                {label:'Modified', data:""" + json.dumps(modified_series) + """, borderColor:'orange'},
+                                {label:'Anomaly Avg', data:""" + json.dumps(anomaly_avg) + """, borderColor:'blue'}
+                            ]
+                        }
+                    });
+                </script>
+                """
 
-    html += """
-    <div class='section-title'>🧬 Clusters Detectados</div>
-    """
+                # ============================
+                #   🧬 SECCIÓN 2 — CLUSTERS
+                # ============================
 
-    for cluster_id, screens in cluster_map.items():
-        color = f"hsl({hash(cluster_id) % 360}, 60%, 70%)"
-        html += f"<h3 style='color:{color}'>Cluster {cluster_id} ({len(screens)} pantallas)</h3>"
+                html += """
+                <div class='section-title'>🧬 Clusters Detectados</div>
+                """
 
-        html += "<ul>"
-        for s in screens:
-            html += f"<li>{s['screen']}</li>"
-        html += "</ul>"
+                for cluster_id, screens in cluster_map.items():
+                    color = f"hsl({hash(cluster_id) % 360}, 60%, 70%)"
+                    html += f"<h3 style='color:{color}'>Cluster {cluster_id} ({len(screens)} pantallas)</h3>"
+                    html += "<ul>"
+                    for s in screens:
+                        html += f"<li>{s['screen']}</li>"
+                    html += "</ul>"
 
-    # ============================
-    #   📄 SECCIÓN 3 — DETALLE POR BUILD
-    # ============================
+                # ============================
+                #   📄 SECCIÓN 3 — DETALLE POR BUILD
+                # ============================
 
-    html += """
-    <div class="section-title">📄 Cambios por Build</div>
-    """
+                html += """
+                <div class="section-title">📄 Cambios por Build</div>
+                """
 
-    for build_id in builds_sorted:
+                for build_id in builds_sorted:
 
-        html += f"<h2>Build {build_id}</h2>"
-        html += """
-        <table>
-        <tr><th>Pantalla</th><th>Removed</th><th>Added</th><th>Modified</th><th>Detalle</th></tr>
-        """
-
-        for s in builds_dict[build_id]:
-
-            html += f"""
-            <tr>
-                <td>{s['screen']}</td>
-                <td>{len(s['removed'])}</td>
-                <td>{len(s['added'])}</td>
-                <td>{len(s['modified'])}</td>
-                <td>
-                    <details>
-                        <summary>Ver detalles</summary>
-                        <div class='change-box'>
-            """
-
-            # REMOVED
-            if s["removed"]:
-                html += "<h4>Removed</h4>"
-                for item in s["removed"]:
-                    html += f"<div>- {item['node']['key']}</div>"
-
-            # ADDED
-            if s["added"]:
-                html += "<h4>Added</h4>"
-                for item in s["added"]:
-                    html += f"<div>+ {item['node']['key']}</div>"
-
-            # MODIFIED
-            if s["modified"]:
-                html += "<h4>Modified</h4>"
-                for item in s["modified"]:
-                    ch = item["changes"]
-
-                    sim = float(ch.get("similarity", 0))
-                    if sim < 0.4:
-                        cls = "similarity-low"
-                    elif sim < 0.7:
-                        cls = "similarity-mid"
-                    else:
-                        cls = "similarity-high"
-
-                    html += f"""
-                        <div class='change-box'>
-                            <b>{item['node']['class']}</b><br>
-                            <span class='{cls}'>Similarity: {sim:.2f}</span>
-                            <br>Old: {ch['text']['old']}
-                            <br>New: {ch['text']['new']}
-                        </div>
+                    html += f"<h2>Build {build_id}</h2>"
+                    html += """
+                    <table>
+                    <tr><th>Pantalla</th><th>Removed</th><th>Added</th><th>Modified</th><th>Detalle</th></tr>
                     """
 
-            html += "</div></details></td></tr>"
+                    for s in builds_dict[build_id]:
 
-        html += "</table>"
+                        html += f"""
+                        <tr>
+                            <td>{s['screen']}</td>
+                            <td>{len(s['removed'])}</td>
+                            <td>{len(s['added'])}</td>
+                            <td>{len(s['modified'])}</td>
+                            <td>
+                                <details>
+                                    <summary>Ver detalles</summary>
+                                    <div class='change-box'>
+                        """
 
-    html += "</body></html>"
+                        # REMOVED
+                        if s["removed"]:
+                            html += "<h4>Removed</h4>"
+                            for item in s["removed"]:
+                                html += f"<div>- {item['node']['key']}</div>"
 
-    return HTMLResponse(content=html)
+                        # ADDED
+                        if s["added"]:
+                            html += "<h4>Added</h4>"
+                            for item in s["added"]:
+                                html += f"<div>+ {item['node']['key']}</div>"
 
+                        # MODIFIED
+                        if s["modified"]:
+                            for item in s["modified"]:
+                                ch = item["changes"]
+                                sim = float(ch.get("similarity", 0))
+                                cls = "similarity-low" if sim < 0.4 else "similarity-mid" if sim < 0.7 else "similarity-high"
+
+                                html += f"""
+                                    <div class='change-box'>
+                                        <b>{item['node']['class']}</b><br>
+                                        <span class='{cls}'>Similarity: {sim:.2f}</span>
+                                        <br>Old: {ch['text']['old']}
+                                        <br>New: {ch['text']['new']}
+                                    </div>
+                                """
+
+                        html += "</div></details></td></tr>"
+
+                    html += "</table>"
+
+                html += "</body></html>"
+
+                return HTMLResponse(content=html)
+
+    # finally:
+    #     release_conn(conn)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {e}")
 
 app.include_router(diff_router)
 app.include_router(router, prefix="/api")
@@ -5164,80 +5212,109 @@ async def toggle_general_train(app_name: str, tester_id: str, build_id: str, ena
     Activa/desactiva el entrenamiento general automático para este tester/app/build
     """
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    # Actualizar tabla de configuración del tester
-    c.update_general_flag(tester_id, app_name, build_id, enabled)
-    return {"status": "ok", "train_general_enabled": enabled}
+    # conn = sqlite3.connect(DB_NAME)
+    # c = conn.cursor()
+    expires_at = int(time.time()) + 900
+    
+    with get_conn_cm() as conn:
+	    with conn.cursor() as c:
+
+                # conn = get_conn()
+                c = conn.cursor()
+                # Actualizar tabla de configuración del tester
+                c.update_general_flag(tester_id, app_name, build_id, enabled)
+                return {"status": "ok", "train_general_enabled": enabled}
+
 
 @app.post("/baseline/mark")
 async def mark_baseline(req: BaselineMarkRequest):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
+    # conn = get_conn()
+    
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as cursor:
 
-    c.execute("""
-        DELETE FROM baseline_metadata
-        WHERE app_name = ? AND tester_id = ?
-    """, (req.app_name, req.tester_id))
+                    # Borrar baseline existente
+                    cursor.execute("""
+                        DELETE FROM baseline_metadata
+                        WHERE app_name = %s AND tester_id = %s
+                    """, (req.app_name, req.tester_id))
 
-    c.execute("""
-        INSERT INTO baseline_metadata (app_name, tester_id, build_id)
-        VALUES (?, ?, ?)
-    """, (req.app_name, req.tester_id, req.build_id))
+                    # Insertar nueva baseline
+                    cursor.execute("""
+                        INSERT INTO baseline_metadata (app_name, tester_id, build_id)
+                        VALUES (%s, %s, %s)
+                    """, (req.app_name, req.tester_id, req.build_id))
 
-    conn.commit()
-    conn.close()
-
-    return {"status": "ok", "message": "Baseline marcada correctamente"}
+                    conn.commit()
+                    return {"status": "ok", "message": "Baseline marcada correctamente"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Error en la DB: {e}")
 
 
 @app.get("/metrics/changes")
 async def get_change_metrics(tester_id: str = None):
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        q = """
-            SELECT tester_id, build_id, total_events, total_changes,
-                   total_added, total_removed, total_modified,
-                   ROUND(100.0 * total_changes / total_events, 2) AS change_rate,
-                   last_updated
-            FROM metrics_changes
-        """
-        if tester_id:
-            q += " WHERE tester_id = ? ORDER BY last_updated DESC"
-            rows = cur.execute(q, (tester_id,)).fetchall()
-        else:
-            q += " ORDER BY last_updated DESC"
-            rows = cur.execute(q).fetchall()
-        return {"metrics": [dict(r) for r in rows]}
+    # conn = get_conn()
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as cur:
 
+        # cur = conn.cursor()
+                q = """
+                    SELECT tester_id, build_id, total_events, total_changes,
+                        total_added, total_removed, total_modified,
+                        ROUND(100.0 * total_changes / total_events, 2) AS change_rate,
+                        last_updated
+                    FROM metrics_changes
+                """
+                params = []
+                if tester_id:
+                    q += " WHERE tester_id = %s"
+                    params.append(tester_id)
+
+                q += " ORDER BY last_updated DESC"
+
+                cur.execute(q, tuple(params))
+                rows = cur.fetchall()
+
+                # Convertir a dict
+                result = []
+                for r in rows:
+                    result.append({desc[0]: val for desc, val in zip(cur.description, r)})
+
+                return {"metrics": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en DB: {e}")
 
 @app.post("/update_rates")
 async def update_rates(usd_to_cop: float, usd_to_eur: float):
-    # Validaciones básicas
     if usd_to_cop <= 0 or usd_to_eur <= 0:
         raise HTTPException(status_code=400, detail="Las tasas deben ser mayores que cero.")
 
+    # conn = get_conn()
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            conn.execute("PRAGMA foreign_keys = ON;")
-            c = conn.cursor()
-            c.execute("""
-                UPDATE active_plans
-                SET rate_cop = ?, rate_eur = ?, updated_at = CURRENT_TIMESTAMP
-            """, (usd_to_cop, usd_to_eur))
-            conn.commit()
+        with get_conn_cm() as conn:
+            with conn.cursor() as cur:
+        # cur = conn.cursor()
+                cur.execute("""
+                    UPDATE active_plans
+                    SET rate_cop = %s, rate_eur = %s, updated_at = NOW()
+                """, (usd_to_cop, usd_to_eur))
+                conn.commit()
 
-        return {
-            "success": True,
-            "message": "Tasas actualizadas correctamente.",
-            "usd_to_cop": usd_to_cop,
-            "usd_to_eur": usd_to_eur
-        }
+                return {
+                    "success": True,
+                    "message": "Tasas actualizadas correctamente.",
+                    "usd_to_cop": usd_to_cop,
+                    "usd_to_eur": usd_to_eur
+                }
 
     except Exception as e:
+        conn.rollback()
         raise HTTPException(status_code=500, detail=f"Error al actualizar tasas: {str(e)}")
-    
+    # finally:
+    #     release_conn(conn)    
     
 @app.post("/train/sync-mode")
 async def sync_train_mode(payload: TrainModeRequest):
@@ -5293,252 +5370,249 @@ async def sync_train_mode(payload: TrainModeRequest):
 
 
 def calculate_all_metrics():
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
 
-        # Limpia el resumen viejo
-        cur.execute("DELETE FROM metrics_summary")
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as cur:
 
-        # ----------------------------
-        #   A) MÉTRICAS POR PANTALLA
-        # ----------------------------
+                # Limpiar resumen viejo
+                cur.execute("DELETE FROM metrics_summary")
 
-        # % de cambio total
-        q1 = """
-            SELECT screen_signature,
-                   SUM(total_added + total_removed + total_modified) AS total_changes,
-                   COUNT(*) AS appearances,
-                   ROUND(100.0 * SUM(total_added + total_removed + total_modified) / COUNT(*), 2) AS change_rate
-            FROM changes
-            GROUP BY screen_signature
-        """
-        for r in cur.execute(q1).fetchall():
-            cur.execute("""
-                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
-                VALUES (?, ?, ?)
-            """, ("screen", f"change_rate_{r['screen_signature']}", r['change_rate']))
+                # ----------------------------
+                # A) MÉTRICAS POR PANTALLA
+                # ----------------------------
 
-        # Severidad
-        q2 = """
-            SELECT screen_signature,
-                   ROUND(AVG(total_modified),2) AS severity
-            FROM changes GROUP BY screen_signature
-        """
-        for r in cur.execute(q2).fetchall():
-            cur.execute("""
-                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
-                VALUES (?, ?, ?)
-            """, ("screen", f"severity_{r['screen_signature']}", r['severity']))
+                q1 = """
+                    SELECT screen_signature,
+                        SUM(total_added + total_removed + total_modified) AS total_changes,
+                        COUNT(*) AS appearances,
+                        ROUND(100.0 * SUM(total_added + total_removed + total_modified) / COUNT(*), 2) AS change_rate
+                    FROM changes
+                    GROUP BY screen_signature
+                """
+                cur.execute(q1)
+                for r in cur.fetchall():
+                    cur.execute("""
+                        INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                        VALUES (%s, %s, %s)
+                    """, ("screen", f"change_rate_{r[0]}", r[3]))
 
-        # Frecuencia aparición de pantalla
-        q3 = """
-            SELECT screen_signature, COUNT(*) AS freq
-            FROM collect GROUP BY screen_signature
-        """
-        for r in cur.execute(q3).fetchall():
-            cur.execute("""
-                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
-                VALUES (?, ?, ?)
-            """, ("screen", f"frequency_{r['screen_signature']}", r['freq']))
+                q2 = """
+                    SELECT screen_signature,
+                        ROUND(AVG(total_modified),2) AS severity
+                    FROM changes GROUP BY screen_signature
+                """
+                cur.execute(q2)
+                for r in cur.fetchall():
+                    cur.execute("""
+                        INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                        VALUES (%s, %s, %s)
+                    """, ("screen", f"severity_{r[0]}", r[1]))
 
-        # -------------------------
-        #   B) MÉTRICAS POR BUILD
-        # -------------------------
+                q3 = """
+                    SELECT screen_signature, COUNT(*) AS freq
+                    FROM collect GROUP BY screen_signature
+                """
+                cur.execute(q3)
+                for r in cur.fetchall():
+                    cur.execute("""
+                        INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                        VALUES (%s, %s, %s)
+                    """, ("screen", f"frequency_{r[0]}", r[1]))
 
-        # Build con más cambios
-        q4 = """
-            SELECT build_id, SUM(total_changes) AS changes
-            FROM metrics_changes
-            GROUP BY build_id
-            ORDER BY changes DESC LIMIT 1
-        """
-        r = cur.execute(q4).fetchone()
-        if r:
-            cur.execute("""
-                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
-                VALUES ('build', 'most_changes_build', ?)
-            """, (f"{r['build_id']} ({r['changes']} cambios)",))
+                # -------------------------
+                # B) MÉTRICAS POR BUILD
+                # -------------------------
 
-        # Build más inestable (tasa de cambios)
-        q5 = """
-            SELECT build_id,
-                   ROUND(100.0 * SUM(total_changes) / SUM(total_events), 2) AS instability
-            FROM metrics_changes
-            GROUP BY build_id ORDER BY instability DESC LIMIT 1
-        """
-        r = cur.execute(q5).fetchone()
-        if r:
-            cur.execute("""
-                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
-                VALUES ('build', 'most_unstable_build', ?)
-            """, (f"{r['build_id']} ({r['instability']}%)",))
+                q4 = """
+                    SELECT build_id, SUM(total_changes) AS changes
+                    FROM metrics_changes
+                    GROUP BY build_id
+                    ORDER BY changes DESC LIMIT 1
+                """
+                cur.execute(q4)
+                r = cur.fetchone()
+                if r:
+                    cur.execute("""
+                        INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                        VALUES (%s, %s, %s)
+                    """, ('build', 'most_changes_build', f"{r[0]} ({r[1]} cambios)"))
 
-        # Ratio cambios/pantalla
-        q6 = """
-            SELECT build_id,
-                   ROUND(SUM(total_changes) * 1.0 / COUNT(DISTINCT screen_signature), 2) AS ratio
-            FROM changes GROUP BY build_id
-        """
-        for r in cur.execute(q6).fetchall():
-            cur.execute("""
-                INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
-                VALUES ('build', ?, ?)
-            """, (f"change_screen_ratio_{r['build_id']}", r['ratio']))
+                q5 = """
+                    SELECT build_id,
+                        ROUND(100.0 * SUM(total_changes) / SUM(total_events), 2) AS instability
+                    FROM metrics_changes
+                    GROUP BY build_id
+                    ORDER BY instability DESC LIMIT 1
+                """
+                cur.execute(q5)
+                r = cur.fetchone()
+                if r:
+                    cur.execute("""
+                        INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                        VALUES (%s, %s, %s)
+                    """, ('build', 'most_unstable_build', f"{r[0]} ({r[1]}%)"))
 
-        # ------------------------------
-        #   C) MÉTRICAS GLOBAL QA LEAD
-        # ------------------------------
+                q6 = """
+                    SELECT build_id,
+                        ROUND(SUM(total_changes)::numeric / COUNT(DISTINCT screen_signature), 2) AS ratio
+                    FROM changes GROUP BY build_id
+                """
+                cur.execute(q6)
+                for r in cur.fetchall():
+                    cur.execute("""
+                        INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                        VALUES (%s, %s, %s)
+                    """, ('build', f"change_screen_ratio_{r[0]}", r[1]))
 
-        # Ranking pantallas más inestables (top 5)
-        q7 = """
-            SELECT screen_signature,
-                   ROUND(AVG(total_added + total_removed + total_modified),2) AS avg_changes
-            FROM changes GROUP BY screen_signature
-            ORDER BY avg_changes DESC LIMIT 5
-        """
-        rank = ", ".join([f"{row['screen_signature']}({row['avg_changes']})"
-                          for row in cur.execute(q7).fetchall()])
-        cur.execute("""
-            INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
-            VALUES ('global', 'top_instable_screens', ?)
-        """, (rank,))
+                # ------------------------------
+                # C) MÉTRICAS GLOBAL QA LEAD
+                # ------------------------------
 
-        # Guardar fecha actualización
-        cur.execute("""
-            INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
-            VALUES ('global', 'last_run', ?)
-        """, (datetime.now().isoformat(),))
+                q7 = """
+                    SELECT screen_signature,
+                        ROUND(AVG(total_added + total_removed + total_modified),2) AS avg_changes
+                    FROM changes GROUP BY screen_signature
+                    ORDER BY avg_changes DESC LIMIT 5
+                """
+                cur.execute(q7)
+                rank = ", ".join([f"{row[0]}({row[1]})" for row in cur.fetchall()])
+                cur.execute("""
+                    INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                    VALUES (%s, %s, %s)
+                """, ('global', 'top_instable_screens', rank))
 
-        conn.commit()
+                # Guardar fecha de actualización
+                cur.execute("""
+                    INSERT INTO metrics_summary(metric_group, metric_name, metric_value)
+                    VALUES (%s, %s, %s)
+                """, ('global', 'last_run', datetime.now().isoformat()))
 
-    return {"status": "ok", "msg": "all metrics calculated"}
+                conn.commit()
+                return {"status": "ok", "msg": "all metrics calculated"}
 
-
-@app.get("/metrics/all")
-async def metrics_all():
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT * FROM metrics_summary").fetchall()
-        return {"metrics": [dict(r) for r in rows]}       
+    except Exception as e:
+        conn.rollback()
+        raise
+   
     
-
-# ============================================================
-# 🔹 NUEVOS ENDPOINTS: SISTEMA DE RETROALIMENTACIÓN
-# ============================================================
-
+@router.get("/metrics/all")
+async def metrics_all():
+    # conn = get_conn()
+    try:
+        with get_conn_cm() as conn:
+            with conn.cursor() as cur:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM metrics_summary")
+                rows = cur.fetchall()
+                # convertir cada fila en diccionario
+                columns = [desc[0] for desc in cur.description]
+                result = [dict(zip(columns, row)) for row in rows]
+                return {"metrics": result}
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en DB: {e}")
+    
+ 
 @app.post("/diff/{diff_id}/approve")
 async def approve_diff(diff_id: int):
-    """
-    Registra aprobación de un diff.
-    El modelo aprenderá a no mostrar similares en el futuro.
-    """
     global feedback_system
     if feedback_system is None:
         return {"error": "Feedback system not initialized", "status": 503}
-    
+
+    # conn = get_conn()
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            c = conn.cursor()
-            
-            # Obtener detalles del diff
-            c.execute("""
-                SELECT diff_hash, tester_id, app_name, build_id, screen_name
-                FROM screen_diffs WHERE id = ? LIMIT 1
-            """, (diff_id,))
-            
-            diff_row = c.fetchone()
-            if not diff_row:
-                return {"error": "Diff not found", "status": 404}
-            
-            diff_hash, tester, app, build, screen = diff_row
-            
-            # Registrar aprobación en feedback system
-            record_diff_decision(
-                diff_hash=diff_hash,
-                diff_signature=diff_hash,
-                app_name=app,
-                tester_id=tester,
-                build_version=build,
-                decision='approved',
-                user_approved=True,
-                feedback_system=feedback_system
-            )
-            
-            # Actualizar BD
-            c.execute("""
-                UPDATE screen_diffs 
-                SET diff_priority = 'low', approved_before = 1
-                WHERE id = ?
-            """, (diff_id,))
-            
-            conn.commit()
-        
-        logger.info(f"✅ Diff {diff_id} aprobado por tester {tester}")
-        return {
-            "success": True,
-            "message": f"Diff approved - modelo mejorado",
-            "diff_id": diff_id
-        }
-        
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+        # cur = conn.cursor()
+
+                # Obtener detalles del diff
+                c.execute("""
+                    SELECT diff_hash, tester_id, app_name, build_id, screen_name
+                    FROM screen_diffs WHERE id = %s LIMIT 1
+                """, (diff_id,))
+                diff_row = c.fetchone()
+                if not diff_row:
+                    return {"error": "Diff not found", "status": 404}
+
+                diff_hash, tester, app, build, screen = diff_row
+
+                # Registrar aprobación en feedback system
+                record_diff_decision(
+                    diff_hash=diff_hash,
+                    diff_signature=diff_hash,
+                    app_name=app,
+                    tester_id=tester,
+                    build_version=build,
+                    decision='approved',
+                    user_approved=True,
+                    feedback_system=feedback_system
+                )
+
+                # Actualizar BD
+                c.execute("""
+                    UPDATE screen_diffs 
+                    SET diff_priority = 'low', approved_before = 1
+                    WHERE id = %s
+                """, (diff_id,))
+
+                conn.commit()
+                logger.info(f"✅ Diff {diff_id} aprobado por tester {tester}")
+                return {"success": True, "message": "Diff approved - modelo mejorado", "diff_id": diff_id}
+
     except Exception as e:
         logger.error(f"❌ Error aprobando diff: {e}")
         return {"error": str(e), "status": 500}
 
+    # finally:
+    #     release_conn(conn)
+
 
 @app.post("/diff/{diff_id}/reject")
 async def reject_diff(diff_id: int):
-    """
-    Registra rechazo de un diff (falso positivo).
-    El modelo aprenderá a no mostrar similares.
-    """
     global feedback_system
     if feedback_system is None:
         return {"error": "Feedback system not initialized", "status": 503}
-    
+
+    # conn = get_conn()
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            c = conn.cursor()
-            
-            c.execute("""
-                SELECT diff_hash, tester_id, app_name, build_id
-                FROM screen_diffs WHERE id = ? LIMIT 1
-            """, (diff_id,))
-            
-            diff_row = c.fetchone()
-            if not diff_row:
-                return {"error": "Diff not found", "status": 404}
-            
-            diff_hash, tester, app, build = diff_row
-            
-            # Registrar rechazo
-            record_diff_decision(
-                diff_hash=diff_hash,
-                diff_signature=diff_hash,
-                app_name=app,
-                tester_id=tester,
-                build_version=build,
-                decision='rejected',
-                user_approved=False,
-                feedback_system=feedback_system
-            )
-            
-            # Marcar como baja prioridad (falso positivo)
-            c.execute("""
-                UPDATE screen_diffs 
-                SET diff_priority = 'low'
-                WHERE id = ?
-            """, (diff_id,))
-            
-            conn.commit()
-        
-        logger.info(f"❌ Diff {diff_id} rechazado por tester {tester} - falso positivo")
-        return {
-            "success": True,
-            "message": "Diff marcado como falso positivo",
-            "diff_id": diff_id
-        }
-        
+        with get_conn_cm() as conn:
+            with conn.cursor() as c:
+        # cur = conn.cursor()
+
+                c.execute("""
+                    SELECT diff_hash, tester_id, app_name, build_id
+                    FROM screen_diffs WHERE id = %s LIMIT 1
+                """, (diff_id,))
+                diff_row = c.fetchone()
+                if not diff_row:
+                    return {"error": "Diff not found", "status": 404}
+
+                diff_hash, tester, app, build = diff_row
+
+                # Registrar rechazo
+                record_diff_decision(
+                    diff_hash=diff_hash,
+                    diff_signature=diff_hash,
+                    app_name=app,
+                    tester_id=tester,
+                    build_version=build,
+                    decision='rejected',
+                    user_approved=False,
+                    feedback_system=feedback_system
+                )
+
+                # Marcar como baja prioridad (falso positivo)
+                c.execute("""
+                    UPDATE screen_diffs 
+                    SET diff_priority = 'low'
+                    WHERE id = %s
+                """, (diff_id,))
+
+                conn.commit()
+                logger.info(f"❌ Diff {diff_id} rechazado por tester {tester} - falso positivo")
+                return {"success": True, "message": "Diff marcado como falso positivo", "diff_id": diff_id}
+
     except Exception as e:
         logger.error(f"❌ Error rechazando diff: {e}")
         return {"error": str(e), "status": 500}
@@ -5647,6 +5721,99 @@ async def analyze_tester_flows(app_name: str, tester_id: str, request: Request):
             content={"error": str(e)}
         )
 
+@app.get("/", response_class=HTMLResponse)
+def get_login(request: Request):
+    return templates.TemplateResponse("login.html", {"request": request})
+
+@app.post("/api/usuarios/sync")
+def sync_users(data: UserSyn):
+    with get_conn_cm() as conn:
+        with conn.cursor() as c:
+
+            # Buscar por UDID
+            c.execute("SELECT id, email FROM usuarios WHERE udid=%s;", (data.udid,))
+            user = c.fetchone()
+            email = user[1] if user else None
+
+            hashed = bcrypt.hashpw(data.password.encode(), bcrypt.gensalt()).decode()
+
+            if user:
+                # Actualiza si ya existe
+                c.execute("""
+                    UPDATE usuarios
+                    SET email=%s, phone=%s, hash_password=%s, updated_at=NOW()
+                    WHERE udid=%s;
+                """, (data.email, data.phone, hashed, data.udid))
+
+                return {"status": "updated"}
+
+            # Si NO existe: Crear
+            new_id = str(uuid.uuid4())
+
+            c.execute("""
+                INSERT INTO usuarios(udid, email, phone, hash_password)
+                VALUES(%s, %s, %s, %s)
+                RETURNING id;
+            """, (data.udid, data.email, data.phone, hashed))
+
+            new_id = c.fetchone()[0]
+            conn.commit()
+
+            return {"status": "created", "id": new_id}
+
+
+@app.put("/api/usuarios/{udid}")
+def update_user(udid: str, data: UserUpdate):
+    
+    with get_conn_cm() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE usuarios
+                SET email=COALESCE(%s,email),
+                    phone=COALESCE(%s,phone),
+                    updated_at=NOW()
+                WHERE udid=%s AND deleted_at IS NULL;
+            """, (data.email, data.phone, udid))
+
+            if c.rowcount == 0:
+                raise HTTPException(404, "Usuario no encontrado")
+
+            return {"status": "updated"}
+
+@app.put("/api/usuarios/{udid}/password")
+def update_password(udid: str, data: PasswordUpdate):
+    hashed = bcrypt.hashpw(data.password.encode(), bcrypt.gensalt()).decode()
+    
+    with get_conn_cm() as conn:
+        with conn.cursor() as c:
+
+            callable.execute("""
+                UPDATE usuarios
+                SET hash_password=%s, updated_at=NOW()
+                WHERE udid=%s AND deleted_at IS NULL;
+            """, (hashed, udid))
+
+            if c.rowcount == 0:
+                raise HTTPException(404, "Usuario no encontrado")
+
+            return {"status": "password_changed"}
+
+@app.get("/api/usuarios/changes")
+def get_changes(since: float):
+
+    with get_conn_cm() as conn:
+        with conn.cursor() as c:
+
+            c.execute("""
+                SELECT udid, EXTRACT(EPOCH FROM updated_at)
+                FROM usuarios
+                WHERE updated_at > TO_TIMESTAMP(%s);
+            """, (since,))
+
+            rows = c.fetchall()
+            return [
+                {"udid": row[0], "updated_at": row[1]} for row in rows
+            ]        
 
 @app.get("/flow-dashboard/{app_name}")
 async def get_flow_analytics_dashboard(app_name: str):
@@ -5769,3 +5936,5 @@ async def get_flow_anomalies(
             status_code=500,
             content={"error": str(e)}
         )
+    
+app.include_router(qa_routers)

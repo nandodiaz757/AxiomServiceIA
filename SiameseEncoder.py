@@ -73,15 +73,6 @@ class SiameseEncoder(nn.Module):
     # Encodea un árbol a embedding
     # ----------------------------------------------------------
     
-    # def encode_batch(self, trees: list):
-    #     vecs = [self.tree_to_vector(t) for t in trees]
-    #     vecs = torch.tensor(vecs, dtype=torch.float32)
-    #     with torch.no_grad():
-    #         emb = self.encoder(vecs)
-    #         norms = emb.norm(p=2, dim=1, keepdim=True)
-    #         emb = torch.where(norms == 0, torch.zeros_like(emb), emb / norms)
-    #     return emb
-    
     def encode_batch(self, trees: list):
         vecs = np.array([self.tree_to_vector(t) for t in trees], dtype=np.float32)
         vecs = torch.from_numpy(vecs)  # más rápido que torch.tensor

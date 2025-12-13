@@ -9,11 +9,6 @@ def normalize_node(node: Dict) -> Dict:
     """Filtra solo las claves estables y convierte None en cadena vacía."""
     return {k: (node.get(k) or "") for k in SAFE_KEYS}
 
-# def normalize_tree(nodes: List[Dict]) -> List[Dict]:
-#     """Normaliza y ordena la lista de nodos para que el orden no afecte el hash."""
-#     normalized = [normalize_node(n) for n in nodes]
-#     return sorted(normalized, key=lambda n: (n["className"], n["text"]))
-
 def normalize_tree(nodes: List[Dict]) -> List[Dict]:
     """Normaliza y ordena la lista de nodos para que el orden no afecte el hash."""
     normalized = [normalize_node(n) for n in nodes]

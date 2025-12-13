@@ -214,7 +214,7 @@ flow_analytics_engine = None  # Se inicializa en startup
 ### Tabla de Base de Datos (Auto-creada)
 ```sql
 CREATE TABLE IF NOT EXISTS flow_anomalies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     app_name TEXT,
     tester_id TEXT,
     flow_sequence TEXT,  -- JSON
